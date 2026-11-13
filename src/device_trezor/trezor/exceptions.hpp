@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -118,6 +118,12 @@ namespace exc {
     ProtocolException(): CommunicationException("Trezor protocol error"){}
   };
 
+  class FirmwareNotSupportedException: public TrezorException {
+  public:
+    using TrezorException::TrezorException;
+    FirmwareNotSupportedException(): TrezorException("Trezor firmware version does not support Monero"){}
+  };
+
   // Communication protocol namespace
   // Separated to distinguish between client and Trezor side exceptions.
 namespace proto {
@@ -154,6 +160,8 @@ namespace proto {
   public:
     using FailureException::FailureException;
     CancelledException(): FailureException("Trezor returned: cancelled operation"){}
+    CancelledException(boost::optional<uint32_t> code, boost::optional<std::string> message)
+        : FailureException(code, message) { reason = "Trezor returned: cancelled operation"; }
   };
 
   class PinExpectedException : public FailureException {

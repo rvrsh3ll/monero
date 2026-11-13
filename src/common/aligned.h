@@ -1,4 +1,4 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -29,8 +29,16 @@
 #pragma once 
 
 #ifdef __cplusplus
+
+#include <cstddef>
+
 extern "C" {
-#endif
+
+#else // C compiler
+
+#include <stddef.h>
+
+#endif // __cplusplus
 
 void *aligned_malloc(size_t bytes, size_t align);
 void *aligned_realloc(void *ptr, size_t bytes, size_t align);

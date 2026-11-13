@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -35,11 +35,12 @@
 #include "tx_pool.h"
 #include "transaction_tests.h"
 
+#include <boost/regex.hpp>
+
 namespace po = boost::program_options;
 
 namespace
 {
-  const command_line::arg_descriptor<std::string> arg_test_data_path              = {"test_data_path", "", ""};
   const command_line::arg_descriptor<bool>        arg_generate_test_data          = {"generate_test_data", ""};
   const command_line::arg_descriptor<bool>        arg_play_test_data              = {"play_test_data", ""};
   const command_line::arg_descriptor<bool>        arg_generate_and_play_test_data = {"generate_and_play_test_data", ""};
@@ -60,7 +61,6 @@ int main(int argc, char* argv[])
   
   po::options_description desc_options("Allowed options");
   command_line::add_arg(desc_options, command_line::arg_help);
-  command_line::add_arg(desc_options, arg_test_data_path);
   command_line::add_arg(desc_options, arg_generate_test_data);
   command_line::add_arg(desc_options, arg_play_test_data);
   command_line::add_arg(desc_options, arg_generate_and_play_test_data);
@@ -89,7 +89,6 @@ int main(int argc, char* argv[])
 
   size_t tests_count = 0;
   std::vector<std::string> failed_tests;
-  std::string tests_folder = command_line::get_arg(vm, arg_test_data_path);
   bool list_tests = false;
   if (command_line::get_arg(vm, arg_generate_test_data))
   {
@@ -131,6 +130,10 @@ int main(int argc, char* argv[])
     GENERATE_AND_PLAY(gen_block_miner_tx_out_is_big);
     GENERATE_AND_PLAY(gen_block_miner_tx_has_no_out);
     GENERATE_AND_PLAY(gen_block_miner_tx_has_out_to_alice);
+    GENERATE_AND_PLAY(gen_block_miner_tx_out_has_no_view_tag_before_hf_view_tags);
+    GENERATE_AND_PLAY(gen_block_miner_tx_out_has_no_view_tag_from_hf_view_tags);
+    GENERATE_AND_PLAY(gen_block_miner_tx_out_has_view_tag_before_hf_view_tags);
+    GENERATE_AND_PLAY(gen_block_miner_tx_out_has_view_tag_from_hf_view_tags);
     GENERATE_AND_PLAY(gen_block_has_invalid_tx);
     GENERATE_AND_PLAY(gen_block_is_too_big);
     GENERATE_AND_PLAY(gen_block_invalid_binary_format); // Takes up to 3 hours, if CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW == 500, up to 30 minutes, if CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW == 10
@@ -159,6 +162,7 @@ int main(int argc, char* argv[])
     // Mempool
     GENERATE_AND_PLAY(txpool_spend_key_public);
     GENERATE_AND_PLAY(txpool_spend_key_all);
+    GENERATE_AND_PLAY(txpool_future_receive_time);
     GENERATE_AND_PLAY(txpool_double_spend_norelay);
     GENERATE_AND_PLAY(txpool_double_spend_local);
     GENERATE_AND_PLAY(txpool_double_spend_keyimage);
@@ -217,6 +221,15 @@ int main(int argc, char* argv[])
     GENERATE_AND_PLAY(gen_rct_tx_pre_rct_increase_vin_and_fee);
     GENERATE_AND_PLAY(gen_rct_tx_pre_rct_altered_extra);
     GENERATE_AND_PLAY(gen_rct_tx_rct_altered_extra);
+    GENERATE_AND_PLAY(gen_rct_tx_pre_rct_has_no_view_tag_before_hf_view_tags);
+    // TODO: base test needs to be restructured to handle pre rct outputs after HF v12
+    // GENERATE_AND_PLAY(gen_rct_tx_pre_rct_has_no_view_tag_from_hf_view_tags);
+    GENERATE_AND_PLAY(gen_rct_tx_pre_rct_has_view_tag_before_hf_view_tags);
+    // GENERATE_AND_PLAY(gen_rct_tx_pre_rct_has_view_tag_from_hf_view_tags);
+    GENERATE_AND_PLAY(gen_rct_tx_rct_has_no_view_tag_before_hf_view_tags);
+    GENERATE_AND_PLAY(gen_rct_tx_rct_has_no_view_tag_from_hf_view_tags);
+    GENERATE_AND_PLAY(gen_rct_tx_rct_has_view_tag_before_hf_view_tags);
+    GENERATE_AND_PLAY(gen_rct_tx_rct_has_view_tag_from_hf_view_tags);
     GENERATE_AND_PLAY(gen_rct_tx_uses_output_too_early);
 
     GENERATE_AND_PLAY(gen_multisig_tx_valid_22_1_2);
@@ -250,21 +263,29 @@ int main(int argc, char* argv[])
 
     GENERATE_AND_PLAY(gen_bp_tx_valid_1_before_12);
     GENERATE_AND_PLAY(gen_bp_tx_invalid_1_from_12);
-    GENERATE_AND_PLAY(gen_bp_tx_invalid_1_1);
     GENERATE_AND_PLAY(gen_bp_tx_valid_2);
     GENERATE_AND_PLAY(gen_bp_tx_valid_3);
     GENERATE_AND_PLAY(gen_bp_tx_valid_16);
-    GENERATE_AND_PLAY(gen_bp_tx_invalid_4_2_1);
-    GENERATE_AND_PLAY(gen_bp_tx_invalid_16_16);
     GENERATE_AND_PLAY(gen_bp_txs_valid_2_and_2);
-    GENERATE_AND_PLAY(gen_bp_txs_invalid_2_and_8_2_and_16_16_1);
     GENERATE_AND_PLAY(gen_bp_txs_valid_2_and_3_and_2_and_4);
-    GENERATE_AND_PLAY(gen_bp_tx_invalid_not_enough_proofs);
     GENERATE_AND_PLAY(gen_bp_tx_invalid_empty_proofs);
     GENERATE_AND_PLAY(gen_bp_tx_invalid_too_many_proofs);
     GENERATE_AND_PLAY(gen_bp_tx_invalid_wrong_amount);
     GENERATE_AND_PLAY(gen_bp_tx_invalid_borromean_type);
     GENERATE_AND_PLAY(gen_bp_tx_invalid_bulletproof2_type);
+    GENERATE_AND_PLAY(gen_bp_tx_invalid_clsag_type);
+
+    GENERATE_AND_PLAY(gen_bpp_tx_invalid_before_fork);
+    GENERATE_AND_PLAY(gen_bpp_tx_valid_at_fork);
+    GENERATE_AND_PLAY(gen_bpp_tx_valid_2);
+    GENERATE_AND_PLAY(gen_bpp_tx_valid_3);
+    GENERATE_AND_PLAY(gen_bpp_tx_valid_16);
+    GENERATE_AND_PLAY(gen_bpp_txs_valid_2_and_2);
+    GENERATE_AND_PLAY(gen_bpp_txs_valid_2_and_3_and_2_and_4);
+    GENERATE_AND_PLAY(gen_bpp_tx_invalid_empty_proofs);
+    GENERATE_AND_PLAY(gen_bpp_tx_invalid_too_many_proofs);
+    GENERATE_AND_PLAY(gen_bpp_tx_invalid_wrong_amount);
+    GENERATE_AND_PLAY(gen_bpp_tx_invalid_clsag_type);
 
     GENERATE_AND_PLAY(gen_rct2_tx_clsag_malleability);
 

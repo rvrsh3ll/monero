@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -42,6 +42,9 @@
 #include "cn_slow_hash.h"
 #include "derive_public_key.h"
 #include "derive_secret_key.h"
+#include "derive_view_tag.h"
+#include "fcmp_pp.h"
+#include "fe_batch_invert.h"
 #include "ge_frombytes_vartime.h"
 #include "ge_tobytes.h"
 #include "generate_key_derivation.h"
@@ -50,6 +53,8 @@
 #include "generate_keypair.h"
 #include "signature.h"
 #include "is_out_to_acc.h"
+#include "is_valid_decomposed_amount.h"
+#include "out_can_be_to_acc.h"
 #include "subaddress_expand.h"
 #include "sc_reduce32.h"
 #include "sc_check.h"
@@ -58,10 +63,13 @@
 #include "equality.h"
 #include "range_proof.h"
 #include "bulletproof.h"
+#include "bulletproof_plus.h"
 #include "crypto_ops.h"
 #include "multiexp.h"
 #include "sig_mlsag.h"
 #include "sig_clsag.h"
+#include "tests_common/fcmp_pp_helpers.h"
+#include "zero_commit.h"
 
 namespace po = boost::program_options;
 
@@ -86,6 +94,10 @@ int main(int argc, char** argv)
   command_line::add_arg(desc_options, arg_loop_multiplier);
   command_line::add_arg(desc_options, arg_timings_database);
 
+  // the default test data directory is ../data (relative to the executable's directory)
+  const auto default_test_data_dir = boost::filesystem::canonical(argv[0]).parent_path().parent_path() / "data";
+  tests_common::data_dir = default_test_data_dir;
+
   po::variables_map vm;
   bool r = command_line::handle_error_helper(desc_options, [&]()
   {
@@ -98,12 +110,14 @@ int main(int argc, char** argv)
 
   const std::string filter = tools::glob_to_regex(command_line::get_arg(vm, arg_filter));
   const std::string timings_database = command_line::get_arg(vm, arg_timings_database);
-  Params p;
+  Params core_params;
   if (!timings_database.empty())
-    p.td = TimingsDatabase(timings_database);
-  p.verbose = command_line::get_arg(vm, arg_verbose);
-  p.stats = command_line::get_arg(vm, arg_stats);
-  p.loop_multiplier = command_line::get_arg(vm, arg_loop_multiplier);
+    core_params.td = TimingsDatabase(timings_database);
+  core_params.verbose = command_line::get_arg(vm, arg_verbose);
+  core_params.stats = command_line::get_arg(vm, arg_stats);
+  core_params.loop_multiplier = command_line::get_arg(vm, arg_loop_multiplier);
+
+  ParamsShuttle p{core_params};
 
   performance_timer timer;
   timer.start();
@@ -165,23 +179,14 @@ int main(int argc, char** argv)
   TEST_PERFORMANCE4(filter, p, test_check_tx_signature, 2, 10, true, rct::RangeProofBorromean);
 
   TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 2, 2, true, rct::RangeProofPaddedBulletproof, 2);
-  TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 2, 2, true, rct::RangeProofMultiOutputBulletproof, 2);
   TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 10, 2, true, rct::RangeProofPaddedBulletproof, 2);
-  TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 10, 2, true, rct::RangeProofMultiOutputBulletproof, 2);
   TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 100, 2, true, rct::RangeProofPaddedBulletproof, 2);
-  TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 100, 2, true, rct::RangeProofMultiOutputBulletproof, 2);
   TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 2, 10, true, rct::RangeProofPaddedBulletproof, 2);
-  TEST_PERFORMANCE5(filter, p, test_check_tx_signature, 2, 10, true, rct::RangeProofMultiOutputBulletproof, 2);
 
   TEST_PERFORMANCE3(filter, p, test_check_tx_signature_aggregated_bulletproofs, 2, 2, 64);
   TEST_PERFORMANCE3(filter, p, test_check_tx_signature_aggregated_bulletproofs, 10, 2, 64);
   TEST_PERFORMANCE3(filter, p, test_check_tx_signature_aggregated_bulletproofs, 100, 2, 64);
   TEST_PERFORMANCE3(filter, p, test_check_tx_signature_aggregated_bulletproofs, 2, 10, 64);
-
-  TEST_PERFORMANCE4(filter, p, test_check_tx_signature_aggregated_bulletproofs, 2, 2, 62, 4);
-  TEST_PERFORMANCE4(filter, p, test_check_tx_signature_aggregated_bulletproofs, 10, 2, 62, 4);
-  TEST_PERFORMANCE4(filter, p, test_check_tx_signature_aggregated_bulletproofs, 2, 2, 56, 16);
-  TEST_PERFORMANCE4(filter, p, test_check_tx_signature_aggregated_bulletproofs, 10, 2, 56, 16);
 
   TEST_PERFORMANCE4(filter, p, test_check_hash, 0, 1, 0, 1);
   TEST_PERFORMANCE4(filter, p, test_check_hash, 0, 0xffffffffffffffff, 0, 0xffffffffffffffff);
@@ -193,11 +198,16 @@ int main(int argc, char** argv)
 
   TEST_PERFORMANCE0(filter, p, test_is_out_to_acc);
   TEST_PERFORMANCE0(filter, p, test_is_out_to_acc_precomp);
+  TEST_PERFORMANCE2(filter, p, test_out_can_be_to_acc, false, true); // no view tag, owned
+  TEST_PERFORMANCE2(filter, p, test_out_can_be_to_acc, true, false); // use view tag, not owned
+  TEST_PERFORMANCE2(filter, p, test_out_can_be_to_acc, true, true); // use view tag, owned
   TEST_PERFORMANCE0(filter, p, test_generate_key_image_helper);
   TEST_PERFORMANCE0(filter, p, test_generate_key_derivation);
   TEST_PERFORMANCE0(filter, p, test_generate_key_image);
   TEST_PERFORMANCE0(filter, p, test_derive_public_key);
   TEST_PERFORMANCE0(filter, p, test_derive_secret_key);
+  TEST_PERFORMANCE1(filter, p, test_fe_batch_invert, true); // batched
+  TEST_PERFORMANCE1(filter, p, test_fe_batch_invert, false); // individual inversions
   TEST_PERFORMANCE0(filter, p, test_ge_frombytes_vartime);
   TEST_PERFORMANCE0(filter, p, test_ge_tobytes);
   TEST_PERFORMANCE0(filter, p, test_generate_keypair);
@@ -205,8 +215,11 @@ int main(int argc, char** argv)
   TEST_PERFORMANCE0(filter, p, test_sc_check);
   TEST_PERFORMANCE1(filter, p, test_signature, false);
   TEST_PERFORMANCE1(filter, p, test_signature, true);
+  TEST_PERFORMANCE0(filter, p, test_derive_view_tag);
 
   TEST_PERFORMANCE2(filter, p, test_wallet2_expand_subaddresses, 50, 200);
+
+  TEST_PERFORMANCE0(filter, p, test_is_valid_decomposed_amount);
 
   TEST_PERFORMANCE1(filter, p, test_cn_slow_hash, 0);
   TEST_PERFORMANCE1(filter, p, test_cn_slow_hash, 1);
@@ -240,6 +253,26 @@ int main(int argc, char** argv)
 
   TEST_PERFORMANCE1(filter, p, test_range_proof, true);
   TEST_PERFORMANCE1(filter, p, test_range_proof, false);
+
+  TEST_PERFORMANCE2(filter, p, test_bulletproof_plus, true, 1); // 1 bulletproof_plus with 1 amount
+  TEST_PERFORMANCE2(filter, p, test_bulletproof_plus, false, 1);
+
+  TEST_PERFORMANCE2(filter, p, test_bulletproof_plus, true, 2); // 1 bulletproof_plus with 2 amounts
+  TEST_PERFORMANCE2(filter, p, test_bulletproof_plus, false, 2);
+
+  TEST_PERFORMANCE2(filter, p, test_bulletproof_plus, true, 15); // 1 bulletproof_plus with 15 amounts
+  TEST_PERFORMANCE2(filter, p, test_bulletproof_plus, false, 15);
+
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, false, 2, 1, 1, 0, 4);
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, true, 2, 1, 1, 0, 4); // 4 proofs, each with 2 amounts
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, false, 8, 1, 1, 0, 4);
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, true, 8, 1, 1, 0, 4); // 4 proofs, each with 8 amounts
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, false, 1, 1, 2, 0, 4);
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, true, 1, 1, 2, 0, 4); // 4 proofs with 1, 2, 4, 8 amounts
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, false, 1, 8, 1, 1, 4);
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, true, 1, 8, 1, 1, 4); // 32 proofs, with 1, 2, 3, 4 amounts, 8 of each
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, false, 2, 1, 1, 0, 64);
+  TEST_PERFORMANCE6(filter, p, test_aggregated_bulletproof_plus, true, 2, 1, 1, 0, 64); // 64 proof, each with 2 amounts
 
   TEST_PERFORMANCE2(filter, p, test_bulletproof, true, 1); // 1 bulletproof with 1 amount
   TEST_PERFORMANCE2(filter, p, test_bulletproof, false, 1);
@@ -570,6 +603,16 @@ int main(int argc, char** argv)
   TEST_PERFORMANCE3(filter, p, test_multiexp, multiexp_pippenger, 4096, 8);
   TEST_PERFORMANCE3(filter, p, test_multiexp, multiexp_pippenger, 4096, 9);
 #endif
+
+  TEST_PERFORMANCE1(filter, p, test_zero_commit, true); // fast
+  TEST_PERFORMANCE1(filter, p, test_zero_commit, false);
+
+  // Test with different n inputs
+  TEST_PERFORMANCE1(filter, p, test_fcmp_pp_verify, 1);
+  TEST_PERFORMANCE1(filter, p, test_fcmp_pp_verify, 2);
+  TEST_PERFORMANCE1(filter, p, test_fcmp_pp_verify, 4);
+  TEST_PERFORMANCE1(filter, p, test_fcmp_pp_verify, 8);
+  TEST_PERFORMANCE1(filter, p, test_fcmp_pp_verify, 128);
 
   std::cout << "Tests finished. Elapsed time: " << timer.elapsed_ms() / 1000 << " sec" << std::endl;
 

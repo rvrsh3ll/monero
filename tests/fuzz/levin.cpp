@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -25,6 +25,8 @@
 // INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#include <boost/uuid/random_generator.hpp>
 
 #include "include_base_utils.h"
 #include "file_io_utils.h"
@@ -135,19 +137,22 @@ namespace
     std::string m_last_in_buf;
   };
 
-  class test_connection : public epee::net_utils::i_service_endpoint
+  class test_connection : public epee::net_utils::service_endpoint<test_levin_protocol_handler>, public std::enable_shared_from_this<test_connection>
   {
   public:
-    test_connection(boost::asio::io_service& io_service, test_levin_protocol_handler_config& protocol_config)
-      : m_io_service(io_service)
-      , m_protocol_handler(this, protocol_config, m_context)
+    test_connection(boost::asio::io_context& io_service, test_levin_protocol_handler_config& protocol_config)
+      : epee::net_utils::service_endpoint<test_levin_protocol_handler>(protocol_config)
+      , std::enable_shared_from_this<test_connection>()
+      , m_io_service(io_service)
       , m_send_return(true)
     {
     }
 
     void start()
     {
-      m_protocol_handler.after_init_connection();
+      using base_type = epee::net_utils::connection_context_base;
+      static_cast<base_type&>(context) = base_type{boost::uuids::random_generator{}(), {}, true, false};
+      m_protocol_handler.m_config.after_init_connection(shared_from_this());
     }
 
     // Implement epee::net_utils::i_service_endpoint interface
@@ -159,11 +164,11 @@ namespace
       return m_send_return;
     }
 
-    virtual bool close()                              { return true; }
+    virtual bool close(const bool wait_for_shutdown)  { return true; }
     virtual bool send_done()                          { return true; }
     virtual bool call_run_once_service_io()           { return true; }
     virtual bool request_callback()                   { return true; }
-    virtual boost::asio::io_service& get_io_service() { return m_io_service; }
+    virtual boost::asio::io_context& get_io_context() { return m_io_service; }
     virtual bool add_ref()                            { return true; }
     virtual bool release()                            { return true; }
 
@@ -175,12 +180,8 @@ namespace
     bool send_return() const { return m_send_return; }
     void send_return(bool v) { m_send_return = v; }
 
-  public:
-    test_levin_connection_context m_context;
-    test_levin_protocol_handler m_protocol_handler;
-
   private:
-    boost::asio::io_service& m_io_service;
+    boost::asio::io_context& m_io_service;
 
     call_counter m_send_counter;
     boost::mutex m_mutex;
@@ -197,7 +198,7 @@ namespace
     const static uint64_t invoke_timeout = 5 * 1000;
     const static size_t max_packet_size = 10 * 1024 * 1024;
 
-    typedef std::unique_ptr<test_connection> test_connection_ptr;
+    typedef std::shared_ptr<test_connection> test_connection_ptr;
 
     async_protocol_handler_test():
       m_pcommands_handler(new test_levin_commands_handler()),
@@ -224,7 +225,7 @@ namespace
     }
 
   protected:
-    boost::asio::io_service m_io_service;
+    boost::asio::io_context m_io_service;
     test_levin_protocol_handler_config m_handler_config;
     test_levin_commands_handler *m_pcommands_handler, &m_commands_handler;
   };
@@ -300,11 +301,11 @@ BEGIN_SIMPLE_FUZZER()
   fclose(f);
 #endif
     //std::unique_ptr<test_connection> conn = new test();
-    boost::asio::io_service io_service;
+    boost::asio::io_context io_service;
     test_levin_protocol_handler_config m_handler_config;
     test_levin_commands_handler *m_pcommands_handler = new test_levin_commands_handler();
     m_handler_config.set_handler(m_pcommands_handler, [](epee::levin::levin_commands_handler<test_levin_connection_context> *handler) { delete handler; });
-    std::unique_ptr<test_connection> conn(new test_connection(io_service, m_handler_config));
+    std::shared_ptr<test_connection> conn(new test_connection(io_service, m_handler_config));
     conn->start();
     //m_commands_handler.invoke_out_buf(expected_out_data);
     //m_commands_handler.return_code(expected_return_code);

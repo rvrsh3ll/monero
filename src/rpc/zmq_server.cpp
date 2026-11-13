@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -35,6 +35,7 @@
 #include <system_error>
 
 #include "byte_slice.h"
+#include "rpc/message.h"
 #include "rpc/zmq_pub.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -46,8 +47,9 @@ namespace cryptonote
 namespace
 {
   constexpr const int num_zmq_threads = 1;
-  constexpr const std::int64_t max_message_size = 10 * 1024 * 1024; // 10 MiB
+  constexpr const std::int64_t max_frame_size = net::zmq::max_message_size;
   constexpr const std::chrono::seconds linger_timeout{2}; // wait period for pending out messages
+  constexpr const int ipv6_option = 1;
 
   net::zmq::socket init_socket(void* context, int type, epee::span<const std::string> addresses)
   {
@@ -62,7 +64,7 @@ namespace
       return nullptr;
     }
 
-    if (zmq_setsockopt(out.get(), ZMQ_MAXMSGSIZE, std::addressof(max_message_size), sizeof(max_message_size)) != 0)
+    if (zmq_setsockopt(out.get(), ZMQ_MAXMSGSIZE, std::addressof(max_frame_size), sizeof(max_frame_size)) != 0)
     {
       MONERO_LOG_ZMQ_ERROR("Failed to set maximum incoming message size");
       return nullptr;
@@ -73,6 +75,12 @@ namespace
     {
       MONERO_LOG_ZMQ_ERROR("Failed to set linger timeout");
       return nullptr;
+    }
+
+    if (zmq_setsockopt(out.get(), ZMQ_IPV6, std::addressof(ipv6_option), sizeof(ipv6_option)) != 0)
+    {
+        MONERO_LOG_ZMQ_ERROR("Failed to enable IPv6");
+        return nullptr;
     }
 
     for (const std::string& address : addresses)
@@ -92,8 +100,9 @@ namespace
 namespace rpc
 {
 
-ZmqServer::ZmqServer(RpcHandler& h) :
+ZmqServer::ZmqServer(RpcHandler& h, const bool restricted) :
     handler(h),
+    restricted(restricted),
     context(zmq_init(num_zmq_threads)),
     rep_socket(nullptr),
     pub_socket(nullptr),
@@ -154,17 +163,44 @@ void ZmqServer::serve()
         state->relay_to_pub(relay.get(), pub.get());
 
       if (sockets[1].revents)
-        state->sub_request(MONERO_UNWRAP(net::zmq::receive(pub.get(), ZMQ_DONTWAIT)));
+      {
+        expect<std::string> message = net::zmq::receive(pub.get(), ZMQ_DONTWAIT);
+        if (message)
+          state->sub_request(*message);
+        else if (message == net::zmq::make_error_code(ETERM))
+          MONERO_THROW(message.error(), "ZMQ-PUB context terminated");
+        else if (message != net::zmq::make_error_code(EAGAIN))
+          MERROR("Read failure on ZMQ-PUB: " << message.error().message());
+      }
 
       if (!pub || sockets[2].revents)
       {
-        std::string message = MONERO_UNWRAP(net::zmq::receive(rep.get(), read_flags));
-        MDEBUG("Received RPC request: \"" << message << "\"");
-        epee::byte_slice response = handler.handle(std::move(message));
+        expect<std::string> message = net::zmq::receive(rep.get(), read_flags);
+        if (!message)
+        {
+          // EAGAIN can occur when using `zmq_poll`, which doesn't inspect for message validity
+          if (message == net::zmq::make_error_code(EMSGSIZE))
+          {
+            MERROR("ZMQ-RPC request exceeds maximum message size");
+            MONERO_UNWRAP(net::zmq::send(REQUEST_TOO_LARGE(), rep.get()));
+          }
+          else if (message == net::zmq::make_error_code(ETERM))
+            MONERO_THROW(message.error(), "ZMQ-RPC context terminated");
+          else if (message != net::zmq::make_error_code(EAGAIN))
+            MERROR("Read failure on ZMQ-RPC: " << message.error().message());
+        }
+        else // no errors
+        {
+          if (restricted)
+            MDEBUG("Received RPC request");
+          else
+            MDEBUG("Received RPC request: \"" << *message << "\"");
+          epee::byte_slice response = handler.handle(std::move(*message));
 
-        const boost::string_ref response_view{reinterpret_cast<const char*>(response.data()), response.size()};
-        MDEBUG("Sending RPC reply: \"" << response_view << "\"");
-        MONERO_UNWRAP(net::zmq::send(std::move(response), rep.get()));
+          const boost::string_ref response_view{reinterpret_cast<const char*>(response.data()), response.size()};
+          MDEBUG("Sending RPC reply: \"" << response_view << "\"");
+          MONERO_UNWRAP(net::zmq::send(std::move(response), rep.get()));
+        }
       }
     }
   }

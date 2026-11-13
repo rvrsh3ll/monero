@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -32,15 +32,16 @@
 
 function (get_version_tag_from_git GIT)
     execute_process(COMMAND "${GIT}" rev-parse --short=9 HEAD
-                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
                     RESULT_VARIABLE RET
                     OUTPUT_VARIABLE COMMIT
+                    ERROR_VARIABLE GIT_ERROR
                     OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     if(RET)
         # Something went wrong, set the version tag to -unknown
 
-        message(WARNING "Cannot determine current commit. Make sure that you are building either from a Git working tree or from a source archive.")
+        message(WARNING "Cannot determine current commit: git rev-parse --short=9 HEAD failed in ${CMAKE_CURRENT_LIST_DIR} (${RET}):\n${GIT_ERROR}\nMake sure that you are building either from a Git working tree or from a source archive.")
         set(VERSIONTAG "unknown")
         set(VERSION_IS_RELEASE "false")
     else()
@@ -49,13 +50,18 @@ function (get_version_tag_from_git GIT)
 
         # Get all the tags
         execute_process(COMMAND "${GIT}" tag -l --points-at HEAD
-                        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
                         RESULT_VARIABLE RET
                         OUTPUT_VARIABLE TAG
+                        ERROR_VARIABLE GIT_ERROR
                         OUTPUT_STRIP_TRAILING_WHITESPACE)
 
         # Check if we're building that tagged commit or a different one
-        if(TAG)
+        if(RET)
+            message(WARNING "Cannot determine release tag: git tag -l --points-at HEAD failed in ${CMAKE_CURRENT_LIST_DIR} (${RET}):\n${GIT_ERROR}")
+            set(VERSIONTAG "unknown")
+            set(VERSION_IS_RELEASE "false")
+        elseif(TAG)
             message(STATUS "You are building a tagged release")
             set(VERSIONTAG "release")
             set(VERSION_IS_RELEASE "true")

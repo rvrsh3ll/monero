@@ -1,212 +1,31 @@
-# Multistage docker build, requires docker 17.05
+FROM stagex/pallet-gcc-gnu-gnu:sx2026.06.0@sha256:c06b4e5e490d7fdc77951510b5256f889a8bd51c6fa9d6c41c7f6c4cea88f35c AS builder
+COPY --from=stagex/core-curl:sx2026.06.0@sha256:7a95abfe88eea0a7afd614d219e0b0f11fd77ce257046489baa0fbbf2fc6c088 . /
+COPY --from=stagex/core-openssl:sx2026.06.0@sha256:5fbecea19913b8c9bb2e5976b03833d44f99c98290b17ee5ef9b469470b7bbff . /
+COPY --from=stagex/core-ca-certificates:sx2026.06.0@sha256:ea7076d1bb83693fa4766c9cbd8132e59ac0981799fd8b58961c245cd360b66d . /
+COPY --from=stagex/user-patch:sx2026.06.0@sha256:1d4428893f0ea9abfabc1fb5e365c5593fe10c6ed8ffc592d6528157a4299942 . /
+COPY --from=stagex/core-cmake:sx2026.06.0@sha256:626a3fdf157efacd00c3ceb0529ae80dde1072d64fa1925aafe9819bebc92047 . /
+COPY --from=stagex/pallet-rust:sx2026.06.0@sha256:59d4d0c9e232a05ecb99348f7216b521af1b914a430059dbdb9130018f2afde1 . /
 
-# builder stage
-FROM ubuntu:16.04 as builder
-
-RUN set -ex && \
-    apt-get update && \
-    apt-get --no-install-recommends --yes install \
-        ca-certificates \
-        cmake \
-        g++ \
-        make \
-        pkg-config \
-        graphviz \
-        doxygen \
-        git \
-        curl \
-        libtool-bin \
-        autoconf \
-        automake \
-        bzip2 \
-        xsltproc \
-        gperf \
-        unzip
-
-WORKDIR /usr/local
-
-ENV CFLAGS='-fPIC'
-ENV CXXFLAGS='-fPIC'
-
-#Cmake
-ARG CMAKE_VERSION=3.14.6
-ARG CMAKE_VERSION_DOT=v3.14
-ARG CMAKE_HASH=4e8ea11cabe459308671b476469eace1622e770317a15951d7b55a82ccaaccb9
-RUN set -ex \
-    && curl -s -O https://cmake.org/files/${CMAKE_VERSION_DOT}/cmake-${CMAKE_VERSION}.tar.gz \
-    && echo "${CMAKE_HASH}  cmake-${CMAKE_VERSION}.tar.gz" | sha256sum -c \
-    && tar -xzf cmake-${CMAKE_VERSION}.tar.gz \
-    && cd cmake-${CMAKE_VERSION} \
-    && ./configure \
-    && make \
-    && make install
-
-## Boost
-ARG BOOST_VERSION=1_70_0
-ARG BOOST_VERSION_DOT=1.70.0
-ARG BOOST_HASH=430ae8354789de4fd19ee52f3b1f739e1fba576f0aded0897c3c2bc00fb38778
-RUN set -ex \
-    && curl -s -L -o  boost_${BOOST_VERSION}.tar.bz2 https://dl.bintray.com/boostorg/release/${BOOST_VERSION_DOT}/source/boost_${BOOST_VERSION}.tar.bz2 \
-    && echo "${BOOST_HASH}  boost_${BOOST_VERSION}.tar.bz2" | sha256sum -c \
-    && tar -xvf boost_${BOOST_VERSION}.tar.bz2 \
-    && cd boost_${BOOST_VERSION} \
-    && ./bootstrap.sh \
-    && ./b2 --build-type=minimal link=static runtime-link=static --with-chrono --with-date_time --with-filesystem --with-program_options --with-regex --with-serialization --with-system --with-thread --with-locale threading=multi threadapi=pthread cflags="$CFLAGS" cxxflags="$CXXFLAGS" stage
-ENV BOOST_ROOT /usr/local/boost_${BOOST_VERSION}
-
-# OpenSSL
-ARG OPENSSL_VERSION=1.1.1i
-ARG OPENSSL_HASH=e8be6a35fe41d10603c3cc635e93289ed00bf34b79671a3a4de64fcee00d5242
-RUN set -ex \
-    && curl -s -O https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz \
-    && echo "${OPENSSL_HASH}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c \
-    && tar -xzf openssl-${OPENSSL_VERSION}.tar.gz \
-    && cd openssl-${OPENSSL_VERSION} \
-    && ./Configure linux-x86_64 no-shared --static "$CFLAGS" \
-    && make build_generated \
-    && make libcrypto.a \
-    && make install
-ENV OPENSSL_ROOT_DIR=/usr/local/openssl-${OPENSSL_VERSION}
-
-# ZMQ
-ARG ZMQ_VERSION=v4.3.2
-ARG ZMQ_HASH=a84ffa12b2eb3569ced199660bac5ad128bff1f0
-RUN set -ex \
-    && git clone https://github.com/zeromq/libzmq.git -b ${ZMQ_VERSION} \
-    && cd libzmq \
-    && test `git rev-parse HEAD` = ${ZMQ_HASH} || exit 1 \
-    && ./autogen.sh \
-    && ./configure --enable-static --disable-shared \
-    && make \
-    && make install \
-    && ldconfig
-
-# zmq.hpp
-ARG CPPZMQ_VERSION=v4.4.1
-ARG CPPZMQ_HASH=f5b36e563598d48fcc0d82e589d3596afef945ae
-RUN set -ex \
-    && git clone https://github.com/zeromq/cppzmq.git -b ${CPPZMQ_VERSION} \
-    && cd cppzmq \
-    && test `git rev-parse HEAD` = ${CPPZMQ_HASH} || exit 1 \
-    && mv *.hpp /usr/local/include
-
-# Readline
-ARG READLINE_VERSION=8.0
-ARG READLINE_HASH=e339f51971478d369f8a053a330a190781acb9864cf4c541060f12078948e461
-RUN set -ex \
-    && curl -s -O https://ftp.gnu.org/gnu/readline/readline-${READLINE_VERSION}.tar.gz \
-    && echo "${READLINE_HASH}  readline-${READLINE_VERSION}.tar.gz" | sha256sum -c \
-    && tar -xzf readline-${READLINE_VERSION}.tar.gz \
-    && cd readline-${READLINE_VERSION} \
-    && ./configure \
-    && make \
-    && make install
-
-# Sodium
-ARG SODIUM_VERSION=1.0.18
-ARG SODIUM_HASH=4f5e89fa84ce1d178a6765b8b46f2b6f91216677
-RUN set -ex \
-    && git clone https://github.com/jedisct1/libsodium.git -b ${SODIUM_VERSION} \
-    && cd libsodium \
-    && test `git rev-parse HEAD` = ${SODIUM_HASH} || exit 1 \
-    && ./autogen.sh \
-    && ./configure \
-    && make \
-    && make check \
-    && make install
-
-# Udev
-ARG UDEV_VERSION=v3.2.8
-ARG UDEV_HASH=d69f3f28348123ab7fa0ebac63ec2fd16800c5e0
-RUN set -ex \
-    && git clone https://github.com/gentoo/eudev -b ${UDEV_VERSION} \
-    && cd eudev \
-    && test `git rev-parse HEAD` = ${UDEV_HASH} || exit 1 \
-    && ./autogen.sh \
-    && ./configure --disable-gudev --disable-introspection --disable-hwdb --disable-manpages --disable-shared \
-    && make \
-    && make install
-
-# Libusb
-ARG USB_VERSION=v1.0.22
-ARG USB_HASH=0034b2afdcdb1614e78edaa2a9e22d5936aeae5d
-RUN set -ex \
-    && git clone https://github.com/libusb/libusb.git -b ${USB_VERSION} \
-    && cd libusb \
-    && test `git rev-parse HEAD` = ${USB_HASH} || exit 1 \
-    && ./autogen.sh \
-    && ./configure --disable-shared \
-    && make \
-    && make install
-
-# Hidapi
-ARG HIDAPI_VERSION=hidapi-0.8.0-rc1
-ARG HIDAPI_HASH=40cf516139b5b61e30d9403a48db23d8f915f52c
-RUN set -ex \
-    && git clone https://github.com/signal11/hidapi -b ${HIDAPI_VERSION} \
-    && cd hidapi \
-    && test `git rev-parse HEAD` = ${HIDAPI_HASH} || exit 1 \
-    && ./bootstrap \
-    && ./configure --enable-static --disable-shared \
-    && make \
-    && make install
-
-# Protobuf
-ARG PROTOBUF_VERSION=v3.7.1
-ARG PROTOBUF_HASH=6973c3a5041636c1d8dc5f7f6c8c1f3c15bc63d6
-RUN set -ex \
-    && git clone https://github.com/protocolbuffers/protobuf -b ${PROTOBUF_VERSION} \
-    && cd protobuf \
-    && test `git rev-parse HEAD` = ${PROTOBUF_HASH} || exit 1 \
-    && git submodule update --init --recursive \
-    && ./autogen.sh \
-    && ./configure --enable-static --disable-shared \
-    && make \
-    && make install \
-    && ldconfig
-
-WORKDIR /src
+ENV TARGET="x86_64-pc-linux-musl"
+WORKDIR /monero
 COPY . .
 
-ENV USE_SINGLE_BUILDDIR=1
-ARG NPROC
-RUN set -ex && \
-    git submodule init && git submodule update && \
-    rm -rf build && \
-    if [ -z "$NPROC" ] ; \
-    then make -j$(nproc) release-static ; \
-    else make -j$NPROC release-static ; \
-    fi
+RUN make -C contrib/depends -j$(nproc) download-linux NO_WALLET=1
 
-# runtime stage
-FROM ubuntu:16.04
+RUN make -C contrib/depends -j$(nproc) HOST="${TARGET}" NO_WALLET=1
 
-RUN set -ex && \
-    apt-get update && \
-    apt-get --no-install-recommends --yes install ca-certificates && \
-    apt-get clean && \
-    rm -rf /var/lib/apt
-COPY --from=builder /src/build/release/bin /usr/local/bin/
+RUN cmake --toolchain "contrib/depends/${TARGET}/share/toolchain.cmake" -S . -B build \
+        -DSTACK_TRACE=OFF \
+        -DUSE_DEVICE_TREZOR=OFF \
+        -DSTATIC_FLAGS="-static-pie" && \
+    cmake --build build --target daemon --parallel $(nproc)
 
-# Create monero user
-RUN adduser --system --group --disabled-password monero && \
-	mkdir -p /wallet /home/monero/.bitmonero && \
-	chown -R monero:monero /home/monero/.bitmonero && \
-	chown -R monero:monero /wallet
+FROM scratch
 
-# Contains the blockchain
-VOLUME /home/monero/.bitmonero
-
-# Generate your wallet via accessing the container and run:
-# cd /wallet
-# monero-wallet-cli
-VOLUME /wallet
+COPY --from=builder /monero/build/bin/monerod /
 
 EXPOSE 18080
 EXPOSE 18081
 
-# switch to user monero
-USER monero
-
-ENTRYPOINT ["monerod", "--p2p-bind-ip=0.0.0.0", "--p2p-bind-port=18080", "--rpc-bind-ip=0.0.0.0", "--rpc-bind-port=18081", "--non-interactive", "--confirm-external-bind"]
-
+ENTRYPOINT ["/monerod"]
+CMD ["--p2p-bind-ip=0.0.0.0", "--p2p-bind-port=18080", "--rpc-bind-ip=0.0.0.0", "--rpc-bind-port=18081", "--non-interactive", "--confirm-external-bind"]

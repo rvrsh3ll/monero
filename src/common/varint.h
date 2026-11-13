@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -39,7 +39,7 @@
  * \brief provides the implementation of varint's
  * 
  * The representation of varints is rather odd. The first bit of each
- * octet is significant, it represents wheter there is another part
+ * octet is significant, it represents whether there is another part
  * waiting to be read. For example 0x8002 would return 0x200, even
  * though 0x02 does not have its msb set. The actual way they are read
  * is as follows: Strip the msb of each byte, then from left to right,
@@ -57,7 +57,7 @@ namespace tools {
   enum {
     /* \brief Represents the overflow error */
     EVARINT_OVERFLOW = -1,
-    /* \brief Represents a non conical represnetation */
+    /* \brief Represents a non-canonical representation */
     EVARINT_REPRESENT = -2,
   };
 
@@ -124,5 +124,15 @@ namespace tools {
   template<typename InputIt, typename T>
     int read_varint(InputIt &&first, InputIt &&last, T &i) {
     return read_varint<std::numeric_limits<T>::digits>(std::forward<InputIt>(first), std::forward<InputIt>(last), i);
+  }
+
+  template <typename T, typename = std::enable_if_t<std::is_integral_v<T> && std::is_unsigned_v<T>>>
+  constexpr std::size_t get_varint_byte_size(T val) {
+    std::size_t bytes = 0;
+    do {
+      ++bytes;
+      val >>= 7;
+    } while (val);
+    return bytes;
   }
 }

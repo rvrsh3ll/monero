@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -45,7 +45,7 @@ namespace trezor
 {
 
   const char * TYPE_PREFIX = "MessageType_";
-  const char * PACKAGES[] = {
+  const std::string PACKAGES[] = {
       "hw.trezor.messages.",
       "hw.trezor.messages.common.",
       "hw.trezor.messages.management.",
@@ -71,9 +71,9 @@ namespace trezor
 
   google::protobuf::Message * MessageMapper::get_message(const std::string & msg_name) {
     // Each package instantiation so lookup works
-    hw::trezor::messages::common::Success::default_instance();
-    hw::trezor::messages::management::Cancel::default_instance();
-    hw::trezor::messages::monero::MoneroGetAddress::default_instance();
+    (void)hw::trezor::messages::common::Success::default_instance();
+    (void)hw::trezor::messages::management::Cancel::default_instance();
+    (void)hw::trezor::messages::monero::MoneroGetAddress::default_instance();
 
 #ifdef WITH_TREZOR_DEBUGGING
     hw::trezor::messages::debug::DebugLinkDecision::default_instance();
@@ -131,6 +131,12 @@ namespace trezor
 
     return res;
   }
+
+#ifdef PROTOBUF_HAS_ABSEIL
+  messages::MessageType MessageMapper::get_message_wire_number(const absl::string_view& msg_name) {
+    return MessageMapper::get_message_wire_number(std::string{msg_name});
+  }
+#endif
 
 }
 }

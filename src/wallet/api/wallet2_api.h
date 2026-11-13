@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -31,13 +31,15 @@
 #pragma once
 
 
-#include <string>
-#include <vector>
-#include <list>
-#include <set>
+#include <cstdint>
 #include <ctime>
 #include <iostream>
+#include <list>
+#include <optional>
+#include <set>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 //  Public interface for libwallet library
 namespace Monero {
@@ -53,18 +55,9 @@ enum NetworkType : uint8_t {
         void onStartup();
     }
 
+    // backwards compatible shim for old declaration of handmade optional<> struct
     template<typename T>
-    class optional {
-      public:
-        optional(): set(false) {}
-        optional(const T &t): t(t), set(true) {}
-        const T &operator*() const { return t; }
-        T &operator*() { return t; }
-        operator bool() const { return set; }
-      private:
-        T t;
-        bool set;
-    };
+    using optional = std::optional<T>;
 
 /**
  * @brief Transaction-like interface for sending money
@@ -95,7 +88,7 @@ struct PendingTransaction
     virtual uint64_t fee() const = 0;
     virtual std::vector<std::string> txid() const = 0;
     /*!
-     * \brief txCount - number of transactions current transaction will be splitted to
+     * \brief txCount - number of transactions current transaction will be split into
      * \return
      */
     virtual uint64_t txCount() const = 0;
@@ -147,10 +140,11 @@ struct UnsignedTransaction
     // returns a string with information about all transactions.
     virtual std::string confirmationMessage() const = 0;
     virtual std::vector<std::string> paymentId() const = 0;
+    // returns one address per destination, in the same order as amount().
     virtual std::vector<std::string> recipientAddress() const = 0;
     virtual uint64_t minMixinCount() const = 0;
     /*!
-     * \brief txCount - number of transactions current transaction will be splitted to
+     * \brief txCount - number of transactions current transaction will be split into
      * \return
      */
     virtual uint64_t txCount() const = 0;
@@ -198,6 +192,7 @@ struct TransactionInfo
     virtual std::string paymentId() const = 0;
     //! only applicable for output transactions
     virtual const std::vector<Transfer> & transfers() const = 0;
+    virtual bool isDoubleSpendSeen() const = 0;
 };
 /**
  * @brief The TransactionHistory - interface for displaying transaction history
@@ -321,9 +316,10 @@ struct SubaddressAccount
 };
 
 struct MultisigState {
-    MultisigState() : isMultisig(false), isReady(false), threshold(0), total(0) {}
+    MultisigState() : isMultisig(false), kexIsDone(false), isReady(false), threshold(0), total(0) {}
 
     bool isMultisig;
+    bool kexIsDone;
     bool isReady;
     uint32_t threshold;
     uint32_t total;
@@ -374,7 +370,7 @@ struct WalletListener
     virtual void newBlock(uint64_t height) = 0;
 
     /**
-     * @brief updated  - generic callback, called when any event (sent/received/block reveived/etc) happened with the wallet;
+     * @brief updated  - generic callback, called when any event (sent/received/block received/etc) happened with the wallet;
      */
     virtual void updated() = 0;
 
@@ -423,7 +419,6 @@ struct WalletListener
 
 /**
  * @brief Interface for wallet operations.
- *        TODO: check if /include/IWallet.h is still actual
  */
 struct Wallet
 {
@@ -445,6 +440,25 @@ struct Wallet
         ConnectionStatus_WrongVersion
     };
 
+    enum BackgroundSyncType {
+        BackgroundSync_Off = 0,
+        BackgroundSync_ReusePassword = 1,
+        BackgroundSync_CustomPassword = 2
+    };
+
+    enum MessageSignatureType {
+        MessageSignatureType_Invalid = 0,
+        MessageSignatureType_Spend,
+        MessageSignatureType_View
+    };
+
+    struct MessageSignatureResult {
+        bool valid = false;
+        unsigned version = 0;
+        bool old = false;
+        MessageSignatureType type = MessageSignatureType_Invalid;
+    };
+
     virtual ~Wallet() = 0;
     virtual std::string seed(const std::string& seed_offset = "") const = 0;
     virtual std::string getSeedLanguage() const = 0;
@@ -456,6 +470,7 @@ struct Wallet
     //! returns both error and error string atomically. suggested to use in instead of status() and errorString()
     virtual void statusWithErrorString(int& status, std::string& errorString) const = 0;
     virtual bool setPassword(const std::string &password) = 0;
+    virtual const std::string& getPassword() const = 0;
     virtual bool setDevicePin(const std::string &pin) { (void)pin; return false; };
     virtual bool setDevicePassphrase(const std::string &passphrase) { (void)passphrase; return false; };
     virtual std::string address(uint32_t accountIndex = 0, uint32_t addressIndex = 0) const = 0;
@@ -541,11 +556,13 @@ struct Wallet
      * \param upper_transaction_size_limit
      * \param daemon_username
      * \param daemon_password
-     * \param lightWallet - start wallet in light mode, connect to a openmonero compatible server.
+     * \param lightWallet - deprecated
      * \param proxy_address - set proxy address, empty string to disable
      * \return  - true on success
      */
     virtual bool init(const std::string &daemon_address, uint64_t upper_transaction_size_limit = 0, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") = 0;
+    virtual void allowMismatchedDaemonVersion(bool allow_mismatch) = 0;
+    virtual void setRingDatabase(const std::string &path) = 0;
 
    /*!
     * \brief createWatchOnly - Creates a watch only wallet
@@ -586,8 +603,8 @@ struct Wallet
     /*!
      * \brief setSubaddressLookahead - set size of subaddress lookahead
      *
-     * \param major - size fot the major index
-     * \param minor - size fot the minor index
+     * \param major - size for the major index
+     * \param minor - size for the minor index
      */
     virtual void setSubaddressLookahead(uint32_t major, uint32_t minor) = 0;
 
@@ -699,7 +716,11 @@ struct Wallet
     static void warning(const std::string &category, const std::string &str);
     static void error(const std::string &category, const std::string &str);
 
-   /**
+    virtual bool getPolyseed(std::string &seed, uint64_t &birthday, bool &is_encrypted) const = 0;
+    static bool createPolyseed(std::string &seed_words, std::string &err, const std::string &language = "English");
+    static std::vector<std::pair<std::string, std::string>> getPolyseedLanguages();
+
+  /**
     * @brief StartRefresh - Start/resume refresh thread (refresh every 10 seconds)
     */
     virtual void startRefresh() = 0;
@@ -726,7 +747,7 @@ struct Wallet
     virtual bool rescanBlockchain() = 0;
 
     /**
-     * @brief rescanBlockchainAsync - rescans wallet asynchronously, starting from genesys
+     * @brief rescanBlockchainAsync - rescans wallet asynchronously, starting from genesis
      */
     virtual void rescanBlockchainAsync() = 0;
 
@@ -789,25 +810,29 @@ struct Wallet
     /**
      * @brief makeMultisig - switches wallet in multisig state. The one and only creation phase for N / N wallets
      * @param info - vector of multisig infos from other participants obtained with getMulitisInfo call
-     * @param threshold - number of required signers to make valid transaction. Must be equal to number of participants (N) or N - 1
+     * @param threshold - number of required signers to make valid transaction. Must be <= number of participants
      * @return in case of N / N wallets returns empty string since no more key exchanges needed. For N - 1 / N wallets returns base58 encoded extra multisig info
      */
     virtual std::string makeMultisig(const std::vector<std::string>& info, uint32_t threshold) = 0;
     /**
      * @brief exchange_multisig_keys - provides additional key exchange round for arbitrary multisig schemes (like N-1/N, M/N)
      * @param info - base58 encoded key derivations returned by makeMultisig or exchangeMultisigKeys function call
+     * @param force_update_use_with_caution - force multisig account to update even if not all signers contribute round messages
      * @return new info string if more rounds required or an empty string if wallet creation is done
      */
-    virtual std::string exchangeMultisigKeys(const std::vector<std::string> &info) = 0;
+    virtual std::string exchangeMultisigKeys(const std::vector<std::string> &info, const bool force_update_use_with_caution) = 0;
     /**
-     * @brief finalizeMultisig - finalizes N - 1 / N multisig wallets creation
-     * @param extraMultisigInfo - wallet participants' extra multisig info obtained with makeMultisig call
-     * @return true if success
+     * @brief getMultisigKeyExchangeBooster - obtain partial information for the key exchange round after the in-progress round,
+     *                                        to speed up another signer's key exchange process
+     * @param info - base58 encoded key derivations returned by makeMultisig or exchangeMultisigKeys function call
+     * @param threshold - number of required signers to make valid transaction. Must be <= number of participants.
+     * @param num_signers - total number of multisig participants.
+     * @return new info string if more rounds required or exception if no more rounds (i.e. no rounds to boost)
      */
-    virtual bool finalizeMultisig(const std::vector<std::string>& extraMultisigInfo) = 0;
+    virtual std::string getMultisigKeyExchangeBooster(const std::vector<std::string> &info, const uint32_t threshold, const uint32_t num_signers) = 0;
     /**
      * @brief exportMultisigImages - exports transfers' key images
-     * @param images - output paramter for hex encoded array of images
+     * @param images - output parameter for hex encoded array of images
      * @return true if success
      */
     virtual bool exportMultisigImages(std::string& images) = 0;
@@ -919,6 +944,62 @@ struct Wallet
     */
     virtual bool importKeyImages(const std::string &filename) = 0;
 
+    /*!
+     * \brief importOutputs - exports outputs to file
+     * \param filename
+     * \return                  - true on success
+     */
+    virtual bool exportOutputs(const std::string &filename, bool all = false) = 0;
+
+    /*!
+     * \brief importOutputs - imports outputs from file
+     * \param filename
+     * \return                  - true on success
+     */
+    virtual bool importOutputs(const std::string &filename) = 0;
+
+    /*!
+     * \brief scanTransactions - scan a list of transaction ids, this operation may reveal the txids to the remote node and affect your privacy
+     * \param txids            - list of transaction ids
+     * \return                 - true on success
+     */
+    virtual bool scanTransactions(const std::vector<std::string> &txids) = 0;
+
+    /*!
+     * \brief setupBackgroundSync       - setup background sync mode with just a view key
+     * \param background_sync_type      - the mode the wallet background syncs in
+     * \param wallet_password
+     * \param background_cache_password - custom password to encrypt background cache, only needed for custom password background sync type
+     * \return                          - true on success
+     */
+    virtual bool setupBackgroundSync(const BackgroundSyncType background_sync_type, const std::string &wallet_password, const optional<std::string> &background_cache_password) = 0;
+
+    /*!
+     * \brief getBackgroundSyncType     - get mode the wallet background syncs in
+     * \return                          - the type, or off if type is unknown
+     */
+    virtual BackgroundSyncType getBackgroundSyncType() const = 0;
+
+    /**
+     * @brief startBackgroundSync - sync the chain in the background with just view key
+     */
+    virtual bool startBackgroundSync() = 0;
+
+    /**
+     * @brief stopBackgroundSync  - bring back spend key and process background synced txs
+     * \param wallet_password
+     */
+    virtual bool stopBackgroundSync(const std::string &wallet_password) = 0;
+
+    /**
+     * @brief isBackgroundSyncing - returns true if the wallet is background syncing
+     */
+    virtual bool isBackgroundSyncing() const = 0;
+
+    /**
+     * @brief isBackgroundWallet - returns true if the wallet is a background wallet
+     */
+    virtual bool isBackgroundWallet() const = 0;
 
     virtual TransactionHistory * history() = 0;
     virtual AddressBook * addressBook() = 0;
@@ -931,7 +1012,7 @@ struct Wallet
      */
     virtual uint32_t defaultMixin() const = 0;
     /*!
-     * \brief setDefaultMixin - setum number of mixins to be used for new transactions
+     * \brief setDefaultMixin - sets the number of mixins to be used for new transactions
      * \param arg
      */
     virtual void setDefaultMixin(uint32_t arg) = 0;
@@ -980,7 +1061,7 @@ struct Wallet
      * \param message - the message to sign (arbitrary byte data)
      * \return the signature
      */
-    virtual std::string signMessage(const std::string &message) = 0;
+    virtual std::string signMessage(const std::string &message, const std::string &address = "") = 0;
     /*!
      * \brief verifySignedMessage - verify a signature matches a given message
      * \param message - the message (arbitrary byte data)
@@ -989,6 +1070,14 @@ struct Wallet
      * \return true if the signature verified, false otherwise
      */
     virtual bool verifySignedMessage(const std::string &message, const std::string &addres, const std::string &signature) const = 0;
+    /*!
+     * \brief verifySignedMessageWithDetails - verify a signature and identify the signing key and algorithm
+     * \param message - the message (arbitrary byte data)
+     * \param address - the address the signature claims to be made with
+     * \param signature - the signature
+     * \return the verification result, including the signature version and key type
+     */
+    virtual MessageSignatureResult verifySignedMessageWithDetails(const std::string &message, const std::string &address, const std::string &signature) const = 0;
 
     /*!
      * \brief signMultisigParticipant   signs given message with the multisig public signer key
@@ -1006,6 +1095,7 @@ struct Wallet
     virtual bool verifyMessageWithPublicKey(const std::string &message, const std::string &publicKey, const std::string &signature) const = 0;
 
     virtual bool parse_uri(const std::string &uri, std::string &address, std::string &payment_id, uint64_t &amount, std::string &tx_description, std::string &recipient_name, std::vector<std::string> &unknown_parameters, std::string &error) = 0;
+    virtual std::string make_uri(const std::string &address, const std::string &payment_id, uint64_t amount, const std::string &tx_description, const std::string &recipient_name, std::string &error) const = 0;
 
     virtual std::string getDefaultDataDir() const = 0;
    
@@ -1020,15 +1110,7 @@ struct Wallet
     * \param offline - true/false
     */
     virtual void setOffline(bool offline) = 0;
-    
-    //! blackballs a set of outputs
-    virtual bool blackballOutputs(const std::vector<std::string> &outputs, bool add) = 0;
-
-    //! blackballs an output
-    virtual bool blackballOutput(const std::string &amount, const std::string &offset) = 0;
-
-    //! unblackballs an output
-    virtual bool unblackballOutput(const std::string &amount, const std::string &offset) = 0;
+    virtual bool isOffline() const = 0;
 
     //! gets the ring used for a key image, if any
     virtual bool getRing(const std::string &key_image, std::vector<uint64_t> &ring) const = 0;
@@ -1048,12 +1130,6 @@ struct Wallet
     //! secondary key reuse mitigation
     virtual void keyReuseMitigation2(bool mitigation) = 0;
 
-    //! Light wallet authenticate and login
-    virtual bool lightWalletLogin(bool &isNewWallet) const = 0;
-    
-    //! Initiates a light wallet import wallet request
-    virtual bool lightWalletImportWalletRequest(std::string &payment_id, uint64_t &fee, bool &new_request, bool &request_fulfilled, std::string &payment_address, std::string &status) = 0;
-
     //! locks/unlocks the keys file; returns true on success
     virtual bool lockKeysFile() = 0;
     virtual bool unlockKeysFile() = 0;
@@ -1071,6 +1147,15 @@ struct Wallet
 
     //! shows address on device display
     virtual void deviceShowAddress(uint32_t accountIndex, uint32_t addressIndex, const std::string &paymentId) = 0;
+
+    //! attempt to reconnect to hardware device
+    virtual bool reconnectDevice() = 0;
+
+    //! get bytes received
+    virtual uint64_t getBytesReceived() = 0;
+
+    //! get bytes sent
+    virtual uint64_t getBytesSent() = 0;
 };
 
 /**
@@ -1078,6 +1163,7 @@ struct Wallet
  */
 struct WalletManager
 {
+    virtual ~WalletManager() = 0;
 
     /*!
      * \brief  Creates new wallet
@@ -1230,6 +1316,27 @@ struct WalletManager
                                             WalletListener * listener = nullptr) = 0;
 
     /*!
+     * \brief creates a wallet from a Polyseed mnemonic phrase
+     * \param path                         Name of the wallet file to be created
+     * \param password                     Password of wallet file
+     * \param nettype                      Network type
+     * \param mnemonic                     Polyseed mnemonic
+     * \param passphrase                   Optional seed offset passphrase
+     * \param newWallet                    Whether it is a new wallet
+     * \param restoreHeight                Override the embedded restore height if recovering
+     * \param kdf_rounds                   Number of rounds for key derivation function
+     * @return
+     */
+    virtual Wallet * createWalletFromPolyseed(const std::string &path,
+                                              const std::string &password,
+                                              NetworkType nettype,
+                                              const std::string &mnemonic,
+                                              const std::string &passphrase = "",
+                                              bool newWallet = true,
+                                              uint64_t restore_height = 0,
+                                              uint64_t kdf_rounds = 1) = 0;
+
+/*!
      * \brief Closes wallet. In case operation succeeded, wallet object deleted. in case operation failed, wallet object not deleted
      * \param wallet        previously opened / created wallet instance
      * \return              None
@@ -1349,6 +1456,3 @@ struct WalletManagerFactory
 
 
 }
-
-namespace Bitmonero = Monero;
-

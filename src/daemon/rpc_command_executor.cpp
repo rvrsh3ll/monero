@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -37,7 +37,6 @@
 #include "cryptonote_core/cryptonote_core.h"
 #include "cryptonote_basic/difficulty.h"
 #include "cryptonote_basic/hardfork.h"
-#include "rpc/rpc_payment_signature.h"
 #include "rpc/rpc_version_str.h"
 #include <boost/format.hpp>
 #include <ctime>
@@ -437,10 +436,6 @@ static float get_sync_percentage(uint64_t height, uint64_t target_height)
     return 99.9f; // to avoid 100% when not fully synced
   return pc;
 }
-static float get_sync_percentage(const cryptonote::COMMAND_RPC_GET_INFO::response &ires)
-{
-  return get_sync_percentage(ires.height, ires.target_height);
-}
 
 bool t_rpc_command_executor::show_status() {
   cryptonote::COMMAND_RPC_GET_INFO::request ireq;
@@ -500,27 +495,13 @@ bool t_rpc_command_executor::show_status() {
 
   std::time_t uptime = std::time(nullptr) - ires.start_time;
   uint64_t net_height = ires.target_height > ires.height ? ires.target_height : ires.height;
-  std::string bootstrap_msg;
-  if (ires.was_bootstrap_ever_used)
-  {
-    bootstrap_msg = ", bootstrapping from " + ires.bootstrap_daemon_address;
-    if (ires.untrusted)
-    {
-      bootstrap_msg += (boost::format(", local height: %llu (%.1f%%)") % ires.height_without_bootstrap % get_sync_percentage(ires.height_without_bootstrap, net_height)).str();
-    }
-    else
-    {
-      bootstrap_msg += " was used before";
-    }
-  }
 
   std::stringstream str;
-  str << boost::format("Height: %llu/%llu (%.1f%%) on %s%s, %s, net hash %s, v%u%s, %u(out)+%u(in) connections")
+  str << boost::format("Height: %llu/%llu (%.1f%%) on %s, %s, net hash %s, v%u%s, %u(out)+%u(in) connections")
     % (unsigned long long)ires.height
     % (unsigned long long)net_height
-    % get_sync_percentage(ires)
+    % get_sync_percentage(ires.height, ires.target_height)
     % (ires.testnet ? "testnet" : ires.stagenet ? "stagenet" : "mainnet")
-    % bootstrap_msg
     % (!has_mining_info ? "mining info unavailable" : mining_busy ? "syncing" : mres.active ? ( ( mres.is_background_mining_enabled ? "smart " : "" ) + std::string("mining at ") + get_mining_speed(mres.speed)) : "not mining")
     % get_mining_speed(cryptonote::difficulty_type(ires.wide_difficulty) / ires.target)
     % (unsigned)hfres.version
@@ -613,7 +594,7 @@ bool t_rpc_command_executor::mining_status() {
     double ratio = mres.speed * mres.block_target / (double)mres.difficulty;
     uint64_t daily = 86400ull / mres.block_target * mres.block_reward * ratio;
     uint64_t monthly = 86400ull / mres.block_target * 30.5 * mres.block_reward * ratio;
-    uint64_t yearly = 86400ull / mres.block_target * 356 * mres.block_reward * ratio;
+    uint64_t yearly = 86400ull / mres.block_target * 365 * mres.block_reward * ratio;
     tools::msg_writer() << "Expected: " << cryptonote::print_money(daily) << " monero daily, "
         << cryptonote::print_money(monthly) << " monero monthly, " << cryptonote::print_money(yearly) << " yearly";
   }
@@ -644,14 +625,18 @@ bool t_rpc_command_executor::print_connections() {
     }
   }
 
-  tools::msg_writer() << std::setw(30) << std::left << "Remote Host"
+  int host_field_width = 15;
+  for (const auto &conn : res.connections)
+    host_field_width = std::max(host_field_width, 8 + (int) conn.address.length());
+
+  tools::msg_writer() << std::setw(host_field_width) << std::left << "Remote Host"
       << std::setw(8) << "Type"
       << std::setw(6) << "SSL"
       << std::setw(20) << "Peer id"
       << std::setw(20) << "Support Flags"      
       << std::setw(30) << "Recv/Sent (inactive,sec)"
       << std::setw(25) << "State"
-      << std::setw(20) << "Livetime(sec)"
+      << std::setw(20) << "Lifetime(sec)"
       << std::setw(12) << "Down (kB/s)"
       << std::setw(14) << "Down(now)"
       << std::setw(10) << "Up (kB/s)" 
@@ -661,11 +646,11 @@ bool t_rpc_command_executor::print_connections() {
   for (auto & info : res.connections)
   {
     std::string address = info.incoming ? "INC " : "OUT ";
-    address += info.ip + ":" + info.port;
+    address += info.address;
     //std::string in_out = info.incoming ? "INC " : "OUT ";
     tools::msg_writer() 
      //<< std::setw(30) << std::left << in_out
-     << std::setw(30) << std::left << address
+     << std::setw(host_field_width) << std::left << address
      << std::setw(8) << (get_address_type_name((epee::net_utils::address_type)info.address_type))
      << std::setw(6) << (info.ssl ? "yes" : "no")
      << std::setw(20) << info.peer_id
@@ -775,7 +760,7 @@ bool t_rpc_command_executor::print_blockchain_info(int64_t start_block_index, ui
         return true;
       }
     }
-    if (start_block_index < 0 && (uint64_t)-start_block_index >= ires.height)
+    if ((uint64_t)-start_block_index >= ires.height)
     {
       tools::fail_msg_writer() << "start offset is larger than blockchain height";
       return true;
@@ -1002,23 +987,20 @@ bool t_rpc_command_executor::print_transaction(crypto::hash transaction_hash,
     }
   }
 
-  if (1 == res.txs.size() || 1 == res.txs_as_hex.size())
+  if (1 == res.txs.size())
   {
-    if (1 == res.txs.size())
-    {
-      // only available for new style answers
-      static const std::string empty_hash = epee::string_tools::pod_to_hex(crypto::cn_fast_hash("", 0));
-      // prunable_hash will equal empty_hash when nothing is prunable (mostly when the transaction is coinbase)
-      bool pruned = res.txs.front().prunable_as_hex.empty() && res.txs.front().prunable_hash != epee::string_tools::pod_to_hex(crypto::null_hash) && res.txs.front().prunable_hash != empty_hash;
-      if (res.txs.front().in_pool)
-        tools::success_msg_writer() << "Found in pool";
-      else
-        tools::success_msg_writer() << "Found in blockchain at height " << res.txs.front().block_height << (pruned ? " (pruned)" : "");
-    }
+    // only available for new style answers
+    static const std::string empty_hash = epee::string_tools::pod_to_hex(crypto::cn_fast_hash("", 0));
+    // prunable_hash will equal empty_hash when nothing is prunable (mostly when the transaction is coinbase)
+    bool pruned = res.txs.front().prunable_as_hex.empty() && res.txs.front().prunable_hash != epee::string_tools::pod_to_hex(crypto::null_hash) && res.txs.front().prunable_hash != empty_hash;
+    if (res.txs.front().in_pool)
+      tools::success_msg_writer() << "Found in pool";
+    else
+      tools::success_msg_writer() << "Found in blockchain at height " << res.txs.front().block_height << (pruned ? " (pruned)" : "");
 
-    const std::string &as_hex = (1 == res.txs.size()) ? res.txs.front().as_hex : res.txs_as_hex.front();
-    const std::string &pruned_as_hex = (1 == res.txs.size()) ? res.txs.front().pruned_as_hex : "";
-    const std::string &prunable_as_hex = (1 == res.txs.size()) ? res.txs.front().prunable_as_hex : "";
+    const std::string &as_hex = res.txs.front().as_hex;
+    const std::string &pruned_as_hex = res.txs.front().pruned_as_hex;
+    const std::string &prunable_as_hex = res.txs.front().prunable_as_hex;
     // Print metadata if requested
     if (include_metadata)
     {
@@ -1063,7 +1045,7 @@ bool t_rpc_command_executor::print_transaction(crypto::hash transaction_hash,
       cryptonote::blobdata blob;
       std::string source = as_hex.empty() ? pruned_as_hex + prunable_as_hex : as_hex;
       bool pruned = !pruned_as_hex.empty() && prunable_as_hex.empty();
-      if (!string_tools::parse_hexstr_to_binbuff(source, blob))
+      if (!epee::string_tools::parse_hexstr_to_binbuff(source, blob))
       {
         tools::fail_msg_writer() << "Failed to parse tx to get json format";
       }
@@ -1403,6 +1385,33 @@ bool t_rpc_command_executor::stop_mining() {
   }
 
   tools::success_msg_writer() << "Mining stopped";
+  return true;
+}
+
+bool t_rpc_command_executor::generate_blocks(const std::string& address, uint64_t amount, uint32_t starting_nonce)
+{
+  cryptonote::COMMAND_RPC_GENERATEBLOCKS::request req;
+  cryptonote::COMMAND_RPC_GENERATEBLOCKS::response res;
+  epee::json_rpc::error error_resp;
+  req.wallet_address = address;
+  req.amount_of_blocks = amount;
+  req.starting_nonce = starting_nonce;
+
+  const std::string fail_message = "Failed to generate blocks";
+  if (m_is_rpc)
+  {
+    if (!m_rpc_client->json_rpc_request(req, res, "generateblocks", fail_message))
+      return true;
+  }
+  else if (!m_rpc_server->on_generateblocks(req, res, error_resp) || res.status != CORE_RPC_STATUS_OK)
+  {
+    tools::fail_msg_writer() << (error_resp.message.empty() ? make_error(fail_message, res.status) : error_resp.message);
+    return true;
+  }
+
+  tools::success_msg_writer() << "Generated " << res.blocks.size()
+                              << (res.blocks.size() == 1 ? " block" : " blocks")
+                              << ", last block height " << res.height;
   return true;
 }
 
@@ -2035,7 +2044,7 @@ bool t_rpc_command_executor::alt_chain_info(const std::string &tip, size_t above
         if (start_difficulty > 0)
           tools::msg_writer() << "Approximated " << 100.f * DIFFICULTY_TARGET_V2 * chain.length / dt << "% of network hash rate";
         else
-          tools::fail_msg_writer() << "Bad cmumulative difficulty reported by dameon";
+          tools::fail_msg_writer() << "Bad cumulative difficulty reported by daemon";
       }
     }
     else
@@ -2310,13 +2319,14 @@ bool t_rpc_command_executor::sync_info()
     return true;
 }
 
-bool t_rpc_command_executor::pop_blocks(uint64_t num_blocks)
+bool t_rpc_command_executor::pop_blocks(uint64_t num_blocks, bool keep_txs)
 {
   cryptonote::COMMAND_RPC_POP_BLOCKS::request req;
   cryptonote::COMMAND_RPC_POP_BLOCKS::response res;
   std::string fail_message = "pop_blocks failed";
 
   req.nblocks = num_blocks;
+  req.keep_txs = keep_txs;
   if (m_is_rpc)
   {
     if (!m_rpc_client->rpc_request(req, res, "/pop_blocks", fail_message.c_str()))
@@ -2402,52 +2412,13 @@ bool t_rpc_command_executor::check_blockchain_pruning()
     return true;
 }
 
-bool t_rpc_command_executor::set_bootstrap_daemon(
-  const std::string &address,
-  const std::string &username,
-  const std::string &password,
-  const std::string &proxy)
-{
-    cryptonote::COMMAND_RPC_SET_BOOTSTRAP_DAEMON::request req;
-    cryptonote::COMMAND_RPC_SET_BOOTSTRAP_DAEMON::response res;
-    const std::string fail_message = "Unsuccessful";
-
-    req.address = address;
-    req.username = username;
-    req.password = password;
-    req.proxy = proxy;
-
-    if (m_is_rpc)
-    {
-        if (!m_rpc_client->rpc_request(req, res, "/set_bootstrap_daemon", fail_message))
-        {
-            return true;
-        }
-    }
-    else
-    {
-        if (!m_rpc_server->on_set_bootstrap_daemon(req, res) || res.status != CORE_RPC_STATUS_OK)
-        {
-            tools::fail_msg_writer() << make_error(fail_message, res.status);
-            return true;
-        }
-    }
-
-    tools::success_msg_writer()
-      << "Successfully set bootstrap daemon address to "
-      << (!req.address.empty() ? req.address : "none");
-
-    return true;
-}
-
-bool t_rpc_command_executor::flush_cache(bool bad_txs, bool bad_blocks)
+bool t_rpc_command_executor::flush_cache(bool bad_blocks)
 {
     cryptonote::COMMAND_RPC_FLUSH_CACHE::request req;
     cryptonote::COMMAND_RPC_FLUSH_CACHE::response res;
     std::string fail_message = "Unsuccessful";
     epee::json_rpc::error error_resp;
 
-    req.bad_txs = bad_txs;
     req.bad_blocks = bad_blocks;
 
     if (m_is_rpc)
@@ -2465,47 +2436,6 @@ bool t_rpc_command_executor::flush_cache(bool bad_txs, bool bad_blocks)
             return true;
         }
     }
-
-    return true;
-}
-
-bool t_rpc_command_executor::rpc_payments()
-{
-    cryptonote::COMMAND_RPC_ACCESS_DATA::request req;
-    cryptonote::COMMAND_RPC_ACCESS_DATA::response res;
-    std::string fail_message = "Unsuccessful";
-    epee::json_rpc::error error_resp;
-
-    if (m_is_rpc)
-    {
-        if (!m_rpc_client->json_rpc_request(req, res, "rpc_access_data", fail_message.c_str()))
-        {
-            return true;
-        }
-    }
-    else
-    {
-        if (!m_rpc_server->on_rpc_access_data(req, res, error_resp) || res.status != CORE_RPC_STATUS_OK)
-        {
-            tools::fail_msg_writer() << make_error(fail_message, res.status);
-            return true;
-        }
-    }
-
-    const uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    uint64_t balance = 0;
-    tools::msg_writer() << boost::format("%64s %16u %16u %8u %8u %8u %8u %s")
-        % "Client ID" % "Balance" % "Total mined" % "Good" % "Stale" % "Bad" % "Dupes" % "Last update";
-    for (const auto &entry: res.entries)
-    {
-      tools::msg_writer() << boost::format("%64s %16u %16u %8u %8u %8u %8u %s")
-          % entry.client % entry.balance % entry.credits_total
-          % entry.nonces_good % entry.nonces_stale % entry.nonces_bad % entry.nonces_dupe
-          % (entry.last_update_time == 0 ? "never" : get_human_time_ago(entry.last_update_time, now).c_str());
-      balance += entry.balance;
-    }
-    tools::msg_writer() << res.entries.size() << " clients with a total of " << balance << " credits";
-    tools::msg_writer() << "Aggregated client hash rate: " << get_mining_speed(res.hashrate);
 
     return true;
 }

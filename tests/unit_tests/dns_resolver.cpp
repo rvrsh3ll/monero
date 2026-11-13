@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -41,15 +41,11 @@ TEST(DNSResolver, IPv4Success)
 
   auto ips = resolver.get_ipv4("example.com", avail, valid);
 
-  ASSERT_EQ(1, ips.size());
-
-  //ASSERT_STREQ("93.184.216.119", ips[0].c_str());
+  ASSERT_LE(1, ips.size());
 
   ips = tools::DNSResolver::instance().get_ipv4("example.com", avail, valid);
 
-  ASSERT_EQ(1, ips.size());
-
-  //ASSERT_STREQ("93.184.216.119", ips[0].c_str());
+  ASSERT_LE(1, ips.size());
 }
 
 TEST(DNSResolver, IPv4Failure)
@@ -76,9 +72,7 @@ TEST(DNSResolver, DNSSECSuccess)
 
   auto ips = resolver.get_ipv4("example.com", avail, valid);
 
-  ASSERT_EQ(1, ips.size());
-
-  //ASSERT_STREQ("93.184.216.119", ips[0].c_str());
+  ASSERT_LE(1, ips.size());
 
   ASSERT_TRUE(avail);
   ASSERT_TRUE(valid);
@@ -100,8 +94,7 @@ TEST(DNSResolver, DNSSECFailure)
   ASSERT_FALSE(valid);
 }
 
-// It would be great to include an IPv6 test and assume it'll pass, but not every ISP / resolver plays nicely with IPv6;)
-/*TEST(DNSResolver, IPv6Success)
+TEST(DNSResolver, IPv6Success)
 {
   tools::DNSResolver resolver = tools::DNSResolver::create();
 
@@ -109,16 +102,12 @@ TEST(DNSResolver, DNSSECFailure)
 
   auto ips = resolver.get_ipv6("example.com", avail, valid);
 
-  ASSERT_EQ(1, ips.size());
-
-  ASSERT_STREQ("2606:2800:220:6d:26bf:1447:1097:aa7", ips[0].c_str());
+  ASSERT_LE(1, ips.size());
 
   ips = tools::DNSResolver::instance().get_ipv6("example.com", avail, valid);
 
-  ASSERT_EQ(1, ips.size());
-
-  ASSERT_STREQ("2606:2800:220:6d:26bf:1447:1097:aa7", ips[0].c_str());
-}*/
+  ASSERT_LE(1, ips.size());
+}
 
 TEST(DNSResolver, IPv6Failure)
 {
@@ -158,10 +147,21 @@ TEST(DNSResolver, GetTXTRecord)
   EXPECT_STREQ("donate.getmonero.org", addr.c_str());
 }
 
+TEST(DNSResolver, Localhost)
+{
+  tools::DNSResolver resolver = tools::DNSResolver::create();
+
+  bool avail, valid;
+  std::vector<std::string> ips = resolver.get_ipv4("localhost", avail, valid);
+
+  ASSERT_EQ(1, ips.size());
+  ASSERT_EQ("127.0.0.1", ips[0]);
+}
+
 bool is_equal(const char *s, const std::vector<std::string> &v) { return v.size() == 1 && v[0] == s; }
 
 TEST(DNS_PUBLIC, empty) { EXPECT_TRUE(tools::dns_utils::parse_dns_public("").empty()); }
-TEST(DNS_PUBLIC, default) { EXPECT_TRUE(tools::dns_utils::parse_dns_public("tcp").size() > 0); }
+TEST(DNS_PUBLIC, default) { EXPECT_GT(tools::dns_utils::parse_dns_public("tcp").size(), 1); }
 TEST(DNS_PUBLIC, invalid_scheme) { EXPECT_TRUE(tools::dns_utils::parse_dns_public("invalid").empty()); }
 TEST(DNS_PUBLIC, invalid_ip_alpha) { EXPECT_TRUE(tools::dns_utils::parse_dns_public("tcp://invalid").empty()); }
 TEST(DNS_PUBLIC, invalid_ip_num1) { EXPECT_TRUE(tools::dns_utils::parse_dns_public("tcp://3").empty()); }

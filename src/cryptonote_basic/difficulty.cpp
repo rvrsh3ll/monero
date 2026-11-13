@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -32,6 +32,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "int-util.h"
@@ -102,18 +103,25 @@ namespace cryptonote {
     return a + b < a || (c && a + b == (uint64_t) -1);
   }
 
+  static inline uint64_t load_u64_from_hash(const crypto::hash &hash, size_t index) {
+    assert(index < sizeof(hash.data) / sizeof(uint64_t));
+    uint64_t word;
+    memcpy(&word, hash.data + index * sizeof(word), sizeof(word));
+    return SWAP64LE(word);
+  }
+
   bool check_hash_64(const crypto::hash &hash, uint64_t difficulty) {
     uint64_t low, high, top, cur;
     // First check the highest word, this will most likely fail for a random hash.
-    mul(swap64le(((const uint64_t *) &hash)[3]), difficulty, top, high);
+    mul(load_u64_from_hash(hash, 3), difficulty, top, high);
     if (high != 0) {
       return false;
     }
-    mul(swap64le(((const uint64_t *) &hash)[0]), difficulty, low, cur);
-    mul(swap64le(((const uint64_t *) &hash)[1]), difficulty, low, high);
+    mul(load_u64_from_hash(hash, 0), difficulty, low, cur);
+    mul(load_u64_from_hash(hash, 1), difficulty, low, high);
     bool carry = cadd(cur, low);
     cur = high;
-    mul(swap64le(((const uint64_t *) &hash)[2]), difficulty, low, high);
+    mul(load_u64_from_hash(hash, 2), difficulty, low, high);
     carry = cadc(cur, low, carry);
     carry = cadc(high, top, carry);
     return !carry;
@@ -162,12 +170,6 @@ namespace cryptonote {
     return (low + time_span - 1) / time_span;
   }
 
-#if defined(_MSC_VER)
-#ifdef max
-#undef max
-#endif
-#endif
-
   const difficulty_type max64bit(std::numeric_limits<std::uint64_t>::max());
   const boost::multiprecision::uint256_t max128bit(std::numeric_limits<boost::multiprecision::uint128_t>::max());
   const boost::multiprecision::uint512_t max256bit(std::numeric_limits<boost::multiprecision::uint256_t>::max());
@@ -177,7 +179,7 @@ namespace cryptonote {
   bool check_hash_128(const crypto::hash &hash, difficulty_type difficulty) {
 #ifndef FORCE_FULL_128_BITS
     // fast check
-    if (difficulty >= max64bit && ((const uint64_t *) &hash)[3] > 0)
+    if (difficulty >= max64bit && load_u64_from_hash(hash, 3) > 0)
       return false;
 #endif
     // usual slow check
@@ -188,7 +190,7 @@ namespace cryptonote {
     for(int i = 1; i < 4; i++) { // highest word is zero
 #endif
       hashVal <<= 64;
-      hashVal |= swap64le(((const uint64_t *) &hash)[3 - i]);
+      hashVal |= load_u64_from_hash(hash, 3 - i);
     }
     return hashVal * difficulty <= max256bit;
   }

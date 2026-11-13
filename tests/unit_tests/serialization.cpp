@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -35,6 +35,7 @@
 #include <vector>
 #include <boost/foreach.hpp>
 #include <boost/archive/portable_binary_iarchive.hpp>
+#include <boost/type_traits/make_unsigned.hpp>
 #include "cryptonote_basic/cryptonote_basic.h"
 #include "cryptonote_basic/cryptonote_basic_impl.h"
 #include "ringct/rctSigs.h"
@@ -45,23 +46,90 @@
 #include "serialization/containers.h"
 #include "serialization/binary_utils.h"
 #include "wallet/wallet2.h"
+#include "wallet/wallet2_basic/wallet2_boost_serialization.h"
+#include "wallet/wallet2_basic/wallet2_serialization.h"
 #include "gtest/gtest.h"
 #include "unit_tests_utils.h"
 #include "device/device.hpp"
 using namespace std;
 using namespace crypto;
 
+static_assert(!std::is_trivially_copyable<std::vector<unsigned char>>(),
+  "should fail to compile when applying blob serializer");
+static_assert(!std::is_trivially_copyable<std::string>(),
+  "should fail to compile when applying blob serializer");
+
+/**
+ * Test convergence of std::make_unsigned against boost::make_unsigned for
+ * scoped enums with explicit underlying types
+ */
+#define DEFINE_SCOPED_UNDERLYING_ENUM(u) \
+    enum class E_ ## u : u { A_##u = static_cast<u>(-1), B_##u = 0, C_##u };                   \
+    static_assert(std::is_same_v<std::underlying_type_t<E_##u>, u>);                           \
+    static_assert(sizeof(std::make_unsigned_t<E_##u>) == sizeof(std::make_unsigned_t<u>));     \
+    static_assert(std::is_same_v<std::make_unsigned_t<E_##u>, boost::make_unsigned_t<E_##u>>);
+
+DEFINE_SCOPED_UNDERLYING_ENUM(uint8_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(uint16_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(uint32_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(uint64_t)
+//DEFINE_SCOPED_UNDERLYING_ENUM(__uint128_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(int8_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(int16_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(int32_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(int64_t)
+//DEFINE_SCOPED_UNDERLYING_ENUM(__int128_t)
+DEFINE_SCOPED_UNDERLYING_ENUM(size_t)
+
+/**
+ * Test convergence of std::make_unsigned against boost::make_unsigned for
+ * unscoped enums with explicit underlying types
+ */
+#define DEFINE_UNSCOPED_UNDERLYING_ENUM(u) \
+    enum class UE_ ## u : u { A_##u = static_cast<u>(-1), B_##u = 0, C_##u };                    \
+    static_assert(std::is_same_v<std::underlying_type_t<UE_##u>, u>);                            \
+    static_assert(sizeof(std::make_unsigned_t<UE_##u>) == sizeof(std::make_unsigned_t<u>));      \
+    static_assert(std::is_same_v<std::make_unsigned_t<UE_##u>, boost::make_unsigned_t<UE_##u>>);
+
+DEFINE_UNSCOPED_UNDERLYING_ENUM(uint8_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(uint16_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(uint32_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(uint64_t)
+//DEFINE_UNSCOPED_UNDERLYING_ENUM(__uint128_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(int8_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(int16_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(int32_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(int64_t)
+//DEFINE_UNSCOPED_UNDERLYING_ENUM(__int128_t)
+DEFINE_UNSCOPED_UNDERLYING_ENUM(size_t)
+
+/**
+ * Test convergence of std::make_unsigned against boost::make_unsigned for
+ * unscoped enums with implicit underlying types
+ */
+#define TEST_MAKE_UNSIGNED_ENUM(e) \
+  static_assert(std::is_same_v<std::make_unsigned_t<e>, boost::make_unsigned_t<e>>);
+enum IUE1 { A1, B1, C1 };
+#if defined(__GNUC__) && !defined(__clang__)
+  TEST_MAKE_UNSIGNED_ENUM(IUE1) // may break for GCC later too, or Boost might fix it first
+#endif
+enum IUE2 { A2 = -1, B2, C2 };
+TEST_MAKE_UNSIGNED_ENUM(IUE2)
+
 struct Struct
 {
   int32_t a;
   int32_t b;
   char blob[8];
+
+  bool operator==(const Struct &other) const
+  {
+    return a == other.a && b == other.b && 0 == memcmp(blob, other.blob, sizeof(blob));
+  }
 };
 
 template <class Archive>
-struct serializer<Archive, Struct>
-{
-  static bool serialize(Archive &ar, Struct &s) {
+static bool do_serialize(Archive &ar, Struct &s) {
     ar.begin_object();
     ar.tag("a");
     ar.serialize_int(s.a);
@@ -71,8 +139,7 @@ struct serializer<Archive, Struct>
     ar.serialize_blob(s.blob, sizeof(s.blob));
     ar.end_object();
     return true;
-  }
-};
+}
 
 struct Struct1
 {
@@ -122,6 +189,23 @@ bool try_parse(const string &blob)
   return serialization::parse_binary(blob, s1);
 }
 
+namespace example_namespace
+{
+  struct ADLExampleStruct
+  {
+    std::string msg;
+  };
+
+  template <class Archive>
+  static bool do_serialize(Archive &ar, ADLExampleStruct &aes)
+  {
+    ar.begin_object();
+    FIELD_N("custom_fieldname", aes.msg);
+    ar.end_object();
+    return ar.good();
+  }
+}
+
 TEST(Serialization, BinaryArchiveInts) {
   uint64_t x = 0xff00000000, x1;
 
@@ -132,11 +216,11 @@ TEST(Serialization, BinaryArchiveInts) {
   ASSERT_EQ(8, oss.str().size());
   ASSERT_EQ(string("\0\0\0\0\xff\0\0\0", 8), oss.str());
 
-  istringstream iss(oss.str());
-  binary_archive<false> iar(iss);
+  const std::string s = oss.str();
+  binary_archive<false> iar{epee::strspan<std::uint8_t>(s)};
   iar.serialize_int(x1);
-  ASSERT_EQ(8, iss.tellg());
-  ASSERT_TRUE(iss.good());
+  ASSERT_EQ(8, iar.getpos());
+  ASSERT_TRUE(iar.good());
 
   ASSERT_EQ(x, x1);
 }
@@ -151,10 +235,10 @@ TEST(Serialization, BinaryArchiveVarInts) {
   ASSERT_EQ(6, oss.str().size());
   ASSERT_EQ(string("\x80\x80\x80\x80\xF0\x1F", 6), oss.str());
 
-  istringstream iss(oss.str());
-  binary_archive<false> iar(iss);
+  const std::string s = oss.str();
+  binary_archive<false> iar{epee::strspan<std::uint8_t>(s)};
   iar.serialize_varint(x1);
-  ASSERT_TRUE(iss.good());
+  ASSERT_TRUE(iar.good());
   ASSERT_EQ(x, x1);
 }
 
@@ -290,6 +374,20 @@ TEST(Serialization, serializes_vector_int64_as_fixed_int)
   ASSERT_EQ(57, blob.size());
 }
 
+TEST(Serialization, deserializes_vector_reserve)
+{
+  std::vector<int64_t> v;
+  string blob;
+
+  tools::write_varint(std::back_inserter(blob), unsigned(100));
+  blob.append(std::string(100, 0));
+
+  ASSERT_LT(v.capacity(), 20);
+  ASSERT_FALSE(serialization::parse_binary(blob, v));
+  ASSERT_LT(v.capacity(), 100); // could fail if lib allocates more in reserve call
+}
+
+
 namespace
 {
   template<typename T>
@@ -363,9 +461,7 @@ TEST(Serialization, serializes_transacion_signatures_correctly)
   tx.invalidate_hashes();
   ASSERT_TRUE(serialization::dump_binary(tx, blob));
   ASSERT_EQ(9, blob.size()); // 5 bytes + 2 * 2 bytes vins + 0 bytes extra + 0 bytes signatures
-  ASSERT_TRUE(serialization::parse_binary(blob, tx1));
-  ASSERT_EQ(tx, tx1);
-  ASSERT_EQ(linearize_vector2(tx.signatures), linearize_vector2(tx1.signatures));
+  ASSERT_FALSE(serialization::parse_binary(blob, tx1));
 
   // Two txin_gen, signatures vector contains only one empty element
   tx.signatures.resize(1);
@@ -377,9 +473,7 @@ TEST(Serialization, serializes_transacion_signatures_correctly)
   tx.invalidate_hashes();
   ASSERT_TRUE(serialization::dump_binary(tx, blob));
   ASSERT_EQ(9, blob.size()); // 5 bytes + 2 * 2 bytes vins + 0 bytes extra + 0 bytes signatures
-  ASSERT_TRUE(serialization::parse_binary(blob, tx1));
-  ASSERT_EQ(tx, tx1);
-  ASSERT_EQ(linearize_vector2(tx.signatures), linearize_vector2(tx1.signatures));
+  ASSERT_FALSE(serialization::parse_binary(blob, tx1));
 
   // Two txin_gen, signatures vector contains three empty elements
   tx.signatures.resize(3);
@@ -594,7 +688,7 @@ TEST(Serialization, serializes_ringct_types)
   destinations.push_back(Pk);
   //compute rct data with mixin 3
   const rct::RCTConfig rct_config{ rct::RangeProofPaddedBulletproof, 2 };
-  s0 = rct::genRctSimple(rct::zero(), sc, pc, destinations, inamounts, amounts, amount_keys, NULL, NULL, 0, 3, rct_config, hw::get_device("default"));
+  s0 = rct::genRctSimple(rct::zero(), sc, pc, destinations, inamounts, amounts, amount_keys, 0, 3, rct_config, hw::get_device("default"));
 
   ASSERT_FALSE(s0.p.MGs.empty());
   ASSERT_TRUE(s0.p.CLSAGs.empty());
@@ -619,7 +713,7 @@ TEST(Serialization, serializes_ringct_types)
   ASSERT_EQ(bp0, bp1);
 
   const rct::RCTConfig rct_config_clsag{ rct::RangeProofPaddedBulletproof, 3 };
-  s0 = rct::genRctSimple(rct::zero(), sc, pc, destinations, inamounts, amounts, amount_keys, NULL, NULL, 0, 3, rct_config_clsag, hw::get_device("default"));
+  s0 = rct::genRctSimple(rct::zero(), sc, pc, destinations, inamounts, amounts, amount_keys, 0, 3, rct_config_clsag, hw::get_device("default"));
 
   ASSERT_FALSE(s0.p.CLSAGs.empty());
   ASSERT_TRUE(s0.p.MGs.empty());
@@ -875,287 +969,6 @@ TEST(Serialization, portability_outputs)
   ASSERT_TRUE(td2.m_pk_index == 0);
 }
 
-struct unsigned_tx_set
-{
-  std::vector<tools::wallet2::tx_construction_data> txes;
-  tools::wallet2::transfer_container transfers;
-};
-template <class Archive>
-inline void serialize(Archive &a, unsigned_tx_set &x, const boost::serialization::version_type ver)
-{
-  a & x.txes;
-  a & x.transfers;
-}
-#define UNSIGNED_TX_PREFIX "Monero unsigned tx set\003"
-TEST(Serialization, portability_unsigned_tx)
-{
-  const boost::filesystem::path filename = unit_test::data_dir / "unsigned_monero_tx";
-  std::string s;
-  const cryptonote::network_type nettype = cryptonote::TESTNET;
-  bool r = epee::file_io_utils::load_file_to_string(filename.string(), s);
-  ASSERT_TRUE(r);
-  const size_t magiclen = strlen(UNSIGNED_TX_PREFIX);
-  ASSERT_FALSE(strncmp(s.c_str(), UNSIGNED_TX_PREFIX, magiclen));
-  unsigned_tx_set exported_txs;
-  s = s.substr(magiclen);
-  r = false;
-  try
-  {
-    std::istringstream iss(s);
-    boost::archive::portable_binary_iarchive ar(iss);
-    ar >> exported_txs;
-    r = true;
-  }
-  catch (...)  
-  {}
-  ASSERT_TRUE(r);
-  /*
-  fields of tools::wallet2::unsigned_tx_set to be checked:
-    std::vector<tx_construction_data> txes
-    std::vector<wallet2::transfer_details> m_transfers
-
-  fields of toolw::wallet2::tx_construction_data to be checked:
-    std::vector<cryptonote::tx_source_entry>      sources
-    cryptonote::tx_destination_entry              change_dts
-    std::vector<cryptonote::tx_destination_entry> splitted_dsts
-    std::list<size_t>                             selected_transfers
-    std::vector<uint8_t>                          extra
-    uint64_t                                      unlock_time
-    bool                                          use_rct
-    std::vector<cryptonote::tx_destination_entry> dests
-  
-  fields of cryptonote::tx_source_entry to be checked:
-    std::vector<std::pair<uint64_t, rct::ctkey>>  outputs
-    size_t                                        real_output
-    crypto::public_key                            real_out_tx_key
-    size_t                                        real_output_in_tx_index
-    uint64_t                                      amount
-    bool                                          rct
-    rct::key                                      mask
-  
-  fields of cryptonote::tx_destination_entry to be checked:
-    uint64_t                amount
-    account_public_address  addr
-  */
-  // txes
-  ASSERT_TRUE(exported_txs.txes.size() == 1);
-  auto& tcd = exported_txs.txes[0];
-  // tcd.sources
-  ASSERT_TRUE(tcd.sources.size() == 1);
-  auto& tse = tcd.sources[0];
-  // tcd.sources[0].outputs
-  ASSERT_TRUE(tse.outputs.size() == 5);
-  auto& out0 = tse.outputs[0];
-  auto& out1 = tse.outputs[1];
-  auto& out2 = tse.outputs[2];
-  auto& out3 = tse.outputs[3];
-  auto& out4 = tse.outputs[4];
-  ASSERT_TRUE(out0.first == 6295);
-  ASSERT_TRUE(out1.first == 14302);
-  ASSERT_TRUE(out2.first == 17598);
-  ASSERT_TRUE(out3.first == 18671);
-  ASSERT_TRUE(out4.first == 19760);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out0.second) == "e7272cb589954ddeedd20de9411ed57265f154d41f33cec9ff69e5d642e09814096490b0ac85308342acf436cc0270d53abef9dc04c6202f2459e879bfd40ce6");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out1.second) == "c3a9f49d1fe75939cc3feb39871ce0a7366c2879a63faa1a5cf34e65723b120a272ff0c7d84ab8b6ee3528d196450b0e28b3fed276bc2597a2b5b17afb9354ab");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out2.second) == "176e239c8c39000c2275e2f63ed7d55c55e0843524091522bbd3d3b869044969021fad70fc1244115449d4754829ae7c47346342ee5d52a2cdd47dfc351d0ab0");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out3.second) == "ef12d7946302fb064f2ba9df1a73d72233ac74664ed3b370580fa3bdc377542ad93f64898bd95851d6efe0d7bf2dbbea9b7c6b3c57e2c807e7b17d55b4622259");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out4.second) == "0d8467e16e73d16510452b78823e082e05ee3a63788d40de577cf31eb555f0c8525096cbc88d00a841eed66f3cdb6f0a018e6ce9fb9433ed61afba15cbbebd04");
-  // tcd.sources[0].{real_output, real_out_tx_key, real_output_in_tx_index, amount, rct, mask}
-  ASSERT_TRUE(tse.real_output == 4);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(tse.real_out_tx_key) == "4d86c7ba1c285fe4bc1cd7b54ba894fa89fa02fc6b0bbeea67d53251acd14a05");
-  ASSERT_TRUE(tse.real_output_in_tx_index == 1); 
-  ASSERT_TRUE(tse.amount == 11066009260865);
-  ASSERT_TRUE(tse.rct);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(tse.mask) == "789bafff169ef206aa21219342c69ca52ce1d78d776c10b21d14bdd960fc7703");
-  // tcd.change_dts
-  ASSERT_TRUE(tcd.change_dts.amount == 9631208773403);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, tcd.change_dts.addr) == "9svHk1wHPo3ULf2AZykghzcye6sitaRE4MaDjPC6uanTHCynHjJHZaiAb922PojE1GexhhRt1LVf5DC43feyrRZMLXQr3mk");
-  // tcd.splitted_dsts
-  ASSERT_TRUE(tcd.splitted_dsts.size() == 2);
-  auto& splitted_dst0 = tcd.splitted_dsts[0];
-  auto& splitted_dst1 = tcd.splitted_dsts[1];
-  ASSERT_TRUE(splitted_dst0.amount == 1400000000000);
-  ASSERT_TRUE(splitted_dst1.amount == 9631208773403);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, splitted_dst0.addr) == "9xnhrMczQkPeoGi6dyu6BgKAYX4tZsDs6KHCkyTStDBKL4M4pM1gfCR3utmTAcSaKHGa1R5o266FbdnubErmij3oMdLyYgA");
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, splitted_dst1.addr) == "9svHk1wHPo3ULf2AZykghzcye6sitaRE4MaDjPC6uanTHCynHjJHZaiAb922PojE1GexhhRt1LVf5DC43feyrRZMLXQr3mk");
-  // tcd.selected_transfers
-  ASSERT_TRUE(tcd.selected_transfers.size() == 1);
-  ASSERT_TRUE(tcd.selected_transfers.front() == 2);
-  // tcd.extra
-  ASSERT_TRUE(tcd.extra.size() == 68);
-  // tcd.{unlock_time, use_rct}
-  ASSERT_TRUE(tcd.unlock_time == 0);
-  ASSERT_TRUE(tcd.use_rct);
-  // tcd.dests
-  ASSERT_TRUE(tcd.dests.size() == 1);
-  auto& dest = tcd.dests[0];
-  ASSERT_TRUE(dest.amount == 1400000000000);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, dest.addr) == "9xnhrMczQkPeoGi6dyu6BgKAYX4tZsDs6KHCkyTStDBKL4M4pM1gfCR3utmTAcSaKHGa1R5o266FbdnubErmij3oMdLyYgA");
-  // transfers
-  ASSERT_TRUE(exported_txs.transfers.size() == 3);
-  auto& td0 = exported_txs.transfers[0];
-  auto& td1 = exported_txs.transfers[1];
-  auto& td2 = exported_txs.transfers[2];
-  ASSERT_TRUE(td0.m_block_height == 818424);
-  ASSERT_TRUE(td1.m_block_height == 818522);
-  ASSERT_TRUE(td2.m_block_height == 818522);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td0.m_txid) == "15024343b38e77a1a9860dfed29921fa17e833fec837191a6b04fa7cb9605b8e");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td1.m_txid) == "ec34c9bb12b99af33d49691384eee5bed9171498ff04e59516505f35d1fc5efc");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td2.m_txid) == "6e7013684d35820f66c6679197ded9329bfe0e495effa47e7b25258799858dba");
-  ASSERT_TRUE(td0.m_internal_output_index == 0);
-  ASSERT_TRUE(td1.m_internal_output_index == 0);
-  ASSERT_TRUE(td2.m_internal_output_index == 1);
-  ASSERT_TRUE(td0.m_global_output_index == 19642);
-  ASSERT_TRUE(td1.m_global_output_index == 19757);
-  ASSERT_TRUE(td2.m_global_output_index == 19760);
-  ASSERT_TRUE (td0.m_spent);
-  ASSERT_FALSE(td1.m_spent);
-  ASSERT_FALSE(td2.m_spent);
-  ASSERT_TRUE(td0.m_spent_height == 0);
-  ASSERT_TRUE(td1.m_spent_height == 0);
-  ASSERT_TRUE(td2.m_spent_height == 0);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td0.m_key_image) == "c5680d3735b90871ca5e3d90cd82d6483eed1151b9ab75c2c8c3a7d89e00a5a8");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td1.m_key_image) == "d54cbd435a8d636ad9b01b8d4f3eb13bd0cf1ce98eddf53ab1617f9b763e66c0");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td2.m_key_image) == "6c3cd6af97c4070a7aef9b1344e7463e29c7cd245076fdb65da447a34da3ca76");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td0.m_mask) == "0100000000000000000000000000000000000000000000000000000000000000");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td1.m_mask) == "d3997a7b27fa199a377643b88cbd3f20f447496746dabe92d288730ecaeda007");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(td2.m_mask) == "789bafff169ef206aa21219342c69ca52ce1d78d776c10b21d14bdd960fc7703");
-  ASSERT_TRUE(td0.m_amount == 13400845012231);
-  ASSERT_TRUE(td1.m_amount == 1200000000000);
-  ASSERT_TRUE(td2.m_amount == 11066009260865);
-  ASSERT_TRUE(td0.m_rct);
-  ASSERT_TRUE(td1.m_rct);
-  ASSERT_TRUE(td2.m_rct);
-  ASSERT_TRUE(td0.m_key_image_known);
-  ASSERT_TRUE(td1.m_key_image_known);
-  ASSERT_TRUE(td2.m_key_image_known);
-  ASSERT_TRUE(td0.m_pk_index == 0);
-  ASSERT_TRUE(td1.m_pk_index == 0);
-  ASSERT_TRUE(td2.m_pk_index == 0);
-}
-
-#define SIGNED_TX_PREFIX "Monero signed tx set\003"
-TEST(Serialization, portability_signed_tx)
-{
-  const boost::filesystem::path filename = unit_test::data_dir / "signed_monero_tx";
-  const cryptonote::network_type nettype = cryptonote::TESTNET;
-  std::string s;
-  bool r = epee::file_io_utils::load_file_to_string(filename.string(), s);
-  ASSERT_TRUE(r);
-  const size_t magiclen = strlen(SIGNED_TX_PREFIX);
-  ASSERT_FALSE(strncmp(s.c_str(), SIGNED_TX_PREFIX, magiclen));
-  tools::wallet2::signed_tx_set exported_txs;
-  s = s.substr(magiclen);
-  r = false;
-  try
-  {
-    std::istringstream iss(s);
-    boost::archive::portable_binary_iarchive ar(iss);
-    ar >> exported_txs;
-    r = true;
-  }
-  catch (...)
-  {}
-  ASSERT_TRUE(r);
-  /*
-  fields of tools::wallet2::signed_tx_set to be checked:
-    std::vector<pending_tx>         ptx
-    std::vector<crypto::key_image>  key_images
-  
-  fields of tools::walllet2::pending_tx to be checked:
-    cryptonote::transaction                       tx                  // TODO
-    uint64_t                                      dust
-    uint64_t                                      fee
-    bool                                          dust_added_to_fee
-    cryptonote::tx_destination_entry              change_dts
-    std::list<size_t>                             selected_transfers
-    std::string                                   key_images
-    crypto::secret_key                            tx_key
-    std::vector<cryptonote::tx_destination_entry> dests
-    tx_construction_data                          construction_data
-  */
-  // ptx
-  ASSERT_TRUE(exported_txs.ptx.size() == 1);
-  auto& ptx = exported_txs.ptx[0];
-  // ptx.{dust, fee, dust_added_to_fee}
-  ASSERT_TRUE (ptx.dust == 0);
-  ASSERT_TRUE (ptx.fee == 34800487462);
-  ASSERT_FALSE(ptx.dust_added_to_fee);
-  // ptx.change.{amount, addr}
-  ASSERT_TRUE(ptx.change_dts.amount == 9631208773403);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, ptx.change_dts.addr) == "9svHk1wHPo3ULf2AZykghzcye6sitaRE4MaDjPC6uanTHCynHjJHZaiAb922PojE1GexhhRt1LVf5DC43feyrRZMLXQr3mk");
-  // ptx.selected_transfers
-  ASSERT_TRUE(ptx.selected_transfers.size() == 1);
-  ASSERT_TRUE(ptx.selected_transfers.front() == 2);
-  // ptx.{key_images, tx_key}
-  ASSERT_TRUE(ptx.key_images == "<6c3cd6af97c4070a7aef9b1344e7463e29c7cd245076fdb65da447a34da3ca76> ");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(ptx.tx_key) == "0100000000000000000000000000000000000000000000000000000000000000");
-  // ptx.dests
-  ASSERT_TRUE(ptx.dests.size() == 1);
-  ASSERT_TRUE(ptx.dests[0].amount == 1400000000000);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, ptx.dests[0].addr) == "9xnhrMczQkPeoGi6dyu6BgKAYX4tZsDs6KHCkyTStDBKL4M4pM1gfCR3utmTAcSaKHGa1R5o266FbdnubErmij3oMdLyYgA");
-  // ptx.construction_data
-  auto& tcd = ptx.construction_data;
-  ASSERT_TRUE(tcd.sources.size() == 1);
-  auto& tse = tcd.sources[0];
-  // ptx.construction_data.sources[0].outputs
-  ASSERT_TRUE(tse.outputs.size() == 5);
-  auto& out0 = tse.outputs[0];
-  auto& out1 = tse.outputs[1];
-  auto& out2 = tse.outputs[2];
-  auto& out3 = tse.outputs[3];
-  auto& out4 = tse.outputs[4];
-  ASSERT_TRUE(out0.first == 6295);
-  ASSERT_TRUE(out1.first == 14302);
-  ASSERT_TRUE(out2.first == 17598);
-  ASSERT_TRUE(out3.first == 18671);
-  ASSERT_TRUE(out4.first == 19760);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out0.second) == "e7272cb589954ddeedd20de9411ed57265f154d41f33cec9ff69e5d642e09814096490b0ac85308342acf436cc0270d53abef9dc04c6202f2459e879bfd40ce6");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out1.second) == "c3a9f49d1fe75939cc3feb39871ce0a7366c2879a63faa1a5cf34e65723b120a272ff0c7d84ab8b6ee3528d196450b0e28b3fed276bc2597a2b5b17afb9354ab");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out2.second) == "176e239c8c39000c2275e2f63ed7d55c55e0843524091522bbd3d3b869044969021fad70fc1244115449d4754829ae7c47346342ee5d52a2cdd47dfc351d0ab0");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out3.second) == "ef12d7946302fb064f2ba9df1a73d72233ac74664ed3b370580fa3bdc377542ad93f64898bd95851d6efe0d7bf2dbbea9b7c6b3c57e2c807e7b17d55b4622259");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(out4.second) == "0d8467e16e73d16510452b78823e082e05ee3a63788d40de577cf31eb555f0c8525096cbc88d00a841eed66f3cdb6f0a018e6ce9fb9433ed61afba15cbbebd04");
-  // ptx.construction_data.sources[0].{real_output, real_out_tx_key, real_output_in_tx_index, amount, rct, mask}
-  ASSERT_TRUE(tse.real_output == 4);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(tse.real_out_tx_key) == "4d86c7ba1c285fe4bc1cd7b54ba894fa89fa02fc6b0bbeea67d53251acd14a05");
-  ASSERT_TRUE(tse.real_output_in_tx_index == 1); 
-  ASSERT_TRUE(tse.amount == 11066009260865);
-  ASSERT_TRUE(tse.rct);
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(tse.mask) == "789bafff169ef206aa21219342c69ca52ce1d78d776c10b21d14bdd960fc7703");
-  // ptx.construction_data.change_dts
-  ASSERT_TRUE(tcd.change_dts.amount == 9631208773403);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, tcd.change_dts.addr) == "9svHk1wHPo3ULf2AZykghzcye6sitaRE4MaDjPC6uanTHCynHjJHZaiAb922PojE1GexhhRt1LVf5DC43feyrRZMLXQr3mk");
-  // ptx.construction_data.splitted_dsts
-  ASSERT_TRUE(tcd.splitted_dsts.size() == 2);
-  auto& splitted_dst0 = tcd.splitted_dsts[0];
-  auto& splitted_dst1 = tcd.splitted_dsts[1];
-  ASSERT_TRUE(splitted_dst0.amount == 1400000000000);
-  ASSERT_TRUE(splitted_dst1.amount == 9631208773403);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, splitted_dst0.addr) == "9xnhrMczQkPeoGi6dyu6BgKAYX4tZsDs6KHCkyTStDBKL4M4pM1gfCR3utmTAcSaKHGa1R5o266FbdnubErmij3oMdLyYgA");
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, splitted_dst1.addr) == "9svHk1wHPo3ULf2AZykghzcye6sitaRE4MaDjPC6uanTHCynHjJHZaiAb922PojE1GexhhRt1LVf5DC43feyrRZMLXQr3mk");
-  // ptx.construction_data.selected_transfers
-  ASSERT_TRUE(tcd.selected_transfers.size() == 1);
-  ASSERT_TRUE(tcd.selected_transfers.front() == 2);
-  // ptx.construction_data.extra
-  ASSERT_TRUE(tcd.extra.size() == 68);
-  // ptx.construction_data.{unlock_time, use_rct}
-  ASSERT_TRUE(tcd.unlock_time == 0);
-  ASSERT_TRUE(tcd.use_rct);
-  // ptx.construction_data.dests
-  ASSERT_TRUE(tcd.dests.size() == 1);
-  auto& dest = tcd.dests[0];
-  ASSERT_TRUE(dest.amount == 1400000000000);
-  ASSERT_TRUE(cryptonote::get_account_address_as_str(nettype, false, dest.addr) == "9xnhrMczQkPeoGi6dyu6BgKAYX4tZsDs6KHCkyTStDBKL4M4pM1gfCR3utmTAcSaKHGa1R5o266FbdnubErmij3oMdLyYgA");
-  // key_images
-  ASSERT_TRUE(exported_txs.key_images.size() == 3);
-  auto& ki0 = exported_txs.key_images[0];
-  auto& ki1 = exported_txs.key_images[1];
-  auto& ki2 = exported_txs.key_images[2];
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(ki0) == "c5680d3735b90871ca5e3d90cd82d6483eed1151b9ab75c2c8c3a7d89e00a5a8");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(ki1) == "d54cbd435a8d636ad9b01b8d4f3eb13bd0cf1ce98eddf53ab1617f9b763e66c0");
-  ASSERT_TRUE(epee::string_tools::pod_to_hex(ki2) == "6c3cd6af97c4070a7aef9b1344e7463e29c7cd245076fdb65da447a34da3ca76");
-}
-
 TEST(Serialization, difficulty_type)
 {
   std::vector<cryptonote::difficulty_type> v_original;
@@ -1177,4 +990,141 @@ TEST(Serialization, difficulty_type)
   a2 >> v_unserialized;
 
   ASSERT_EQ(v_original, v_unserialized);
+}
+
+TEST(Serialization, adl_free_function)
+{
+  std::stringstream ss;
+  json_archive<true> ar(ss);
+
+  const std::string msg = "Howdy, World!";
+  example_namespace::ADLExampleStruct aes{msg};
+
+  ASSERT_TRUE(serialization::serialize(ar, aes));
+
+  //                                                       VVVVVVVVVVVVVVVVVVVVVVVVVV weird string serialization artifact
+  const std::string expected = "{\"custom_fieldname\": " + std::to_string(msg.size()) + '"' + epee::string_tools::buff_to_hex_nodelimer(msg) + "\"}";
+  EXPECT_EQ(expected, ss.str());
+}
+
+using Tuple3 = std::tuple<uint16_t, std::string, uint64_t>;
+using Tuple4 = std::tuple<int32_t, std::string, uint64_t, Struct>;
+
+TEST(Serialization, tuple_3_4_backwards_compatibility)
+{
+  std::string serialized;
+
+  ////////////////////////////////////////
+
+  Tuple3 t3{1876, "Hullabaloo", 1963};
+  EXPECT_TRUE(::serialization::dump_binary(t3, serialized));
+
+  EXPECT_EQ("0354070a48756c6c6162616c6f6fab0f",
+    epee::string_tools::buff_to_hex_nodelimer(serialized));
+
+  Tuple3 t3_recovered;
+  EXPECT_TRUE(::serialization::parse_binary(serialized, t3_recovered));
+  EXPECT_EQ(t3, t3_recovered);
+
+  /////////////////////////////////////////
+
+  Tuple4 t4{1999, "Caneck Caneck", (uint64_t)-1, {20229, 242, {1, 1, 2, 3, 5, 8, 13, 21}}};
+  EXPECT_TRUE(::serialization::dump_binary(t4, serialized));
+
+  EXPECT_EQ("04cf0700000d43616e65636b2043616e65636bffffffffffffffffff01054f0000f20000000101020305080d15",
+    epee::string_tools::buff_to_hex_nodelimer(serialized));
+
+  Tuple4 t4_recovered;
+  EXPECT_TRUE(::serialization::parse_binary(serialized, t4_recovered));
+  EXPECT_EQ(t4, t4_recovered);
+}
+
+TEST(Serialization, unsigned_tx_set_transfer_count_versions)
+{
+  for (uint32_t version = 0; version <= 2; ++version)
+  {
+    std::ostringstream oss;
+    binary_archive<true> ar(oss);
+    ar.serialize_varint(version);
+    std::vector<tools::wallet2::tx_construction_data> txes;
+    ASSERT_TRUE(::serialization::serialize(ar, txes));
+    if (version == 0)
+    {
+      std::pair<size_t, tools::wallet2::transfer_container> transfers{3, {}};
+      ASSERT_TRUE(::serialization::serialize(ar, transfers));
+    }
+    else if (version == 1)
+    {
+      std::pair<size_t, std::vector<tools::wallet2::exported_transfer_details>> transfers{3, {}};
+      ASSERT_TRUE(::serialization::serialize(ar, transfers));
+    }
+    else
+    {
+      std::tuple<uint64_t, uint64_t, std::vector<tools::wallet2::exported_transfer_details>> transfers{3, 3, {}};
+      ASSERT_TRUE(::serialization::serialize(ar, transfers));
+    }
+
+    tools::wallet2::unsigned_tx_set recovered;
+    ASSERT_TRUE(::serialization::parse_binary(oss.str(), recovered));
+    EXPECT_EQ(version == 2, recovered.has_new_transfers_total);
+    if (version == 0)
+      EXPECT_EQ(3, std::get<1>(recovered.transfers));
+    else
+      EXPECT_EQ(3, std::get<1>(recovered.new_transfers));
+  }
+}
+
+struct Tupler
+{
+  std::tuple<> t0;
+  std::tuple<int8_t> t1;
+  std::tuple<uint8_t, int16_t> t2;
+  Tuple3 t3_backcompat;
+  Tuple3 t3_compact;
+  Tuple4 t4_backcompat;
+  Tuple4 t4_compact;
+  std::tuple<uint32_t, std::string, bool, int64_t, Struct> t5;
+
+  BEGIN_SERIALIZE_OBJECT()
+    FIELD(t0)
+    FIELD(t1)
+    FIELD(t2)
+    FIELD(t3_backcompat)
+    TUPLE_COMPACT_FIELD(t3_compact)
+    FIELD(t4_backcompat)
+    TUPLE_COMPACT_FIELD(t4_compact)
+    TUPLE_COMPACT_FIELD(t5)
+  END_SERIALIZE()
+};
+
+bool operator==(const Tupler &a, const Tupler &b)
+{
+  return a.t0 == b.t0 && a.t1 == b.t1 && a.t2 == b.t2 && a.t3_backcompat == b.t3_backcompat &&
+    a.t3_compact == b.t3_compact && a.t4_backcompat == b.t4_backcompat && a.t5 == b.t5;
+}
+
+TEST(Serialization, tuple_many_tuples)
+{
+  Tupler tupler{
+    {},
+    {69},
+    {42, 420},
+    {1876, "Hullabaloo", 1963},
+    {1876, "Hullabaloo", 1963},
+    {1999, "Caneck Caneck", (uint64_t)-1, {20229, 242, {1, 1, 2, 3, 5, 8, 13, 21}}},
+    {1999, "Caneck Caneck", (uint64_t)-1, {20229, 242, {1, 1, 2, 3, 5, 8, 13, 21}}},
+    {72982, "He is now rising from affluence to poverty.", false, 256,
+      {
+        13, 37, { 1, 1, 1, 2, 3, 7, 11, 26 }
+      }
+    }
+  };
+
+  std::string serialized;
+  EXPECT_TRUE(::serialization::dump_binary(tupler, serialized));
+
+  Tupler tupler_recovered;
+  EXPECT_TRUE(::serialization::parse_binary(serialized, tupler_recovered));
+
+  EXPECT_EQ(tupler, tupler_recovered);
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -31,6 +31,7 @@
 #include "gtest/gtest.h"
 
 #include "cryptonote_basic/cryptonote_basic_impl.h"
+#include "misc_language.h"
 
 using namespace cryptonote;
 

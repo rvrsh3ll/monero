@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2019-2020 The Monero Project
+# Copyright (c) 2019-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -28,19 +28,21 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from __future__ import print_function
-
 """Test txpool
 """
 
 from framework.daemon import Daemon
 from framework.wallet import Wallet
+from framework.zmq import Zmq
+
+DEFAULT_TXPOOL_MAX_WEIGHT = 648000000 # See cryptonote_config.h
 
 class TransferTest():
     def run_test(self):
         self.reset()
         self.create()
         self.mine()
+        self.check_tip_template()
         self.check_txpool()
 
     def reset(self):
@@ -82,6 +84,30 @@ class TransferTest():
 
         return txes
 
+    def check_tip_template(self):
+        print('Checking templates for an explicit main chain tip')
+        daemon = Daemon()
+        wallet = Wallet()
+        address = '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
+        destination = '46r4nYSevkfBUMhuykdK3gQ98XDqDTYW1hNLaXNvjpsJaSbNtdXh1sKMsdVgqkaihChAzEy29zEDPMR3NHQvGoZCLGwTerK'
+
+        wallet.transfer([{'address': destination, 'amount': 1000000000000}])
+        daemon.generateblocks(address, 1)
+        wallet.refresh()
+
+        empty_template = daemon.getblocktemplate(address)
+        txes = self.create_txes(destination, 5)
+        tip = daemon.get_info().top_block_hash
+        normal = daemon.getblocktemplate(address)
+        explicit = daemon.getblocktemplate(address, prev_block=tip)
+
+        assert normal.prev_hash == explicit.prev_hash == tip
+        assert normal.height == explicit.height
+        assert normal.expected_reward == empty_template.expected_reward + sum(tx.fee for tx in txes.values())
+        assert explicit.expected_reward == normal.expected_reward
+        assert explicit.cumulative_weight == normal.cumulative_weight
+        daemon.flush_txpool()
+
     def check_empty_pool(self):
         daemon = Daemon()
 
@@ -105,6 +131,10 @@ class TransferTest():
     def check_txpool(self):
         daemon = Daemon()
         wallet = Wallet()
+        zmq = Zmq()
+
+        zmq_topic = "json-minimal-txpool_add"
+        zmq.sub(zmq_topic)
 
         res = daemon.get_info()
         height = res.height
@@ -141,6 +171,33 @@ class TransferTest():
             total_fee += x.fee
             min_bytes = min(min_bytes, x.blob_size)
             max_bytes = max(max_bytes, x.blob_size)
+
+        print('Checking miner data: when pool size less than median block weight')
+        assert total_bytes < DEFAULT_TXPOOL_MAX_WEIGHT, total_bytes # test needs updating for this case
+        pool_res = res
+        miner_data_res = daemon.get_miner_data()
+        assert total_bytes < miner_data_res.median_weight, total_bytes # test needs updating for this case
+        pool_txids = set(x.id_hash for x in pool_res.transactions)
+        miner_data_txids = set(x.id for x in miner_data_res.tx_backlog)
+        assert len(pool_txids) == len(pool_res.transactions) # dups
+        assert len(miner_data_txids) == len(miner_data_res.tx_backlog) # dups
+        assert pool_txids == miner_data_txids
+
+
+        print('Checking all txs received via zmq')
+        for i in range(len(txes.keys())):
+            zmq_event = zmq.recv(zmq_topic)
+            assert len(zmq_event) == 1
+
+            zmq_tx = zmq_event[0]
+
+            x = [x for x in res.transactions if x.id_hash == zmq_tx["id"]]
+            assert len(x) == 1
+
+            x = x[0]
+            assert x.blob_size == zmq_tx["blob_size"]
+            assert x.weight == zmq_tx["weight"]
+            assert x.fee == zmq_tx["fee"]
 
         res = daemon.get_transaction_pool_hashes()
         assert sorted(res.tx_hashes) == sorted(txes.keys())
@@ -251,6 +308,22 @@ class TransferTest():
         assert res.txs[0].tx_hash == txid
         assert res.txs[0].in_pool
         assert res.txs[0].relayed
+
+        print('Checking cached prunable hash against independently calculated value')
+        # while unconfirmed, prunable_hash comes from the pool's cache (populated
+        # when the tx was inserted/re-inserted into the pool)
+        pool_prunable_hash = res.txs[0].prunable_hash
+        assert len(pool_prunable_hash) == 64
+        assert pool_prunable_hash != '0' * 64
+
+        # once mined, prunable_hash is calculated independently from the
+        # confirmed blockchain data, not the pool's cache
+        daemon.generateblocks('42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm', 1)
+        res = daemon.get_transactions([txid])
+        assert len(res.txs) == 1
+        assert res.txs[0].tx_hash == txid
+        assert not res.txs[0].in_pool
+        assert res.txs[0].prunable_hash == pool_prunable_hash
 
         daemon.flush_txpool()
         self.check_empty_pool()

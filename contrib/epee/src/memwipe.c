@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -38,13 +38,8 @@
 #endif
 #include "memwipe.h"
 
-#if defined(_MSC_VER)
-#define SCARECROW \
-    __asm;
-#else
 #define SCARECROW \
     __asm__ __volatile__("" : : "r"(ptr) : "memory");
-#endif
 
 #ifdef HAVE_MEMSET_S
 

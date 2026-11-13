@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -27,10 +27,13 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "daemon_handler.h"
+#include "rpc/zmq_restricted_methods.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <boost/uuid/nil_generator.hpp>
 #include <boost/utility/string_ref.hpp>
@@ -41,6 +44,15 @@
 #include "cryptonote_basic/blobdatatype.h"
 #include "ringct/rctSigs.h"
 #include "version.h"
+
+namespace
+{
+constexpr size_t restricted_max_fake_outs = 5000;
+constexpr auto restricted_histogram_cutoff = std::chrono::hours{3 * 24};
+constexpr size_t restricted_max_txs = 100;
+constexpr size_t restricted_max_key_images = 5000;
+constexpr size_t restricted_max_block_headers = 1000;
+}
 
 namespace cryptonote
 {
@@ -109,12 +121,14 @@ namespace rpc
     };
   } // anonymous
 
-  DaemonHandler::DaemonHandler(cryptonote::core& c, t_p2p& p2p)
-    : m_core(c), m_p2p(p2p)
+  DaemonHandler::DaemonHandler(cryptonote::core& c, t_p2p& p2p, bool restricted)
+    : m_core(c), m_p2p(p2p), m_restricted(restricted)
   {
     const auto last_sorted = std::is_sorted_until(std::begin(handlers), std::end(handlers));
     if (last_sorted != std::end(handlers))
       throw std::logic_error{std::string{"ZMQ JSON-RPC handlers map is not properly sorted, see "} + last_sorted->method_name};
+
+    check_blocked_methods_sorted();
   }
 
   void DaemonHandler::handle(const GetHeight::Request& req, GetHeight::Response& res)
@@ -126,9 +140,9 @@ namespace rpc
 
   void DaemonHandler::handle(const GetBlocksFast::Request& req, GetBlocksFast::Response& res)
   {
-    std::vector<std::pair<std::pair<blobdata, crypto::hash>, std::vector<std::pair<crypto::hash, blobdata> > > > blocks;
+    std::vector<std::pair<std::pair<blobdata, crypto::hash>, std::vector<std::tuple<crypto::hash, crypto::hash, blobdata> > > > blocks;
 
-    if(!m_core.find_blockchain_supplement(req.start_height, req.block_ids, blocks, res.current_height, res.start_height, req.prune, true, COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT, COMMAND_RPC_GET_BLOCKS_FAST_MAX_TX_COUNT))
+    if(!m_core.find_blockchain_supplement(req.start_height, req.block_ids, blocks, res.current_height, res.top_block_hash, res.start_height, req.prune, true, false, COMMAND_RPC_GET_BLOCKS_FAST_MAX_BLOCK_COUNT, COMMAND_RPC_GET_BLOCKS_FAST_MAX_TX_COUNT))
     {
       res.status = Message::STATUS_FAILED;
       res.error_details = "core::find_blockchain_supplement() returned false";
@@ -185,8 +199,8 @@ namespace rpc
         bwt.transactions.back().pruned = req.prune;
 
         const bool parsed = req.prune ?
-          parse_and_validate_tx_base_from_blob(blob.second, bwt.transactions.back()) :
-          parse_and_validate_tx_from_blob(blob.second, bwt.transactions.back());
+          parse_and_validate_tx_base_from_blob(std::get<2>(blob), bwt.transactions.back()) :
+          parse_and_validate_tx_from_blob(std::get<2>(blob), bwt.transactions.back());
         if (!parsed)
         {
           res.blocks.clear();
@@ -233,6 +247,13 @@ namespace rpc
 
   void DaemonHandler::handle(const GetTransactions::Request& req, GetTransactions::Response& res)
   {
+    if (m_restricted && req.tx_hashes.size() > restricted_max_txs)
+    {
+      res.status = Message::STATUS_FAILED;
+      res.error_details = "Too many transactions requested in restricted mode";
+      return;
+    }
+
     std::vector<cryptonote::transaction> found_txs_vec;
     std::vector<crypto::hash> missed_vec;
 
@@ -261,25 +282,41 @@ namespace rpc
     // if any missing from blockchain, check in tx pool
     if (!missed_vec.empty())
     {
-      std::vector<cryptonote::transaction> pool_txs;
+      std::unordered_set<crypto::hash> missed_set(missed_vec.begin(), missed_vec.end());
+      missed_vec.assign(missed_set.begin(), missed_set.end());
+      std::vector<std::pair<crypto::hash, tx_memory_pool::tx_details>> pool_details;
 
-      m_core.get_pool_transactions(pool_txs);
+      m_core.get_pool_transactions_info(missed_vec, pool_details, false);
 
-      for (const auto& tx : pool_txs)
+      for (const auto& entry : pool_details)
       {
-        crypto::hash h = get_transaction_hash(tx);
+        const crypto::hash& h = entry.first;
+        const tx_memory_pool::tx_details& details = entry.second;
+        unprunable_summary_t tx_desc;
+        if (!get_transaction_unprunable_summary(details.tx_blob, tx_desc))
+        {
+          MERROR("Failed to parse tx from txpool");
+          continue;
+        }
+        // coinbase txes do not have signatures to prune, so they appear to be pruned if looking just at prunable data being empty
+        const bool pruned = tx_desc.unprunable_size == details.tx_blob.size() && !tx_desc.is_coinbase;
+        cryptonote::transaction tx;
+        if (!(pruned ? parse_and_validate_tx_base_from_blob(details.tx_blob, tx) : parse_and_validate_tx_from_blob(details.tx_blob, tx)))
+        {
+          MERROR("Failed to parse tx from txpool");
+          continue;
+        }
+        tx.set_hash(h);
 
-        auto itr = std::find(missed_vec.begin(), missed_vec.end(), h);
-
-        if (itr != missed_vec.end())
+        if (missed_set.erase(h))
         {
           found_hashes.push_back(h);
-          found_txs_vec.push_back(tx);
+          found_txs_vec.push_back(std::move(tx));
           heights.push_back(std::numeric_limits<uint64_t>::max());
           in_pool.push_back(true);
-          missed_vec.erase(itr);
         }
       }
+      missed_vec.assign(missed_set.begin(), missed_set.end());
     }
 
     for (size_t i=0; i < found_hashes.size(); i++)
@@ -298,6 +335,13 @@ namespace rpc
 
   void DaemonHandler::handle(const KeyImagesSpent::Request& req, KeyImagesSpent::Response& res)
   {
+    if (m_restricted && req.key_images.size() > restricted_max_key_images)
+    {
+      res.status = Message::STATUS_FAILED;
+      res.error_details = "Too many key images queried in restricted mode";
+      return;
+    }
+
     res.spent_status.resize(req.key_images.size(), KeyImagesSpent::STATUS::UNSPENT);
 
     std::vector<bool> chain_spent_status;
@@ -351,7 +395,7 @@ namespace rpc
     std::string tx_blob;
     if(!epee::string_tools::parse_hexstr_to_binbuff(req.tx_as_hex, tx_blob))
     {
-      MERROR("[SendRawTxHex]: Failed to parse tx from hexbuff: " << req.tx_as_hex);
+      MERROR("[SendRawTxHex]: Failed to parse tx from hexbuff, input size: " << req.tx_as_hex.size());
       res.status = Message::STATUS_FAILED;
       res.error_details = "Invalid hex";
       return;
@@ -370,7 +414,7 @@ namespace rpc
 
     tx_verification_context tvc = AUTO_VAL_INIT(tvc);
 
-    if(!m_core.handle_incoming_tx({tx_blob, crypto::null_hash}, tvc, (relay ? relay_method::local : relay_method::none), false) || tvc.m_verifivation_failed)
+    if(!m_core.handle_incoming_tx(tx_blob, tvc, (relay ? relay_method::local : relay_method::none), false) || tvc.m_verifivation_failed)
     {
       if (tvc.m_verifivation_failed)
       {
@@ -421,6 +465,16 @@ namespace rpc
       {
         if (!res.error_details.empty()) res.error_details += " and ";
         res.error_details += "too few outputs";
+      }
+      if (tvc.m_tx_extra_too_big)
+      {
+        if (!res.error_details.empty()) res.error_details += " and ";
+        res.error_details += "tx_extra too long";
+      }
+      if (tvc.m_nonzero_unlock_time)
+      {
+        if (!res.error_details.empty()) res.error_details += " and ";
+        res.error_details += "non-zero unlock time";
       }
       if (res.error_details.empty())
       {
@@ -510,6 +564,8 @@ namespace rpc
       res.info.target_height = res.info.height;
     }
 
+    m_core.get_blockchain_top(res.info.top_block_height, res.info.top_block_hash);
+
     auto& chain = m_core.get_blockchain_storage();
 
     res.info.wide_difficulty = chain.get_difficulty_for_next_block();
@@ -519,17 +575,17 @@ namespace rpc
 
     res.info.tx_count = chain.get_total_transactions() - res.info.height; //without coinbase
 
-    res.info.tx_pool_size = m_core.get_pool_transactions_count();
+    res.info.tx_pool_size = m_core.get_pool_transactions_count(!m_restricted);
 
-    res.info.alt_blocks_count = chain.get_alternative_blocks_count();
+    res.info.alt_blocks_count = m_restricted ? 0 : chain.get_alternative_blocks_count();
 
-    uint64_t total_conn = m_p2p.get_public_connections_count();
-    res.info.outgoing_connections_count = m_p2p.get_public_outgoing_connections_count();
-    res.info.incoming_connections_count = total_conn - res.info.outgoing_connections_count;
+    uint64_t total_conn = m_restricted ? 0 : m_p2p.get_public_connections_count();
+    res.info.outgoing_connections_count = m_restricted ? 0 : m_p2p.get_public_outgoing_connections_count();
+    res.info.incoming_connections_count = m_restricted ? 0 : total_conn - res.info.outgoing_connections_count;
 
-    res.info.white_peerlist_size = m_p2p.get_public_white_peers_count();
+    res.info.white_peerlist_size = m_restricted ? 0 : m_p2p.get_public_white_peers_count();
 
-    res.info.grey_peerlist_size = m_p2p.get_public_gray_peers_count();
+    res.info.grey_peerlist_size = m_restricted ? 0 : m_p2p.get_public_gray_peers_count();
 
     res.info.mainnet = m_core.get_nettype() == MAINNET;
     res.info.testnet = m_core.get_nettype() == TESTNET;
@@ -539,8 +595,8 @@ namespace rpc
     res.info.block_size_limit = res.info.block_weight_limit = m_core.get_blockchain_storage().get_current_cumulative_block_weight_limit();
     res.info.block_size_median = res.info.block_weight_median = m_core.get_blockchain_storage().get_current_cumulative_block_weight_median();
     res.info.adjusted_time = m_core.get_blockchain_storage().get_adjusted_time(res.info.height);
-    res.info.start_time = (uint64_t)m_core.get_start_time();
-    res.info.version = MONERO_VERSION;
+    res.info.start_time = m_restricted ? 0 : (uint64_t)m_core.get_start_time();
+    res.info.version = m_restricted ? "" : MONERO_VERSION;
 
     res.status = Message::STATUS_OK;
     res.error_details = "";
@@ -659,6 +715,13 @@ namespace rpc
 
   void DaemonHandler::handle(const GetBlockHeadersByHeight::Request& req, GetBlockHeadersByHeight::Response& res)
   {
+    if (m_restricted && req.heights.size() > restricted_max_block_headers)
+    {
+      res.status = Message::STATUS_FAILED;
+      res.error_details = "Too many block headers requested in restricted mode";
+      return;
+    }
+
     res.headers.resize(req.heights.size());
 
     for (size_t i=0; i < req.heights.size(); i++)
@@ -776,6 +839,24 @@ namespace rpc
 
   void DaemonHandler::handle(const GetOutputHistogram::Request& req, GetOutputHistogram::Response& res)
   {
+    size_t amounts = req.amounts.size();
+    if (m_restricted && amounts == 0)
+    {
+      res.status = Message::STATUS_FAILED;
+      res.error_details = "Restricted RPC will not serve histograms on the whole blockchain. Use your own node.";
+      return;
+    }
+
+    using clock = std::chrono::system_clock;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(clock::now().time_since_epoch());
+    const std::uint64_t oldest_cutoff = std::chrono::seconds{now - restricted_histogram_cutoff}.count();
+    if (m_restricted && req.recent_cutoff > 0 && req.recent_cutoff < oldest_cutoff)
+    {
+      res.status = Message::STATUS_FAILED;
+      res.error_details = "Recent cutoff is too old";
+      return;
+    }
+
     std::map<uint64_t, std::tuple<uint64_t, uint64_t, uint64_t> > histogram;
     try
     {
@@ -801,6 +882,13 @@ namespace rpc
 
   void DaemonHandler::handle(const GetOutputKeys::Request& req, GetOutputKeys::Response& res)
   {
+    if (m_restricted && req.outputs.size() > restricted_max_fake_outs)
+    {
+      res.status = Message::STATUS_FAILED;
+      res.error_details = "Too many outs requested";
+      return;
+    }
+
     try
     {
       for (const auto& i : req.outputs)
@@ -831,14 +919,10 @@ namespace rpc
   void DaemonHandler::handle(const GetFeeEstimate::Request& req, GetFeeEstimate::Response& res)
   {
     res.hard_fork_version = m_core.get_blockchain_storage().get_current_hard_fork_version();
-    res.estimated_base_fee = m_core.get_blockchain_storage().get_dynamic_base_fee_estimate(req.num_grace_blocks);
 
-    if (res.hard_fork_version < HF_VERSION_PER_BYTE_FEE)
-    {
-       res.size_scale = 1024; // per KiB fee
-       res.fee_mask = 1;
-    }
-    else
+    m_core.get_blockchain_storage().get_dynamic_base_fee_estimate_2021_scaling(req.num_grace_blocks, res.fees);
+    res.estimated_base_fee = res.fees.at(0);
+
     {
       res.size_scale = 1; // per byte fee
       res.fee_mask = Blockchain::get_fee_quantization_mask();
@@ -850,6 +934,13 @@ namespace rpc
   {
     try
     {
+      if (m_restricted && req.amounts != std::vector<uint64_t>(1, 0))
+      {
+        res.distributions.clear();
+        res.status = Message::STATUS_FAILED;
+        res.error_details = "Restricted RPC can only get output distribution for rct outputs. Use your own node.";
+        return;
+      }
       res.distributions.reserve(req.amounts.size());
 
       const uint64_t req_to_height = req.to_height ? req.to_height : (m_core.get_current_blockchain_height() - 1);
@@ -913,13 +1004,24 @@ namespace rpc
 
   epee::byte_slice DaemonHandler::handle(std::string&& request)
   {
-    MDEBUG("Handling RPC request: " << request);
+    if (m_restricted)
+        MDEBUG("Handling RPC request");
+    else
+        MDEBUG("Handling RPC request: " << request);
 
     try
     {
       FullMessage req_full(std::move(request), true);
 
       const std::string request_type = req_full.getRequestType();
+      if (m_restricted && is_blocked_in_restricted_mode(request_type))
+      {
+        Message fail;
+        fail.status = Message::STATUS_FAILED;
+        fail.error_details = "\"" + request_type + "\" is not available in restricted mode.";
+        return FullMessage::getResponse(fail, req_full.getID());
+      }
+
       const auto matched_handler = std::lower_bound(std::begin(handlers), std::end(handlers), request_type);
       if (matched_handler == std::end(handlers) || matched_handler->method_name != request_type)
         return BAD_REQUEST(request_type, req_full.getID());

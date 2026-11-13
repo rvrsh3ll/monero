@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -69,6 +69,14 @@ namespace epee
   std::string to_hex::string(const span<const std::uint8_t> src) { return convert<std::string>(src); }
   epee::wipeable_string to_hex::wipeable_string(const span<const std::uint8_t> src) { return convert<epee::wipeable_string>(src); }
 
+  bool to_hex::buffer(span<char> out, const span<const std::uint8_t> src) noexcept
+  {
+    if (out.size() % 2 != 0 || out.size() / 2 != src.size())
+      return false;
+    to_hex::buffer_unchecked(out.data(), src);
+    return true;
+  }
+
   void to_hex::buffer(std::ostream& out, const span<const std::uint8_t> src)
   {
     write_hex(std::ostreambuf_iterator<char>{out}, src);
@@ -126,7 +134,7 @@ namespace epee
     // should we include a specific character
     auto include = [](char input) {
         // we ignore spaces and colons
-        return !std::isspace(input) && input != ':';
+        return !std::isspace(static_cast<unsigned char>(input)) && input != ':';
     };
 
     // the number of relevant characters to decode
@@ -145,7 +153,7 @@ namespace epee
 
     // convert a single hex character to an unsigned integer
     auto char_to_int = [](const char *input) {
-      switch (std::tolower(*input)) {
+      switch (std::tolower(static_cast<unsigned char>(*input))) {
         case '0': return  0;
         case '1': return  1;
         case '2': return  2;
@@ -176,6 +184,9 @@ namespace epee
 
       // convert two matching characters to int
       auto high = char_to_int(data++);
+      while (data != src.end() && !include(*data)) {
+        ++data;
+      }
       auto low  = char_to_int(data++);
 
       result.push_back(high << 4 | low);

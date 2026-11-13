@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020, The Monero Project
+// Copyright (c) 2019-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -30,29 +30,53 @@
 #pragma once
 
 #ifdef _WIN32
+
 #include <windows.h>
-#define CTHR_MUTEX_TYPE	HANDLE
-#define CTHR_MUTEX_INIT	NULL
-#define CTHR_MUTEX_LOCK(x)	do { if (x == NULL) { \
-    HANDLE p = CreateMutex(NULL, FALSE, NULL); \
-    if (InterlockedCompareExchangePointer((PVOID*)&x, (PVOID)p, NULL) != NULL) \
-      CloseHandle(p); \
-  } WaitForSingleObject(x, INFINITE); } while(0)
-#define CTHR_MUTEX_UNLOCK(x)	ReleaseMutex(x)
+
+#define CTHR_RWLOCK_TYPE	SRWLOCK
+#define CTHR_RWLOCK_INIT	SRWLOCK_INIT
+#define CTHR_RWLOCK_LOCK_WRITE(x)	AcquireSRWLockExclusive(&x)
+#define CTHR_RWLOCK_UNLOCK_WRITE(x)	ReleaseSRWLockExclusive(&x)
+#define CTHR_RWLOCK_LOCK_READ(x)	AcquireSRWLockShared(&x)
+#define CTHR_RWLOCK_UNLOCK_READ(x)	ReleaseSRWLockShared(&x)
+#define CTHR_RWLOCK_TRYLOCK_READ(x)	TryAcquireSRWLockShared(&x)
+
 #define CTHR_THREAD_TYPE	HANDLE
-#define CTHR_THREAD_RTYPE	void
-#define CTHR_THREAD_RETURN	return
-#define CTHR_THREAD_CREATE(thr, func, arg)	thr = (HANDLE)_beginthread(func, 0, arg)
-#define CTHR_THREAD_JOIN(thr)			WaitForSingleObject(thr, INFINITE)
+#define CTHR_THREAD_RTYPE	unsigned __stdcall
+#define CTHR_THREAD_RETURN	_endthreadex(0); return 0;
+#define CTHR_THREAD_CREATE(thr, func, arg)	((thr = (HANDLE)_beginthreadex(0, 0, func, arg, 0, 0)) != 0L)
+#define CTHR_THREAD_JOIN(thr)			do { WaitForSingleObject(thr, INFINITE); CloseHandle(thr); } while(0)
+#define CTHR_THREAD_CLOSE(thr)			CloseHandle((HANDLE)thr);
+
+#define CTHR_ONCE_FLAG             INIT_ONCE
+#define CTHR_ONCE_INIT             INIT_ONCE_STATIC_INIT
+#define CTHR_ONCE_CALL(flag, f)    (0 != InitOnceExecuteOnce(flag, f, NULL, NULL))
+#define CTHR_ONCE_DECLARE_CB(name) BOOL CALLBACK name(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
+#define CTHR_ONCE_CB_SUCCESS       true
+
 #else
+
 #include <pthread.h>
-#define CTHR_MUTEX_TYPE pthread_mutex_t
-#define CTHR_MUTEX_INIT	PTHREAD_MUTEX_INITIALIZER
-#define CTHR_MUTEX_LOCK(x)	pthread_mutex_lock(&x)
-#define CTHR_MUTEX_UNLOCK(x)	pthread_mutex_unlock(&x)
+
+#define CTHR_RWLOCK_TYPE	pthread_rwlock_t
+#define CTHR_RWLOCK_INIT	PTHREAD_RWLOCK_INITIALIZER
+#define CTHR_RWLOCK_LOCK_WRITE(x)	pthread_rwlock_wrlock(&x)
+#define CTHR_RWLOCK_UNLOCK_WRITE(x)	pthread_rwlock_unlock(&x)
+#define CTHR_RWLOCK_LOCK_READ(x)	pthread_rwlock_rdlock(&x)
+#define CTHR_RWLOCK_UNLOCK_READ(x)	pthread_rwlock_unlock(&x)
+#define CTHR_RWLOCK_TRYLOCK_READ(x)	(pthread_rwlock_tryrdlock(&x) == 0)
+
 #define CTHR_THREAD_TYPE pthread_t
 #define CTHR_THREAD_RTYPE	void *
 #define CTHR_THREAD_RETURN	return NULL
-#define CTHR_THREAD_CREATE(thr, func, arg)	pthread_create(&thr, NULL, func, arg)
+#define CTHR_THREAD_CREATE(thr, func, arg)	(pthread_create(&thr, NULL, func, arg) == 0)
 #define CTHR_THREAD_JOIN(thr)			pthread_join(thr, NULL)
+#define CTHR_THREAD_CLOSE(thr)			pthread_detach(thr)
+
+#define CTHR_ONCE_FLAG             pthread_once_t
+#define CTHR_ONCE_INIT             PTHREAD_ONCE_INIT
+#define CTHR_ONCE_CALL(flag, f)    (0 == pthread_once(flag, f))
+#define CTHR_ONCE_DECLARE_CB(name) void name(void)
+#define CTHR_ONCE_CB_SUCCESS
+
 #endif

@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -30,10 +30,7 @@
 #include <boost/filesystem.hpp>
 #include "common/command_line.h"
 #include "serialization/crypto.h"
-#include "cryptonote_core/tx_pool.h"
 #include "cryptonote_core/cryptonote_core.h"
-#include "cryptonote_core/blockchain.h"
-#include "blockchain_db/blockchain_db.h"
 #include "version.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -115,6 +112,7 @@ int main(int argc, char* argv[])
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_data_dir);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_testnet_on);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_stagenet_on);
+  command_line::add_arg(desc_cmd_sett, cryptonote::arg_regtest_on);
   command_line::add_arg(desc_cmd_sett, arg_log_level);
   command_line::add_arg(desc_cmd_sett, arg_verbose);
   command_line::add_arg(desc_cmd_sett, arg_dry_run);
@@ -151,18 +149,15 @@ int main(int argc, char* argv[])
   LOG_PRINT_L0("Starting...");
 
   std::string opt_data_dir = command_line::get_arg(vm, cryptonote::arg_data_dir);
-  bool opt_testnet = command_line::get_arg(vm, cryptonote::arg_testnet_on);
-  bool opt_stagenet = command_line::get_arg(vm, cryptonote::arg_stagenet_on);
-  network_type net_type = opt_testnet ? TESTNET : opt_stagenet ? STAGENET : MAINNET;
+  const network_type net_type = core::get_network_type_from_args(vm);
   bool opt_verbose = command_line::get_arg(vm, arg_verbose);
   bool opt_dry_run = command_line::get_arg(vm, arg_dry_run);
 
   const std::string input = command_line::get_arg(vm, arg_input);
 
   LOG_PRINT_L0("Initializing source blockchain (BlockchainDB)");
-  std::unique_ptr<Blockchain> core_storage;
-  tx_memory_pool m_mempool(*core_storage);
-  core_storage.reset(new Blockchain(m_mempool));
+  std::unique_ptr<BlockchainAndPool> core_storage = std::make_unique<BlockchainAndPool>();
+
   BlockchainDB *db = new_db();
   if (db == NULL)
   {
@@ -182,7 +177,7 @@ int main(int argc, char* argv[])
     LOG_PRINT_L0("Error opening database: " << e.what());
     return 1;
   }
-  r = core_storage->init(db, net_type);
+  r = core_storage->blockchain.init(db, net_type);
 
   CHECK_AND_ASSERT_MES(r, 1, "Failed to initialize source blockchain storage");
   LOG_PRINT_L0("Source blockchain storage initialized OK");
@@ -280,7 +275,7 @@ int main(int argc, char* argv[])
   MINFO("Prunable outputs: " << num_prunable_outputs);
 
   LOG_PRINT_L0("Blockchain known spent data pruned OK");
-  core_storage->deinit();
+  core_storage->blockchain.deinit();
   return 0;
 
   CATCH_ENTRY("Error", 1);

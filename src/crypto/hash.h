@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -30,25 +30,20 @@
 
 #pragma once
 
-#include <stddef.h>
-#include <iostream>
+#include <cstddef>
+#include <iosfwd>
 
-#include "common/pod-class.h"
 #include "generic-ops.h"
-#include "hex.h"
-#include "span.h"
 
 namespace crypto {
 
-  extern "C" {
-#include "hash-ops.h"
-  }
+#include "hash-def.h"
 
 #pragma pack(push, 1)
-  POD_CLASS hash {
+  struct hash {
     char data[HASH_SIZE];
   };
-  POD_CLASS hash8 {
+  struct hash8 {
     char data[8];
   };
 #pragma pack(pop)
@@ -60,37 +55,26 @@ namespace crypto {
     Cryptonight hash functions
   */
 
-  inline void cn_fast_hash(const void *data, std::size_t length, hash &hash) {
-    cn_fast_hash(data, length, reinterpret_cast<char *>(&hash));
-  }
+  void cn_fast_hash(const void *data, std::size_t length, hash &hash);
 
-  inline hash cn_fast_hash(const void *data, std::size_t length) {
-    hash h;
-    cn_fast_hash(data, length, reinterpret_cast<char *>(&h));
-    return h;
-  }
+  hash cn_fast_hash(const void *data, std::size_t length);
 
-  inline void cn_slow_hash(const void *data, std::size_t length, hash &hash, int variant = 0, uint64_t height = 0) {
-    cn_slow_hash(data, length, reinterpret_cast<char *>(&hash), variant, 0/*prehashed*/, height);
-  }
+  void cn_variant1_check(const std::size_t length, const int variant);
 
-  inline void cn_slow_hash_prehashed(const void *data, std::size_t length, hash &hash, int variant = 0, uint64_t height = 0) {
-    cn_slow_hash(data, length, reinterpret_cast<char *>(&hash), variant, 1/*prehashed*/, height);
-  }
+  void cn_slow_hash(const void *data, std::size_t length, hash &hash, int variant = 0, uint64_t height = 0);
 
-  inline void tree_hash(const hash *hashes, std::size_t count, hash &root_hash) {
-    tree_hash(reinterpret_cast<const char (*)[HASH_SIZE]>(hashes), count, reinterpret_cast<char *>(&root_hash));
-  }
+  void cn_slow_hash_prehashed(const void *data, std::size_t length, hash &hash, int variant = 0, uint64_t height = 0);
 
-  inline std::ostream &operator <<(std::ostream &o, const crypto::hash &v) {
-    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
-  }
-  inline std::ostream &operator <<(std::ostream &o, const crypto::hash8 &v) {
-    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
-  }
+  void tree_hash(const hash *hashes, std::size_t count, hash &root_hash);
+
+  std::ostream &operator <<(std::ostream &o, const crypto::hash &v);
+  std::ostream &operator <<(std::ostream &o, const crypto::hash8 &v);
 
   constexpr static crypto::hash null_hash = {};
   constexpr static crypto::hash8 null_hash8 = {};
+
+  inline bool operator<(const hash &lhs, const hash &rhs) noexcept { return memcmp(&lhs, &rhs, sizeof(hash)) < 0; }
+  inline bool operator>(const hash &lhs, const hash &rhs) noexcept { return rhs < lhs; }
 }
 
 CRYPTO_MAKE_HASHABLE(hash)

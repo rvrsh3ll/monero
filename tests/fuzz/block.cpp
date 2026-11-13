@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -37,6 +37,6 @@ BEGIN_INIT_SIMPLE_FUZZER()
 END_INIT_SIMPLE_FUZZER()
 
 BEGIN_SIMPLE_FUZZER()
-  cryptonote::block b = AUTO_VAL_INIT(b);
+  cryptonote::block b{};
   parse_and_validate_block_from_blob(std::string((const char*)buf, len), b);
 END_SIMPLE_FUZZER()

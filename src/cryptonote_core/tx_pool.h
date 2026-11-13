@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -37,8 +37,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
-#include <boost/serialization/version.hpp>
 #include <boost/utility.hpp>
+#include <boost/bimap.hpp>
+#include <boost/bimap/set_of.hpp>
+#include <boost/bimap/multiset_of.hpp>
+#include <boost/bimap/unordered_multiset_of.hpp>
 
 #include "span.h"
 #include "string_tools.h"
@@ -59,26 +62,24 @@ namespace cryptonote
   /*                                                                      */
   /************************************************************************/
 
-  //! pair of <transaction fee, transaction hash> for organization
-  typedef std::pair<std::pair<double, std::time_t>, crypto::hash> tx_by_fee_and_receive_time_entry;
-
-  class txCompare
+  class txFeeCompare
   {
   public:
-    bool operator()(const tx_by_fee_and_receive_time_entry& a, const tx_by_fee_and_receive_time_entry& b) const
+    bool operator()(const std::pair<double, std::time_t>& a, const std::pair<double, std::time_t>& b) const
     {
       // sort by greatest first, not least
-      if (a.first.first > b.first.first) return true;
-      else if (a.first.first < b.first.first) return false;
-      else if (a.first.second < b.first.second) return true;
-      else if (a.first.second > b.first.second) return false;
-      else if (a.second != b.second) return true;
-      else return false;
+      if (a.first > b.first) return true;
+      if (a.first < b.first) return false;
+
+      if (a.second < b.second) return true;
+      return false;
     }
-  };
+  }; 
 
   //! container for sorting transactions by fee per unit size
-  typedef std::set<tx_by_fee_and_receive_time_entry, txCompare> sorted_tx_container;
+  typedef boost::bimap<boost::bimaps::multiset_of<std::pair<double, std::time_t>, txFeeCompare>,
+                       boost::bimaps::set_of<crypto::hash>> sorted_tx_container;
+  
 
   /**
    * @brief Transaction pool, handles transactions which are not part of a block
@@ -98,21 +99,19 @@ namespace cryptonote
   {
   public:
     /**
-     * @brief Constructor
-     *
-     * @param bchs a Blockchain class instance, for getting chain info
-     */
-    tx_memory_pool(Blockchain& bchs);
-
-
-    /**
      * @copydoc add_tx(transaction&, tx_verification_context&, bool, bool, uint8_t)
      *
      * @param id the transaction's hash
      * @tx_relay how the transaction was received
      * @param tx_weight the transaction's weight
+     * @param valid_input_verification_id a previously valid verID if non-null
+     * @return True if tx passes verification checks AND is first observation
+     *   of tx in `broadcasted` relay method.
      */
-    bool add_tx(transaction &tx, const crypto::hash &id, const cryptonote::blobdata &blob, size_t tx_weight, tx_verification_context& tvc, relay_method tx_relay, bool relayed, uint8_t version);
+    bool add_tx(transaction &tx, const crypto::hash &id, const cryptonote::blobdata &blob,
+      size_t tx_weight, tx_verification_context& tvc, relay_method tx_relay, bool relayed,
+      uint8_t version, uint8_t nic_verified_hf_version = 0,
+      const crypto::hash &valid_input_verification_id = crypto::null_hash);
 
     /**
      * @brief add a transaction to the transaction pool
@@ -127,10 +126,21 @@ namespace cryptonote
      * @tx_relay how the transaction was received
      * @param relayed was this transaction from the network or a local client?
      * @param version the version used to create the transaction
+     * @param nic_verified_hf_version hard fork which "tx" is known to pass non-input consensus test
+     * @param valid_input_verification_id a previously valid verID if non-null
      *
-     * @return true if the transaction passes validations, otherwise false
+     * If "nic_verified_hf_version" parameter is equal to "version" parameter, then we skip the
+     * asserting `ver_non_input_consensus(tx)`, which greatly speeds up block popping and returning
+     * txs to mempool for txs which we know will pass the test. If nothing is known about how "tx"
+     * passes the non-input consensus tests (e.g. for newly received relayed txs), then leave
+     * "nic_verified_hf_version" as its default value of 0 (there is no v0 fork).
+     *
+     * @return True if tx passes verification checks AND is first observation
+     *   of tx in `broadcasted` relay method.
      */
-    bool add_tx(transaction &tx, tx_verification_context& tvc, relay_method tx_relay, bool relayed, uint8_t version);
+    bool add_tx(transaction &tx, tx_verification_context& tvc, relay_method tx_relay, bool relayed,
+      uint8_t version, uint8_t nic_verified_hf_version = 0,
+      const crypto::hash &valid_input_verification_id = crypto::null_hash);
 
     /**
      * @brief takes a transaction with the given hash from the pool
@@ -140,14 +150,26 @@ namespace cryptonote
      * @param txblob return-by-reference the transaction as a blob
      * @param tx_weight return-by-reference the transaction's weight
      * @param fee the transaction fee
-     * @param relayed return-by-reference was transaction relayed to us by the network?
-     * @param do_not_relay return-by-reference is transaction not to be relayed to the network?
-     * @param double_spend_seen return-by-reference was a double spend seen for that transaction?
-     * @param pruned return-by-reference is the tx pruned
+     * @param[out] valid_input_verification_id return-by-reference was a previously valid verID if non-null
+     * @param[out] relayed return-by-reference was transaction relayed to us by the network?
+     * @param[out] do_not_relay return-by-reference is transaction not to be relayed to the network?
+     * @param[out] double_spend_seen return-by-reference was a double spend seen for that transaction?
+     * @param[out] pruned return-by-reference is the tx pruned
+     * @param[out] suppress_missing_msgs suppress warning msgs when txid is missing (optional, defaults to `false`)
      *
      * @return true unless the transaction cannot be found in the pool
      */
-    bool take_tx(const crypto::hash &id, transaction &tx, cryptonote::blobdata &txblob, size_t& tx_weight, uint64_t& fee, bool &relayed, bool &do_not_relay, bool &double_spend_seen, bool &pruned);
+    bool take_tx(const crypto::hash &id,
+      transaction &tx,
+      cryptonote::blobdata &txblob,
+      size_t& tx_weight,
+      uint64_t& fee,
+      crypto::hash &valid_input_verification_id,
+      bool &relayed,
+      bool &do_not_relay,
+      bool &double_spend_seen,
+      bool &pruned,
+      bool suppress_missing_msgs = false);
 
     /**
      * @brief checks if the pool has a transaction with the given hash
@@ -226,17 +248,38 @@ namespace cryptonote
     /**
      * @brief Chooses transactions for a block to include
      *
-     * @param bl return-by-reference the block to fill in with transactions
-     * @param median_weight the current median block weight
+     * @param median_weight the current median block weight used for penalty calculations
      * @param already_generated_coins the current total number of coins "minted"
-     * @param total_weight return-by-reference the total weight of the new block
-     * @param fee return-by-reference the total of fees from the included transactions
-     * @param expected_reward return-by-reference the total reward awarded to the miner finding this block, including transaction fees
-     * @param version hard fork version to use for consensus rules
+     * @param hf_version the current hard fork version
+     * @param overpick if >0, the ratio over the optimal weight for which to limit total weight of `selected_backlog`
+     * @param include_sensitive return stempool (only if m_mine_stem_txes), anonymity-pool, and unrelayed txes
+     * @param[out] selected_backlog potential (TXID, weight, fee) tuples, in descending preference order
      *
-     * @return true
+     * Not all transactions in the pool will be returned for performance, consensus, and/or
+     * profitability reasons. If there are too many transactions in the pool, only the
+     * highest-paying / oldest transactions will be returned - but enough for the miner to create a
+     * full block. Transactions which do not pass validation rules for the next block are also
+     * filtered out. However, @warning, `selected_backlog` may also contain *too many entries*, even
+     * when `overpick_ratio` == 0, such that block weight limit is surpassed after including the
+     * coinbase transaction. In this case, it is a good idea to pop candidates from the back of the
+     * list until the weight is within the limit.
+     *
+     * The target limit is calculated as (1 + `overpick`) * optimal weight. So for example, an
+     * `overpick` value of 0.1 will try to fill `selected_backlog` so that it's total weight is 110%
+     * of the total weight if `overpick` were 0. When `overpick` > 0, entries in `selected_backlog`
+     * may not be net profitable to include in the block, even if they fit within the block.
+     *
+     * This function *may* do some upkeep on the mempool, including updating transaction
+     * verification metadata, and removing stale unverifiable transactions.
+     *
+     * @return true on success
      */
-    bool fill_block_template(block &bl, size_t median_weight, uint64_t already_generated_coins, size_t &total_weight, uint64_t &fee, uint64_t &expected_reward, uint8_t version);
+    bool get_block_template_backlog(size_t median_weight,
+      uint64_t already_generated_coins,
+      uint8_t hf_version,
+      float overpick,
+      bool include_sensitive,
+      std::vector<tx_block_template_backlog_entry> &selected_backlog);
 
     /**
      * @brief get a list of all transactions in the pool
@@ -281,12 +324,9 @@ namespace cryptonote
      *
      * @param tx_infos return-by-reference the transactions' information
      * @param key_image_infos return-by-reference the spent key images' information
-     * @param include_sensitive_data return stempool, anonymity-pool, and unrelayed
-     *    txes and fields that are sensitive to the node privacy
-     *
      * @return true
      */
-    bool get_transactions_and_spent_keys_info(std::vector<tx_info>& tx_infos, std::vector<spent_key_image_info>& key_image_infos, bool include_sensitive_data = false) const;
+    bool get_transactions_and_spent_keys_info(std::vector<tx_info>& tx_infos, std::vector<spent_key_image_info>& key_image_infos) const;
 
     /**
      * @brief get information about all transactions and key images in the pool
@@ -295,7 +335,6 @@ namespace cryptonote
      *
      * @param tx_infos [out] the transactions' information
      * @param key_image_infos [out] the spent key images' information
-     *
      * @return true
      */
     bool get_pool_for_rpc(std::vector<cryptonote::rpc::tx_in_pool>& tx_infos, cryptonote::rpc::key_images_with_tx_hashes& key_image_infos) const;
@@ -344,8 +383,10 @@ namespace cryptonote
      *
      * @param hashes list of tx hashes that are about to be relayed
      * @param tx_relay update how the tx left this node
+     * @param just_broadcasted true if a tx was just broadcasted
+     *
      */
-    void set_relayed(epee::span<const crypto::hash> hashes, relay_method tx_relay);
+    void set_relayed(epee::span<const crypto::hash> hashes, relay_method tx_relay, std::vector<bool> &just_broadcasted);
 
     /**
      * @brief get the total number of transactions in the pool
@@ -384,29 +425,18 @@ namespace cryptonote
     uint64_t cookie() const { return m_cookie; }
 
     /**
-     * @brief get the cumulative txpool weight in bytes
+     * @brief reduce the cumulative txpool weight by the weight provided
      *
-     * @return the cumulative txpool weight in bytes
+     * @param weight the weight to reduce the total txpool weight by
      */
-    size_t get_txpool_weight() const;
-
-    /**
-     * @brief set the max cumulative txpool weight in bytes
-     *
-     * @param bytes the max cumulative txpool weight in bytes
-     */
-    void set_txpool_max_weight(size_t bytes);
-
-#define CURRENT_MEMPOOL_ARCHIVE_VER    11
-#define CURRENT_MEMPOOL_TX_DETAILS_ARCHIVE_VER    13
+    void reduce_txpool_weight(size_t weight);
 
     /**
      * @brief information about a single transaction
      */
     struct tx_details
     {
-      transaction tx;  //!< the transaction
-      size_t blob_size;  //!< the transaction's size
+      cryptonote::blobdata tx_blob; //!< the transaction's binary blob
       size_t weight;  //!< the transaction's weight
       uint64_t fee;  //!< the transaction's fee amount
       crypto::hash max_used_block_id;  //!< the hash of the highest block referenced by an input
@@ -439,19 +469,41 @@ namespace cryptonote
       bool do_not_relay; //!< to avoid relay this transaction to the network
 
       bool double_spend_seen; //!< true iff another tx was seen double spending this one
+
+      crypto::hash prunable_hash; //!< cached prunable hash, valid iff `prunable_hash_valid`
+      bool prunable_hash_valid; //!< whether `prunable_hash` was cached at pool-insertion time
     };
 
     /**
-     * @brief get infornation about a single transaction
+     * @brief get information about a single transaction
      */
-    bool get_transaction_info(const crypto::hash &txid, tx_details &td) const;
+    bool get_transaction_info(const crypto::hash &txid, tx_details &td, bool include_sensitive_data) const;
+
+    /**
+     * @brief get information about multiple transactions
+     */
+    bool get_transactions_info(const epee::span<const crypto::hash> txids, std::vector<std::pair<crypto::hash, tx_details>>& txs, bool include_sensitive_data = false, size_t max_tx_count = 0) const;
 
     /**
      * @brief get transactions not in the passed set
      */
-    bool get_complement(const std::vector<crypto::hash> &hashes, std::vector<cryptonote::blobdata> &txes) const;
+    bool get_complement(std::vector<crypto::hash> hashes, std::vector<cryptonote::blobdata> &txes) const;
+
+    /**
+     * @brief get info necessary for update of pool-related info in a wallet, preferably incremental
+     *
+     * @return true on success, false on error
+     */
+    bool get_pool_info(time_t start_time, bool include_sensitive, size_t max_tx_count, std::vector<std::pair<crypto::hash, tx_details>>& added_txs, std::vector<crypto::hash>& remaining_added_txids, std::vector<crypto::hash>& removed_txs, bool& incremental) const;
 
   private:
+
+    /**
+     * @brief Constructor
+     *
+     * @param bchs a Blockchain class instance, for getting chain info
+     */
+    tx_memory_pool(Blockchain& bchs);
 
     /**
      * @brief insert key images into m_spent_key_images
@@ -511,36 +563,14 @@ namespace cryptonote
     bool remove_transaction_keyimages(const transaction_prefix& tx, const crypto::hash &txid);
 
     /**
-     * @brief check if any of a transaction's spent key images are present in a given set
-     *
-     * @param kic the set of key images to check against
-     * @param tx the transaction to check
-     *
-     * @return true if any key images present in the set, otherwise false
-     */
-    static bool have_key_images(const std::unordered_set<crypto::key_image>& kic, const transaction_prefix& tx);
-
-    /**
-     * @brief append the key images from a transaction to the given set
-     *
-     * @param kic the set of key images to append to
-     * @param tx the transaction
-     *
-     * @return false if any append fails, otherwise true
-     */
-    static bool append_key_images(std::unordered_set<crypto::key_image>& kic, const transaction_prefix& tx);
-
-    /**
      * @brief check if a transaction is a valid candidate for inclusion in a block
      *
      * @param txd the transaction to check (and info about it)
      * @param txid the txid of the transaction to check
-     * @param txblob the transaction blob to check
-     * @param tx the parsed transaction, if successful
      *
      * @return true if the transaction is good to go, otherwise false
      */
-    bool is_transaction_ready_to_go(txpool_tx_meta_t& txd, const crypto::hash &txid, const cryptonote::blobdata &txblob, transaction&tx) const;
+    bool is_transaction_ready_to_go(txpool_tx_meta_t& txd, const crypto::hash &txid) const;
 
     /**
      * @brief mark all transactions double spending the one passed
@@ -554,16 +584,23 @@ namespace cryptonote
      */
     void prune(size_t bytes = 0);
 
+    void add_tx_to_transient_lists(const crypto::hash& txid, double fee, time_t receive_time, bool sensitive);
+    void remove_tx_from_transient_lists(const cryptonote::sorted_tx_container::iterator& sorted_it, const crypto::hash& txid, bool sensitive);
+    void track_removed_tx(const crypto::hash& txid, bool sensitive);
+
     //TODO: confirm the below comments and investigate whether or not this
     //      is the desired behavior
-    //! map key images to transactions which spent them
+    //! map key images to transactions which spent them, and vice versa
     /*! this seems odd, but it seems that multiple transactions can exist
      *  in the pool which both have the same spent key.  This would happen
      *  in the event of a reorg where someone creates a new/different
      *  transaction on the assumption that the original will not be in a
      *  block again.
      */
-    typedef std::unordered_map<crypto::key_image, std::unordered_set<crypto::hash>> key_images_container;
+    typedef boost::bimap<
+        boost::bimaps::unordered_multiset_of<crypto::key_image>,
+        boost::bimaps::unordered_multiset_of<crypto::hash>
+      > key_images_container;
 
 #if defined(DEBUG_CREATE_BLOCK_TEMPLATE)
 public:
@@ -586,6 +623,32 @@ private:
 
     std::atomic<uint64_t> m_cookie; //!< incremented at each change
 
+    struct added_tx_info
+    {
+      time_t receive_time;
+      bool sensitive;
+    };
+
+    // Info when transactions entered the pool, accessible by txid
+    std::unordered_map<crypto::hash, added_tx_info> m_added_txs_by_id;
+
+    // Info at what time the pool started to track the adding of transactions
+    time_t m_added_txs_start_time;
+
+    struct removed_tx_info
+    {
+      crypto::hash txid;
+      bool sensitive;
+    };
+
+    // Info about transactions that were removed from the pool, ordered by the time
+    // of deletion
+    std::multimap<time_t, removed_tx_info> m_removed_txs_by_time;
+
+    // Info how far back in time the list of removed tx ids currently reaches
+    // (it gets shortened periodically to prevent overflow)
+    time_t m_removed_txs_start_time;
+
     /**
      * @brief get an iterator to a transaction in the sorted container
      *
@@ -593,10 +656,16 @@ private:
      *
      * @return an iterator, possibly to the end of the container if not found
      */
-    sorted_tx_container::iterator find_tx_in_sorted_container(const crypto::hash& id) const;
+    sorted_tx_container::iterator find_tx_in_sorted_container(const crypto::hash& id);
 
     //! cache/call Blockchain::check_tx_inputs results
-    bool check_tx_inputs(const std::function<cryptonote::transaction&(void)> &get_tx, const crypto::hash &txid, uint64_t &max_used_block_height, crypto::hash &max_used_block_id, tx_verification_context &tvc, bool kept_by_block = false) const;
+    bool check_tx_inputs(const std::function<cryptonote::transaction&(void)> &get_tx,
+      const crypto::hash &txid,
+      crypto::hash &valid_input_verification_id_inout,
+      uint64_t &max_used_block_height,
+      crypto::hash &max_used_block_id,
+      tx_verification_context &tvc,
+      bool kept_by_block = false) const;
 
     //! transactions which are unlikely to be included in blocks
     /*! These transactions are kept in RAM in case they *are* included
@@ -616,40 +685,7 @@ private:
 
     //! Next timestamp that a DB check for relayable txes is allowed
     std::atomic<time_t> m_next_check;
+
+    friend struct BlockchainAndPool;
   };
 }
-
-namespace boost
-{
-  namespace serialization
-  {
-    template<class archive_t>
-    void serialize(archive_t & ar, cryptonote::tx_memory_pool::tx_details& td, const unsigned int version)
-    {
-      ar & td.blob_size;
-      ar & td.fee;
-      ar & td.tx;
-      ar & td.max_used_block_height;
-      ar & td.max_used_block_id;
-      ar & td.last_failed_height;
-      ar & td.last_failed_id;
-      ar & td.receive_time;
-      ar & td.last_relayed_time;
-      ar & td.relayed;
-      if (version < 11)
-        return;
-      ar & td.kept_by_block;
-      if (version < 12)
-        return;
-      ar & td.do_not_relay;
-      if (version < 13)
-        return;
-      ar & td.weight;
-    }
-  }
-}
-BOOST_CLASS_VERSION(cryptonote::tx_memory_pool, CURRENT_MEMPOOL_ARCHIVE_VER)
-BOOST_CLASS_VERSION(cryptonote::tx_memory_pool::tx_details, CURRENT_MEMPOOL_TX_DETAILS_ARCHIVE_VER)
-
-
-

@@ -1,4 +1,5 @@
-# Copyright (c) 2020, The Monero Project
+# Copyright (c) 2020-2024, The Monero Project
+
 #
 # All rights reserved.
 #
@@ -37,10 +38,10 @@ set(MONERO_WALLET_CRYPTO_LIBRARY "auto" CACHE STRING "Select a wallet crypto lib
 if (${MONERO_WALLET_CRYPTO_LIBRARY} STREQUAL "auto")
    monero_crypto_autodetect(AVAILABLE BEST)
   if (DEFINED BEST)
-    message("Wallet crypto is using ${BEST} backend")
+    message(STATUS "Wallet crypto is using ${BEST} backend")
     set(MONERO_WALLET_CRYPTO_LIBRARY ${BEST})
   else ()
-    message("Defaulting to internal crypto library for wallet")
+    message(STATUS "Defaulting to internal crypto library for wallet")
     set(MONERO_WALLET_CRYPTO_LIBRARY "cn")
   endif ()
 endif ()

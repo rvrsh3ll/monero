@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020, The Monero Project
+// Copyright (c) 2019-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -30,7 +30,9 @@
 
 #include <boost/chrono/chrono.hpp>
 #include <boost/thread/thread_only.hpp>
+#include <ctime>
 #include <limits>
+#include "blockchain_db/locked_txn.h"
 #include "string_tools.h"
 
 #define INIT_MEMPOOL_TEST()                                   \
@@ -44,18 +46,10 @@
 
 txpool_base::txpool_base()
   : test_chain_unit_base()
-  , m_broadcasted_tx_count(0)
   , m_all_tx_count(0)
 {
-  REGISTER_CALLBACK_METHOD(txpool_spend_key_public, increase_broadcasted_tx_count);
   REGISTER_CALLBACK_METHOD(txpool_spend_key_public, increase_all_tx_count);
   REGISTER_CALLBACK_METHOD(txpool_spend_key_public, check_txpool_spent_keys);
-}
-
-bool txpool_base::increase_broadcasted_tx_count(cryptonote::core& /*c*/, size_t /*ev_index*/, const std::vector<test_event_entry>& /*events*/)
-{
-  ++m_broadcasted_tx_count;
-  return true;
 }
 
 bool txpool_base::increase_all_tx_count(cryptonote::core& /*c*/, size_t /*ev_index*/, const std::vector<test_event_entry>& /*events*/)
@@ -68,23 +62,7 @@ bool txpool_base::check_txpool_spent_keys(cryptonote::core& c, size_t /*ev_index
 {
   std::vector<cryptonote::tx_info> infos{};
   std::vector<cryptonote::spent_key_image_info> key_images{};
-  if (!c.get_pool_transactions_and_spent_keys_info(infos, key_images) || infos.size() != m_broadcasted_tx_count || key_images.size() != m_broadcasted_tx_count)
-  {
-    MERROR("Failed broadcasted spent keys retrieval - Expected Broadcasted Count: " << m_broadcasted_tx_count << " Actual Info Count: " << infos.size() << " Actual Key Image Count: " << key_images.size());
-    return false;
-  }
-
-  infos.clear();
-  key_images.clear();
-  if (!c.get_pool_transactions_and_spent_keys_info(infos, key_images, false) || infos.size() != m_broadcasted_tx_count || key_images.size() != m_broadcasted_tx_count)
-  {
-    MERROR("Failed broadcasted spent keys retrieval - Expected Broadcasted Count: " << m_broadcasted_tx_count << " Actual Info Count: " << infos.size() << " Actual Key Image Count: " << key_images.size());
-    return false;
-  }
-
-  infos.clear();
-  key_images.clear();
-  if (!c.get_pool_transactions_and_spent_keys_info(infos, key_images, true) || infos.size() != m_all_tx_count || key_images.size() != m_all_tx_count)
+  if (!c.get_pool_transactions_and_spent_keys_info(infos, key_images) || infos.size() != m_all_tx_count || key_images.size() != m_all_tx_count)
   {
     MERROR("Failed all spent keys retrieval - Expected All Count: " << m_all_tx_count << " Actual Info Count: " << infos.size() << " Actual Key Image Count: " << key_images.size());
     return false;
@@ -98,8 +76,7 @@ bool txpool_spend_key_public::generate(std::vector<test_event_entry>& events) co
   INIT_MEMPOOL_TEST();
 
   DO_CALLBACK(events, "check_txpool_spent_keys");
-  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0);
-  DO_CALLBACK(events, "increase_broadcasted_tx_count");
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
   DO_CALLBACK(events, "increase_all_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
 
@@ -112,11 +89,119 @@ bool txpool_spend_key_all::generate(std::vector<test_event_entry>& events)
   SET_EVENT_VISITOR_SETT(events, event_visitor_settings::set_txs_do_not_relay);
 
   DO_CALLBACK(events, "check_txpool_spent_keys");
-  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0);
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
   DO_CALLBACK(events, "increase_all_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
 
   return true;
+}
+
+txpool_future_receive_time::txpool_future_receive_time()
+  : test_chain_unit_base()
+  , m_future_txids{crypto::null_hash, crypto::null_hash}
+  , m_expired_txid(crypto::null_hash)
+{
+  REGISTER_CALLBACK_METHOD(txpool_future_receive_time, set_future_receive_time);
+  REGISTER_CALLBACK_METHOD(txpool_future_receive_time, check_txpool);
+}
+
+bool txpool_future_receive_time::generate(std::vector<test_event_entry>& events)
+{
+  INIT_MEMPOOL_TEST();
+  GENERATE_ACCOUNT(alice_account);
+  GENERATE_ACCOUNT(carol_account);
+
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
+  MAKE_TX(events, tx_1, miner_account, alice_account, send_amount, blk_0r);
+  MAKE_TX(events, tx_2, miner_account, carol_account, send_amount, blk_0r);
+  DO_CALLBACK(events, "set_future_receive_time");
+  DO_CALLBACK(events, "check_txpool");
+
+  return true;
+}
+
+bool txpool_future_receive_time::set_future_receive_time(cryptonote::core& c, size_t ev_index, const std::vector<test_event_entry>& events)
+{
+  cryptonote::Blockchain& blockchain = c.get_blockchain_storage();
+  m_future_txids[0] = cryptonote::get_transaction_hash(boost::get<cryptonote::transaction>(events.at(ev_index - 3)));
+  m_future_txids[1] = cryptonote::get_transaction_hash(boost::get<cryptonote::transaction>(events.at(ev_index - 2)));
+  m_expired_txid = cryptonote::get_transaction_hash(boost::get<cryptonote::transaction>(events.at(ev_index - 1)));
+
+  const uint64_t now = std::time(nullptr);
+  const auto set_receive_time = [&blockchain](const crypto::hash& txid, uint64_t receive_time)
+  {
+    cryptonote::txpool_tx_meta_t meta{};
+    if (!blockchain.get_txpool_tx_meta(txid, meta))
+      return false;
+    meta.receive_time = receive_time;
+    blockchain.update_txpool_tx(txid, meta);
+    return true;
+  };
+
+  cryptonote::LockedTXN lock(blockchain.get_db());
+  if (!set_receive_time(m_future_txids[0], now + 3600) ||
+      !set_receive_time(m_future_txids[1], now + 3600) ||
+      !set_receive_time(m_expired_txid, now - CRYPTONOTE_MEMPOOL_TX_LIVETIME - 1))
+  {
+    MERROR("Failed to update transaction pool metadata");
+    return false;
+  }
+  lock.commit();
+  return true;
+}
+
+bool txpool_future_receive_time::check_txpool(cryptonote::core& c, size_t /*ev_index*/, const std::vector<test_event_entry>& /*events*/)
+{
+  bool valid = true;
+  cryptonote::txpool_stats stats{};
+  if (!c.get_pool_transaction_stats(stats) || stats.txs_total != 3)
+  {
+    MERROR("Failed to get transaction pool statistics");
+    valid = false;
+  }
+
+  uint32_t histogram_txs = 0;
+  for (const cryptonote::txpool_histo& entry : stats.histo)
+    histogram_txs += entry.txs;
+  if (histogram_txs != stats.txs_total)
+  {
+    MERROR("Transaction pool histogram contains " << histogram_txs << " transactions, expected " << stats.txs_total);
+    valid = false;
+  }
+
+  c.on_idle();
+  for (const crypto::hash& txid : m_future_txids)
+  {
+    if (!c.pool_has_tx(txid))
+    {
+      MERROR("Transaction with a future receive time was removed from the pool");
+      valid = false;
+    }
+  }
+  if (c.pool_has_tx(m_expired_txid))
+  {
+    MERROR("Expired transaction was not removed from the pool");
+    valid = false;
+  }
+
+  stats = {};
+  if (!c.get_pool_transaction_stats(stats) || stats.txs_total != 2)
+  {
+    MERROR("Failed to get transaction pool statistics after cleanup");
+    valid = false;
+  }
+
+  histogram_txs = 0;
+  for (const cryptonote::txpool_histo& entry : stats.histo)
+    histogram_txs += entry.txs;
+  const uint64_t now = std::time(nullptr);
+  if (histogram_txs != stats.txs_total || stats.oldest > now)
+  {
+    MERROR("Invalid transaction pool statistics after cleanup");
+    valid = false;
+  }
+
+  return valid;
 }
 
 txpool_double_spend_base::txpool_double_spend_base()
@@ -245,7 +330,7 @@ bool txpool_double_spend_base::check_changed(cryptonote::core& c, const size_t e
   {
     std::vector<cryptonote::tx_info> infos{};
     std::vector<cryptonote::spent_key_image_info> key_images{};
-    if (!c.get_pool_transactions_and_spent_keys_info(infos, key_images, true) || infos.size() != m_all_hashes.size())
+    if (!c.get_pool_transactions_and_spent_keys_info(infos, key_images) || infos.size() != m_all_hashes.size())
     {
       MERROR("Unable to retrieve all txpool metadata");
       return false;
@@ -307,7 +392,7 @@ bool txpool_double_spend_base::check_changed(cryptonote::core& c, const size_t e
 
       if (!public_hashes.erase(hash))
       {
-        MERROR("An unexected transaction was returned from the public pool");
+        MERROR("An unexpected transaction was returned from the public pool");
         return false;
       }
     }
@@ -336,7 +421,7 @@ bool txpool_double_spend_base::check_changed(cryptonote::core& c, const size_t e
 
       if (!public_hashes.erase(hash))
       {
-        MERROR("An unexected transaction was returned from the public pool");
+        MERROR("An unexpected transaction was returned from the public pool");
         return false;
       }
     }
@@ -364,7 +449,7 @@ bool txpool_double_spend_base::check_changed(cryptonote::core& c, const size_t e
     {
       if (!all_hashes.erase(hash))
       {
-        MERROR("An unexected transaction was returned from the all pool");
+        MERROR("An unexpected transaction was returned from the all pool");
         return false;
       }
     }
@@ -502,7 +587,7 @@ bool txpool_double_spend_norelay::generate(std::vector<test_event_entry>& events
   SET_EVENT_VISITOR_SETT(events, event_visitor_settings::set_txs_do_not_relay);
   DO_CALLBACK(events, "mark_no_new");
 
-  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0);
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
 
   DO_CALLBACK(events, "increase_all_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
@@ -539,7 +624,7 @@ bool txpool_double_spend_local::generate(std::vector<test_event_entry>& events) 
   SET_EVENT_VISITOR_SETT(events, event_visitor_settings::set_local_relay);
   DO_CALLBACK(events, "mark_no_new");
 
-  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0);
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
 
   DO_CALLBACK(events, "increase_all_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
@@ -553,7 +638,6 @@ bool txpool_double_spend_local::generate(std::vector<test_event_entry>& events) 
   SET_EVENT_VISITOR_SETT(events, 0);
   DO_CALLBACK(events, "timestamp_change_pause");
   events.push_back(tx_0);
-  DO_CALLBACK(events, "increase_broadcasted_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
   DO_CALLBACK(events, "mark_timestamp_change");
   DO_CALLBACK(events, "check_new_broadcasted");
@@ -574,7 +658,7 @@ bool txpool_double_spend_keyimage::generate(std::vector<test_event_entry>& event
   DO_CALLBACK(events, "mark_no_new");
 
   const std::size_t tx_index1 = events.size();
-  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0);
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
 
   SET_EVENT_VISITOR_SETT(events, event_visitor_settings::set_txs_stem);
   DO_CALLBACK(events, "increase_all_tx_count");
@@ -595,7 +679,7 @@ bool txpool_double_spend_keyimage::generate(std::vector<test_event_entry>& event
     auto events_copy = events;
     events_copy.erase(events_copy.begin() + tx_index1);
     events_copy.erase(events_copy.begin() + tx_index2 - 1);
-    MAKE_TX(events_copy, tx_temp, miner_account, bob_account, send_amount, blk_0);
+    MAKE_TX(events_copy, tx_temp, miner_account, bob_account, send_amount, blk_0r);
     tx_1 = tx_temp;
   }
 
@@ -616,7 +700,7 @@ bool txpool_stem_loop::generate(std::vector<test_event_entry>& events) const
   SET_EVENT_VISITOR_SETT(events, event_visitor_settings::set_txs_stem);
   DO_CALLBACK(events, "mark_no_new");
 
-  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0);
+  MAKE_TX(events, tx_0, miner_account, bob_account, send_amount, blk_0r);
 
   DO_CALLBACK(events, "increase_all_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
@@ -624,7 +708,6 @@ bool txpool_stem_loop::generate(std::vector<test_event_entry>& events) const
   DO_CALLBACK(events, "check_new_hidden");
   DO_CALLBACK(events, "timestamp_change_pause");
   events.push_back(tx_0);
-  DO_CALLBACK(events, "increase_broadcasted_tx_count");
   DO_CALLBACK(events, "check_txpool_spent_keys");
   DO_CALLBACK(events, "mark_timestamp_change");
   DO_CALLBACK(events, "check_new_broadcasted");

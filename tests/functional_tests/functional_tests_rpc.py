@@ -1,6 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-from __future__ import print_function
 import sys
 import time
 import subprocess
@@ -8,9 +7,14 @@ from signal import SIGTERM
 import socket
 import string
 import os
+import time
 
 USAGE = 'usage: functional_tests_rpc.py <python> <srcdir> <builddir> [<tests-to-run> | all]'
-DEFAULT_TESTS = ['address_book', 'bans', 'blockchain', 'cold_signing', 'daemon_info', 'get_output_distribution', 'integrated_address', 'mining', 'multisig', 'p2p', 'proofs', 'rpc_payment', 'sign_message', 'transfer', 'txpool', 'uri', 'validate_address', 'wallet']
+DEFAULT_TESTS = [
+  'address_book', 'bans', 'blockchain', 'cold_signing', 'daemon_info', 'get_output_distribution',
+  'http_digest_auth', 'integrated_address', 'k_anonymity', 'mining', 'multisig', 'p2p', 'proofs',
+  'sign_message', 'transfer', 'txpool', 'uri', 'validate_address', 'wallet'
+]
 try:
   python = sys.argv[1]
   srcdir = sys.argv[2]
@@ -23,7 +27,7 @@ try:
   sys.argv[4]
 except:
   print(USAGE)
-  print('Available tests: ' + string.join(DEFAULT_TESTS, ', '))
+  print('Available tests: ' + ', '.join(DEFAULT_TESTS))
   print('Or run all with "all"')
   sys.exit(0)
 
@@ -35,32 +39,43 @@ except:
   tests = DEFAULT_TESTS
 
 # a main offline monerod, does most of the tests
-# a restricted RPC monerod setup with RPC payment
 # two local online monerods connected to each other
-N_MONERODS = 4
+N_MONERODS = 5
 
 # 4 wallets connected to the main offline monerod
-# a wallet connected to the first local online monerod
-N_WALLETS = 5
+# 1 wallet connected to the first local online monerod
+# 1 offline wallet
+# 1 offline wallet generated from a JSON file with a Polyseed
+N_WALLETS = 8
 
 WALLET_DIRECTORY = builddir + "/functional-tests-directory"
+FUNCTIONAL_TESTS_DIRECTORY = builddir + "/tests/functional_tests"
 DIFFICULTY = 10
 
-monerod_base = [builddir + "/bin/monerod", "--regtest", "--fixed-difficulty", str(DIFFICULTY), "--no-igd", "--p2p-bind-port", "monerod_p2p_port", "--rpc-bind-port", "monerod_rpc_port", "--zmq-rpc-bind-port", "monerod_zmq_port", "--non-interactive", "--disable-dns-checkpoints", "--check-updates", "disabled", "--rpc-ssl", "disabled", "--data-dir", "monerod_data_dir", "--log-level", "1"]
+monerod_base = [builddir + "/bin/monerod", "--regtest", "--fixed-difficulty", str(DIFFICULTY), "--p2p-bind-port", "monerod_p2p_port", "--rpc-bind-port", "monerod_rpc_port", "--zmq-rpc-bind-port", "monerod_zmq_port", "--zmq-pub", "monerod_zmq_pub", "--non-interactive", "--disable-dns-checkpoints", "--check-updates", "disabled", "--rpc-ssl", "disabled", "--data-dir", "monerod_data_dir", "--log-level", "1", "--rpc-max-connections-per-private-ip", "100", "--rpc-max-connections", "100"]
+
 monerod_extra = [
   ["--offline"],
-  ["--rpc-payment-address", "44SKxxLQw929wRF6BA9paQ1EWFshNnKhXM3qz6Mo3JGDE2YG3xyzVutMStEicxbQGRfrYvAAYxH6Fe8rnD56EaNwUiqhcwR", "--rpc-payment-difficulty", str(DIFFICULTY), "--rpc-payment-credits", "5000", "--offline"],
+  ["--proxy", "127.0.0.1:1", "--no-sync"],
   ["--add-exclusive-node", "127.0.0.1:18283"],
   ["--add-exclusive-node", "127.0.0.1:18282"],
+  ["--rpc-login", "md5_lover:Z1ON0101", "--rpc-restricted-bind-port", "18194", "--offline"],
 ]
-wallet_base = [builddir + "/bin/monero-wallet-rpc", "--wallet-dir", WALLET_DIRECTORY, "--rpc-bind-port", "wallet_port", "--disable-rpc-login", "--rpc-ssl", "disabled", "--daemon-ssl", "disabled", "--log-level", "1"]
+wallet_base = [builddir + "/bin/monero-wallet-rpc", "--wallet-dir", WALLET_DIRECTORY, "--rpc-bind-port", "wallet_port", "--rpc-ssl", "disabled", "--daemon-ssl", "disabled", "--log-level", "1", "--allow-mismatched-daemon-version"]
 wallet_extra = [
-  ["--daemon-port", "18180"],
-  ["--daemon-port", "18180"],
-  ["--daemon-port", "18180"],
-  ["--daemon-port", "18180"],
-  ["--daemon-port", "18182"],
+  ["--daemon-port", "18180", "--disable-rpc-login"],
+  ["--daemon-port", "18180", "--disable-rpc-login"],
+  ["--daemon-port", "18180", "--disable-rpc-login"],
+  ["--daemon-port", "18180", "--disable-rpc-login"],
+  ["--daemon-port", "18182", "--disable-rpc-login", "--no-dns"],
+  ["--offline", "--disable-rpc-login"],
+  ["--daemon-port", "18184", "--daemon-login", "md5_lover:Z1ON0101", "--rpc-login", "kyle:reveille"],
+  ["--offline", "--disable-rpc-login", "--generate-from-json", WALLET_DIRECTORY + "/polyseed.json"],
 ]
+
+os.makedirs(WALLET_DIRECTORY, exist_ok = True)
+with open(WALLET_DIRECTORY + "/polyseed.json", "w") as f:
+  f.write('{"version": 1, "filename": "", "password": "", "seed": "pulse tone truth head invite orphan sock wet crumble oven price corn pilot antenna luxury strategy", "seed_passphrase": "abc"}')
 
 command_lines = []
 processes = []
@@ -68,17 +83,21 @@ outputs = []
 ports = []
 
 for i in range(N_MONERODS):
-  command_lines.append([str(18180+i) if x == "monerod_rpc_port" else str(18280+i) if x == "monerod_p2p_port" else str(18380+i) if x == "monerod_zmq_port" else builddir + "/functional-tests-directory/monerod" + str(i) if x == "monerod_data_dir" else x for x in monerod_base])
+  command_lines.append([str(18180+i) if x == "monerod_rpc_port" else str(18280+i) if x == "monerod_p2p_port" else str(18380+i) if x == "monerod_zmq_port" else "tcp://127.0.0.1:" + str(18480+i) if x == "monerod_zmq_pub" else builddir + "/functional-tests-directory/monerod" + str(i) if x == "monerod_data_dir" else x for x in monerod_base])
   if i < len(monerod_extra):
     command_lines[-1] += monerod_extra[i]
-  outputs.append(open(builddir + '/tests/functional_tests/monerod' + str(i) + '.log', 'a+'))
+  outputs.append(open(FUNCTIONAL_TESTS_DIRECTORY + '/monerod' + str(i) + '.log', 'a+'))
   ports.append(18180+i)
 
 for i in range(N_WALLETS):
   command_lines.append([str(18090+i) if x == "wallet_port" else x for x in wallet_base])
   if i < len(wallet_extra):
     command_lines[-1] += wallet_extra[i]
-  outputs.append(open(builddir + '/tests/functional_tests/wallet' + str(i) + '.log', 'a+'))
+    if "--generate-from-json" in wallet_extra[i] and "--wallet-dir" in command_lines[-1]:
+      # monero-wallet-rpc ignores --generate-from-json when --wallet-dir is given
+      idx = command_lines[-1].index("--wallet-dir")
+      del command_lines[-1][idx:idx+2]
+  outputs.append(open(FUNCTIONAL_TESTS_DIRECTORY + '/wallet' + str(i) + '.log', 'a+'))
   ports.append(18090+i)
 
 print('Starting servers...')
@@ -89,11 +108,15 @@ try:
   PYTHONPATH += srcdir + '/../../utils/python-rpc'
   os.environ['PYTHONPATH'] = PYTHONPATH
   os.environ['WALLET_DIRECTORY'] = WALLET_DIRECTORY
+  os.environ['FUNCTIONAL_TESTS_DIRECTORY'] = FUNCTIONAL_TESTS_DIRECTORY
+  os.environ['SOURCE_DIRECTORY'] = srcdir
   os.environ['PYTHONIOENCODING'] = 'utf-8'
   os.environ['DIFFICULTY'] = str(DIFFICULTY)
-  os.environ['MAKE_TEST_SIGNATURE'] = builddir + '/tests/functional_tests/make_test_signature'
+  os.environ['MAKE_TEST_SIGNATURE'] = FUNCTIONAL_TESTS_DIRECTORY + '/make_test_signature'
   os.environ['SEEDHASH_EPOCH_BLOCKS'] = "8"
   os.environ['SEEDHASH_EPOCH_LAG'] = "4"
+  if not 'MINING_SILENT' in os.environ:
+    os.environ['MINING_SILENT'] = "1"
 
   for i in range(len(command_lines)):
     #print('Running: ' + str(command_lines[i]))
@@ -108,23 +131,24 @@ def kill():
     except: pass
 
 # wait for error/startup
-for i in range(10):
-  time.sleep(1)
-  all_open = True
-  for port in ports:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(1)
-    if s.connect_ex(('127.0.0.1', port)) != 0:
-      all_open = False
+startup_timeout = 10
+deadline = time.monotonic() + startup_timeout
+for port in ports:
+  addr = ('127.0.0.1', port)
+  delay = 0
+  while True:
+    time.sleep(delay)
+    timeout = deadline - time.monotonic()
+    if timeout <= 0:
+      print('Failed to start wallet or daemon, last port checked: ' + str(port))
+      kill()
+      sys.exit(1)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+      s.settimeout(timeout)
+      err = s.connect_ex(addr)
+    if err == 0:
       break
-    s.close()
-  if all_open:
-    break
-
-if not all_open:
-  print('Failed to start wallet or daemon')
-  kill()
-  sys.exit(1)
+    delay = .1
 
 # online daemons need some time to connect to peers to be ready
 time.sleep(2)
@@ -147,24 +171,14 @@ for test in tests:
 print('Stopping servers...')
 kill()
 
-# wait for exit, the poll method does not work (https://bugs.python.org/issue2475) so we wait, possibly forever if the process hangs
-if True:
-  for p in processes:
+# Wait up to 10 seconds for each process, then force termination.
+for p in processes:
+  try:
+    p.wait(timeout=10)
+  except subprocess.TimeoutExpired:
+    print('Failed to stop process ' + str(p.pid) + ', killing it')
+    p.kill()
     p.wait()
-else:
-  for i in range(10):
-    n_returncode = 0
-    for p in processes:
-      p.poll()
-      if p.returncode:
-        n_returncode += 1
-    if n_returncode == len(processes):
-      print('All done: ' + string.join([x.returncode for x in processes], ', '))
-      break
-    time.sleep(1)
-  for p in processes:
-    if not p.returncode:
-      print('Failed to stop process')
 
 if len(FAIL) == 0:
   print('Done, ' + str(len(PASS)) + '/' + str(len(tests)) + ' tests passed')

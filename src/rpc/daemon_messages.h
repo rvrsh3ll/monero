@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -97,7 +97,9 @@ BEGIN_RPC_MESSAGE_CLASS(GetBlocksFast);
     RPC_MESSAGE_MEMBER(std::vector<cryptonote::rpc::block_with_transactions>, blocks);
     RPC_MESSAGE_MEMBER(uint64_t, start_height);
     RPC_MESSAGE_MEMBER(uint64_t, current_height);
+    RPC_MESSAGE_MEMBER(crypto::hash, top_block_hash);
     RPC_MESSAGE_MEMBER(std::vector<cryptonote::rpc::block_output_indices>, output_indices);
+    RPC_MESSAGE_MEMBER(uint64_t, max_block_count);
   END_RPC_MESSAGE_RESPONSE;
 END_RPC_MESSAGE_CLASS;
 
@@ -423,6 +425,7 @@ BEGIN_RPC_MESSAGE_CLASS(GetFeeEstimate);
     RPC_MESSAGE_MEMBER(uint64_t, num_grace_blocks);
   END_RPC_MESSAGE_REQUEST;
   BEGIN_RPC_MESSAGE_RESPONSE;
+    RPC_MESSAGE_MEMBER(std::vector<uint64_t>, fees);
     RPC_MESSAGE_MEMBER(uint64_t, estimated_base_fee);
     RPC_MESSAGE_MEMBER(uint64_t, fee_mask);
     RPC_MESSAGE_MEMBER(uint32_t, size_scale);

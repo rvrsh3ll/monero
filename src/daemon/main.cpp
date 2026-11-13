@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -83,7 +83,7 @@ uint16_t parse_public_rpc_port(const po::variables_map &vm)
   }
 
   uint16_t rpc_port;
-  if (!string_tools::get_xtype_from_string(rpc_port, rpc_port_str))
+  if (!epee::string_tools::get_xtype_from_string(rpc_port, rpc_port_str))
   {
     throw std::runtime_error("invalid RPC port " + rpc_port_str);
   }
@@ -106,6 +106,23 @@ uint16_t parse_public_rpc_port(const po::variables_map &vm)
   }
 
   return rpc_port;
+}
+
+bf::path get_config_file_path(const po::variables_map &vm)
+{
+  const bf::path config_path(command_line::get_arg(vm, daemon_args::arg_config_file));
+  if (!command_line::is_arg_defaulted(vm, daemon_args::arg_config_file) ||
+      command_line::is_arg_defaulted(vm, cryptonote::arg_data_dir))
+    return config_path;
+
+  const bf::path data_dir_config =
+      bf::absolute(bf::path(command_line::get_arg(vm, cryptonote::arg_data_dir))) /
+      std::string(CRYPTONOTE_NAME ".conf");
+  boost::system::error_code ec;
+  if (bf::exists(data_dir_config, ec))
+    return data_dir_config;
+
+  return config_path;
 }
 
 #ifdef WIN32
@@ -143,7 +160,6 @@ int main(int argc, char const * argv[])
 
       command_line::add_arg(visible_options, command_line::arg_help);
       command_line::add_arg(visible_options, command_line::arg_version);
-      command_line::add_arg(visible_options, daemon_args::arg_os_version);
       command_line::add_arg(visible_options, daemon_args::arg_config_file);
 
       // Settings
@@ -152,11 +168,16 @@ int main(int argc, char const * argv[])
       command_line::add_arg(core_settings, daemon_args::arg_max_log_file_size);
       command_line::add_arg(core_settings, daemon_args::arg_max_log_files);
       command_line::add_arg(core_settings, daemon_args::arg_max_concurrency);
+      command_line::add_arg(core_settings, daemon_args::arg_proxy);
+      command_line::add_arg(core_settings, daemon_args::arg_proxy_allow_dns_leaks);
       command_line::add_arg(core_settings, daemon_args::arg_public_node);
       command_line::add_arg(core_settings, daemon_args::arg_zmq_rpc_bind_ip);
       command_line::add_arg(core_settings, daemon_args::arg_zmq_rpc_bind_port);
       command_line::add_arg(core_settings, daemon_args::arg_zmq_pub);
+      command_line::add_arg(core_settings, daemon_args::arg_confirm_zmq_rpc_external_bind);
+      command_line::add_arg(core_settings, daemon_args::arg_restricted_zmq_rpc);
       command_line::add_arg(core_settings, daemon_args::arg_zmq_rpc_disabled);
+      command_line::add_arg(core_settings, daemonizer::arg_non_interactive);
 
       daemonizer::init_options(hidden_options, visible_options);
       daemonize::t_executor::init_options(core_settings);
@@ -201,21 +222,26 @@ int main(int argc, char const * argv[])
       return 0;
     }
 
-    // OS
-    if (command_line::get_arg(vm, daemon_args::arg_os_version))
-    {
-      std::cout << "OS: " << tools::get_os_version_string() << ENDL;
-      return 0;
-    }
-
-    std::string config = command_line::get_arg(vm, daemon_args::arg_config_file);
-    boost::filesystem::path config_path(config);
+    boost::filesystem::path config_path = get_config_file_path(vm);
     boost::system::error_code ec;
     if (bf::exists(config_path, ec))
     {
       try
       {
         po::store(po::parse_config_file<char>(config_path.string<std::string>().c_str(), core_settings), vm);
+      }
+      catch (const po::unknown_option &e)
+      {
+        std::string unrecognized_option = e.get_option_name();
+        if (all_options.find_nothrow(unrecognized_option, false))
+        {
+          std::cerr << "Option '" << unrecognized_option << "' is not allowed in the config file, please use it as a command line flag." << std::endl;
+        }
+        else
+        {
+          std::cerr << "Unrecognized option '" << unrecognized_option << "' in config file." << std::endl;
+        }
+        return 1;
       }
       catch (const std::exception &e)
       {
@@ -226,16 +252,14 @@ int main(int argc, char const * argv[])
     }
     else if (!command_line::is_arg_defaulted(vm, daemon_args::arg_config_file))
     {
-      std::cerr << "Can't find config file " << config << std::endl;
+      std::cerr << "Can't find config file " << config_path.string() << std::endl;
       return 1;
     }
 
-    const bool testnet = command_line::get_arg(vm, cryptonote::arg_testnet_on);
-    const bool stagenet = command_line::get_arg(vm, cryptonote::arg_stagenet_on);
-    const bool regtest = command_line::get_arg(vm, cryptonote::arg_regtest_on);
-    if (testnet + stagenet + regtest > 1)
+    try { cryptonote::core::get_network_type_from_args(vm); }
+    catch (const std::runtime_error&)
     {
-      std::cerr << "Can't specify more than one of --tesnet and --stagenet and --regtest" << ENDL;
+      std::cerr << "Can't specify more than one of --testnet and --stagenet and --regtest" << ENDL;
       return 1;
     }
 
@@ -282,10 +306,6 @@ int main(int argc, char const * argv[])
 
     // after logs initialized
     tools::create_directories_if_necessary(data_dir.string());
-
-#ifdef STACK_TRACE
-    tools::set_stack_trace_log(log_file_path.filename().string());
-#endif // STACK_TRACE
 
     if (!command_line::is_arg_defaulted(vm, daemon_args::arg_max_concurrency))
       tools::set_max_concurrency(command_line::get_arg(vm, daemon_args::arg_max_concurrency));
@@ -352,6 +372,9 @@ int main(int argc, char const * argv[])
         }
       }
     }
+
+    // Calibrate perf timer on startup
+    (void)tools::ticks_to_ns(0);
 
     MINFO("Moving from main() into the daemonize now.");
 

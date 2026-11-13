@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -43,11 +43,18 @@
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "WalletAPI"
 
-namespace epee {
-    unsigned int g_test_dbg_lock_sleep = 0;
-}
-
 namespace Monero {
+
+WalletManager::~WalletManager()
+{}
+
+WalletManagerImpl::~WalletManagerImpl()
+{}
+
+WalletManagerImpl::WalletManagerImpl()
+{
+    tools::set_strict_default_file_permissions(true);
+}
 
 Wallet *WalletManagerImpl::createWallet(const std::string &path, const std::string &password,
                                     const std::string &language, NetworkType nettype, uint64_t kdf_rounds)
@@ -148,6 +155,15 @@ Wallet *WalletManagerImpl::createWalletFromDevice(const std::string &path,
         wallet->setSubaddressLookahead(lookahead->first, lookahead->second);
     }
     wallet->recoverFromDevice(path, password, deviceName);
+    return wallet;
+}
+
+Wallet *WalletManagerImpl::createWalletFromPolyseed(const std::string &path, const std::string &password, NetworkType nettype,
+                                                    const std::string &mnemonic, const std::string &passphrase,
+                                                    bool newWallet, uint64_t restoreHeight, uint64_t kdf_rounds)
+{
+    WalletImpl * wallet = new WalletImpl(nettype, kdf_rounds);
+    wallet->createFromPolyseed(path, password, mnemonic, passphrase, newWallet, restoreHeight);
     return wallet;
 }
 
@@ -336,7 +352,11 @@ bool WalletManagerImpl::stopMining()
 
 std::string WalletManagerImpl::resolveOpenAlias(const std::string &address, bool &dnssec_valid) const
 {
-    std::vector<std::string> addresses = tools::dns_utils::addresses_from_url(address, dnssec_valid);
+    tools::dns_utils::dnssec_status dnssec;
+    std::vector<std::string> addresses = tools::dns_utils::addresses_from_url(address, dnssec);
+    // Preserve the public API's boolean contract: only report valid when DNSSEC
+    // was both available and successfully validated.
+    dnssec_valid = dnssec == tools::dns_utils::dnssec_status::valid;
     if (addresses.empty())
         return "";
     return addresses.front();
@@ -406,5 +426,3 @@ void WalletManagerFactory::setLogCategories(const std::string &categories)
 
 
 }
-
-namespace Bitmonero = Monero;

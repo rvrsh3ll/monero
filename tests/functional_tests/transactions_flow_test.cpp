@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -85,7 +85,7 @@ bool do_send_money(tools::wallet2& w1, tools::wallet2& w2, size_t mix_in_factor,
   try
   {
     std::vector<tools::wallet2::pending_tx> ptx;
-    ptx = w1.create_transactions_2(dsts, mix_in_factor, 0, 0, std::vector<uint8_t>(), 0, {});
+    ptx = w1.create_transactions_2(dsts, mix_in_factor, tools::fee_priority::Default, std::vector<uint8_t>(), 0, {});
     for (auto &p: ptx)
       w1.commit_tx(p);
     return true;
@@ -243,7 +243,6 @@ bool transactions_flow_test(std::string& working_folder,
       if(!do_send_money(w1, w2, mix_in_factor, amount_to_tx, tx))
       {
         LOG_PRINT_L0( "failed to transfer money, second chance. tx: " << get_transaction_hash(tx) << ", exit" );
-        LOCAL_ASSERT(false);
         return false;
       }
     }
@@ -297,7 +296,6 @@ bool transactions_flow_test(std::string& working_folder,
 
     MERROR("-----------------------FINISHING TRANSACTIONS FLOW TEST FAILED-----------------------" );
     MERROR("income " << print_money(money_2) << " via " << i << " transactions, expected money = " << print_money(transfered_money) );
-    LOCAL_ASSERT(false);
     return false;
   }
 

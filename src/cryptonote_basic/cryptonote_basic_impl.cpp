@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -28,22 +28,21 @@
 //
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
-#include "include_base_utils.h"
-using namespace epee;
-
 #include "cryptonote_basic_impl.h"
 #include "string_tools.h"
 #include "serialization/binary_utils.h"
 #include "cryptonote_format_utils.h"
 #include "cryptonote_config.h"
-#include "misc_language.h"
 #include "common/base58.h"
 #include "crypto/hash.h"
+#include "ringct/rctOps.h"
 #include "int-util.h"
 #include "common/dns_utils.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "cn"
+
+using namespace epee;
 
 namespace cryptonote {
 
@@ -127,26 +126,6 @@ namespace cryptonote {
     return true;
   }
   //------------------------------------------------------------------------------------
-  uint8_t get_account_address_checksum(const public_address_outer_blob& bl)
-  {
-    const unsigned char* pbuf = reinterpret_cast<const unsigned char*>(&bl);
-    uint8_t summ = 0;
-    for(size_t i = 0; i!= sizeof(public_address_outer_blob)-1; i++)
-      summ += pbuf[i];
-
-    return summ;
-  }
-  //------------------------------------------------------------------------------------
-  uint8_t get_account_integrated_address_checksum(const public_integrated_address_outer_blob& bl)
-  {
-    const unsigned char* pbuf = reinterpret_cast<const unsigned char*>(&bl);
-    uint8_t summ = 0;
-    for(size_t i = 0; i!= sizeof(public_integrated_address_outer_blob)-1; i++)
-      summ += pbuf[i];
-
-    return summ;
-  }
-  //-----------------------------------------------------------------------
   std::string get_account_address_as_str(
       network_type nettype
     , bool subaddress
@@ -172,17 +151,15 @@ namespace cryptonote {
     return tools::base58::encode_addr(integrated_address_prefix, t_serializable_object_to_blob(iadr));
   }
   //-----------------------------------------------------------------------
-  bool is_coinbase(const transaction& tx)
+  bool check_address(const account_public_address& adr)
   {
-    if(tx.vin.size() != 1)
-      return false;
-
-    if(tx.vin[0].type() != typeid(txin_gen))
-      return false;
-
-    return true;
+    const auto valid_key = [](const crypto::public_key& key) {
+      const rct::key point = rct::pk2rct(key);
+      return point != rct::identity() && rct::isInMainSubgroup(point);
+    };
+    return valid_key(adr.m_spend_public_key) && valid_key(adr.m_view_public_key);
   }
-  //-----------------------------------------------------------------------
+
   bool get_account_address_from_str(
       address_parse_info& info
     , network_type nettype
@@ -193,96 +170,60 @@ namespace cryptonote {
     uint64_t integrated_address_prefix = get_config(nettype).CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX;
     uint64_t subaddress_prefix = get_config(nettype).CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX;
 
-    if (2 * sizeof(public_address_outer_blob) != str.size())
+    blobdata data;
+    uint64_t prefix;
+    if (!tools::base58::decode_addr(str, prefix, data))
     {
-      blobdata data;
-      uint64_t prefix;
-      if (!tools::base58::decode_addr(str, prefix, data))
+      LOG_PRINT_L2("Invalid address format");
+      return false;
+    }
+
+    if (integrated_address_prefix == prefix)
+    {
+      info.is_subaddress = false;
+      info.has_payment_id = true;
+    }
+    else if (address_prefix == prefix)
+    {
+      info.is_subaddress = false;
+      info.has_payment_id = false;
+    }
+    else if (subaddress_prefix == prefix)
+    {
+      info.is_subaddress = true;
+      info.has_payment_id = false;
+    }
+    else {
+      LOG_PRINT_L1("Wrong address prefix: " << prefix << ", expected " << address_prefix
+        << " or " << integrated_address_prefix
+        << " or " << subaddress_prefix);
+      return false;
+    }
+
+    if (info.has_payment_id)
+    {
+      integrated_address iadr;
+      if (!::serialization::parse_binary(data, iadr))
       {
-        LOG_PRINT_L2("Invalid address format");
+        LOG_PRINT_L1("Account public address keys can't be parsed");
         return false;
       }
-
-      if (integrated_address_prefix == prefix)
-      {
-        info.is_subaddress = false;
-        info.has_payment_id = true;
-      }
-      else if (address_prefix == prefix)
-      {
-        info.is_subaddress = false;
-        info.has_payment_id = false;
-      }
-      else if (subaddress_prefix == prefix)
-      {
-        info.is_subaddress = true;
-        info.has_payment_id = false;
-      }
-      else {
-        LOG_PRINT_L1("Wrong address prefix: " << prefix << ", expected " << address_prefix 
-          << " or " << integrated_address_prefix
-          << " or " << subaddress_prefix);
-        return false;
-      }
-
-      if (info.has_payment_id)
-      {
-        integrated_address iadr;
-        if (!::serialization::parse_binary(data, iadr))
-        {
-          LOG_PRINT_L1("Account public address keys can't be parsed");
-          return false;
-        }
-        info.address = iadr.adr;
-        info.payment_id = iadr.payment_id;
-      }
-      else
-      {
-        if (!::serialization::parse_binary(data, info.address))
-        {
-          LOG_PRINT_L1("Account public address keys can't be parsed");
-          return false;
-        }
-      }
-
-      if (!crypto::check_key(info.address.m_spend_public_key) || !crypto::check_key(info.address.m_view_public_key))
-      {
-        LOG_PRINT_L1("Failed to validate address keys");
-        return false;
-      }
+      info.address = iadr.adr;
+      info.payment_id = iadr.payment_id;
     }
     else
     {
-      // Old address format
-      std::string buff;
-      if(!string_tools::parse_hexstr_to_binbuff(str, buff))
-        return false;
-
-      if(buff.size()!=sizeof(public_address_outer_blob))
+      if (!::serialization::parse_binary(data, info.address))
       {
-        LOG_PRINT_L1("Wrong public address size: " << buff.size() << ", expected size: " << sizeof(public_address_outer_blob));
+        LOG_PRINT_L1("Account public address keys can't be parsed");
         return false;
       }
+    }
 
-      public_address_outer_blob blob = *reinterpret_cast<const public_address_outer_blob*>(buff.data());
-
-
-      if(blob.m_ver > CRYPTONOTE_PUBLIC_ADDRESS_TEXTBLOB_VER)
-      {
-        LOG_PRINT_L1("Unknown version of public address: " << blob.m_ver << ", expected " << CRYPTONOTE_PUBLIC_ADDRESS_TEXTBLOB_VER);
-        return false;
-      }
-
-      if(blob.check_sum != get_account_address_checksum(blob))
-      {
-        LOG_PRINT_L1("Wrong public address checksum");
-        return false;
-      }
-
-      //we success
-      info.address = blob.m_address;
-      info.is_subaddress = false;
-      info.has_payment_id = false;
+    if (!check_address(info.address))
+    {
+      LOG_PRINT_L1("Failed to validate address keys");
+      return false;
     }
 
     return true;
@@ -292,15 +233,45 @@ namespace cryptonote {
       address_parse_info& info
     , network_type nettype
     , const std::string& str_or_url
-    , std::function<std::string(const std::string&, const std::vector<std::string>&, bool)> dns_confirm
+    , std::function<std::string(const std::string&, const std::vector<std::string>&, tools::dns_utils::dnssec_status)> dns_confirm
+    )
+  {
+    return get_account_address_from_str_or_url(info, nettype, str_or_url, true, dns_confirm);
+  }
+  //--------------------------------------------------------------------------------
+  bool get_account_address_from_str_or_url(
+      address_parse_info& info
+    , network_type nettype
+    , const std::string& str_or_url
+    , bool allow_dns
+    , std::function<std::string(const std::string&, const std::vector<std::string>&, tools::dns_utils::dnssec_status)> dns_confirm
     )
   {
     if (get_account_address_from_str(info, nettype, str_or_url))
       return true;
-    bool dnssec_valid;
-    std::string address_str = tools::dns_utils::get_account_address_as_str_from_url(str_or_url, dnssec_valid, dns_confirm);
+    if (!allow_dns)
+      return false;
+    tools::dns_utils::dnssec_status dnssec;
+    std::string address_str = tools::dns_utils::get_account_address_as_str_from_url(str_or_url, dnssec, dns_confirm);
     return !address_str.empty() &&
       get_account_address_from_str(info, nettype, address_str);
+  }
+  //--------------------------------------------------------------------------------
+  const char* get_network_type_name(const network_type nettype)
+  {
+    switch (nettype)
+    {
+    case MAINNET:
+      return "mainnet";
+    case TESTNET:
+      return "testnet";
+    case STAGENET:
+      return "stagenet";
+    case FAKECHAIN:
+      return "fakechain";
+    default:
+      return "unknown";
+    };
   }
   //--------------------------------------------------------------------------------
   bool operator ==(const cryptonote::transaction& a, const cryptonote::transaction& b) {
@@ -309,6 +280,52 @@ namespace cryptonote {
 
   bool operator ==(const cryptonote::block& a, const cryptonote::block& b) {
     return cryptonote::get_block_hash(a) == cryptonote::get_block_hash(b);
+  }
+  //--------------------------------------------------------------------------------
+  int compare_hash32_reversed_nbits(const crypto::hash& ha, const crypto::hash& hb, unsigned int nbits)
+  {
+    static_assert(sizeof(uint64_t) * 4 == sizeof(crypto::hash), "hash is wrong size");
+
+    // We have to copy these buffers b/c of the strict aliasing rule
+    uint64_t va[4];
+    memcpy(va, &ha, sizeof(crypto::hash));
+    uint64_t vb[4];
+    memcpy(vb, &hb, sizeof(crypto::hash));
+
+    for (int n = 3; n >= 0 && nbits; --n)
+    {
+      const unsigned int msb_nbits = std::min<unsigned int>(64, nbits);
+      const uint64_t lsb_nbits_dropped = static_cast<uint64_t>(64 - msb_nbits);
+      const uint64_t van = SWAP64LE(va[n]) >> lsb_nbits_dropped;
+      const uint64_t vbn = SWAP64LE(vb[n]) >> lsb_nbits_dropped;
+      nbits -= msb_nbits;
+
+      if (van < vbn) return -1; else if (van > vbn) return 1;
+    }
+
+    return 0;
+  }
+
+  crypto::hash make_hash32_loose_template(unsigned int nbits, const crypto::hash& h)
+  {
+    static_assert(sizeof(uint64_t) * 4 == sizeof(crypto::hash), "hash is wrong size");
+
+    // We have to copy this buffer b/c of the strict aliasing rule
+    uint64_t vh[4];
+    memcpy(vh, &h, sizeof(crypto::hash));
+
+    for (int n = 3; n >= 0; --n)
+    {
+      const unsigned int msb_nbits = std::min<unsigned int>(64, nbits);
+      const uint64_t mask = msb_nbits ? (~((std::uint64_t(1) << (64 - msb_nbits)) - 1)) : 0;
+      nbits -= msb_nbits;
+
+      vh[n] &= SWAP64LE(mask);
+    }
+
+    crypto::hash res;
+    memcpy(&res, vh, sizeof(crypto::hash));
+    return res;
   }
 }
 
@@ -319,7 +336,7 @@ bool parse_hash256(const std::string &str_hash, crypto::hash& hash)
   bool res = epee::string_tools::parse_hexstr_to_binbuff(str_hash, buf);
   if (!res || buf.size() != sizeof(crypto::hash))
   {
-    MERROR("invalid hash format: " << str_hash);
+    MERROR("invalid hash format, input size: " << str_hash.size());
     return false;
   }
   else

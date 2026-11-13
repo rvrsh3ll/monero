@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -25,6 +25,79 @@
 # INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+add_subdirectory(gen_corpus)
+
+if(OSSFUZZ)
+# Add the include path for <fuzzer/FuzzedDataProvider.h>
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Recompile perf_timer for fuzzing
+add_library(fuzz_unsafe_macro OBJECT
+  ${PROJECT_SOURCE_DIR}/src/common/perf_timer.cpp)
+target_compile_definitions(fuzz_unsafe_macro
+  PRIVATE FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+
+monero_add_minimal_executable(fuzz_rpc
+  fuzz_rpc/initialisation.cpp
+  fuzz_rpc/rpc_endpoints.cpp
+  fuzz_rpc/fuzz_rpc.cpp
+  $<TARGET_OBJECTS:fuzz_unsafe_macro>)
+target_compile_definitions(fuzz_rpc PRIVATE SAFE)
+target_link_libraries(fuzz_rpc
+  PRIVATE
+    rpc
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET fuzz_rpc
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(fuzz_rpc_full
+  fuzz_rpc/initialisation.cpp
+  fuzz_rpc/rpc_endpoints.cpp
+  fuzz_rpc/fuzz_rpc.cpp
+  $<TARGET_OBJECTS:fuzz_unsafe_macro>)
+target_link_libraries(fuzz_rpc_full
+  PRIVATE
+    rpc
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET fuzz_rpc_full
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(fuzz_rpc_full_no_exceptions
+  fuzz_rpc/initialisation.cpp
+  fuzz_rpc/rpc_endpoints.cpp
+  fuzz_rpc/fuzz_rpc.cpp
+  $<TARGET_OBJECTS:fuzz_unsafe_macro>)
+target_compile_definitions(fuzz_rpc_full_no_exceptions PRIVATE CATCH_ALL_EXCEPTIONS)
+target_link_libraries(fuzz_rpc_full_no_exceptions
+  PRIVATE
+    rpc
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET fuzz_rpc_full_no_exceptions
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(fuzz_zmq
+  fuzz_rpc/zmq_endpoints.cpp
+  fuzz_rpc/fuzz_zmq.cpp)
+target_link_libraries(fuzz_zmq
+  PRIVATE
+    rpc_pub
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET fuzz_zmq
+  PROPERTY
+    FOLDER "tests")
+endif()
 
 monero_add_minimal_executable(block_fuzz_tests block.cpp fuzzer.cpp)
 target_link_libraries(block_fuzz_tests
@@ -152,12 +225,24 @@ set_property(TARGET parse-url_fuzz_tests
   PROPERTY
     FOLDER "tests")
 
+monero_add_minimal_executable(network-address_fuzz_tests network_address.cpp fuzzer.cpp)
+target_link_libraries(network-address_fuzz_tests
+  PRIVATE
+    net
+    epee
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET network-address_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
 monero_add_minimal_executable(http-client_fuzz_tests http-client.cpp fuzzer.cpp)
 target_link_libraries(http-client_fuzz_tests
   PRIVATE
     epee
     ${Boost_THREAD_LIBRARY}
-    ${Boost_CHRONO_LIBRARY}
     ${Boost_REGEX_LIBRARY}
     ${Boost_PROGRAM_OPTIONS_LIBRARY}
     ${Boost_SYSTEM_LIBRARY}
@@ -174,7 +259,6 @@ target_link_libraries(levin_fuzz_tests
     common
     epee
     ${Boost_THREAD_LIBRARY}
-    ${Boost_CHRONO_LIBRARY}
     ${Boost_REGEX_LIBRARY}
     ${Boost_PROGRAM_OPTIONS_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -187,16 +271,24 @@ set_property(TARGET levin_fuzz_tests
 monero_add_minimal_executable(bulletproof_fuzz_tests bulletproof.cpp fuzzer.cpp)
 target_link_libraries(bulletproof_fuzz_tests
   PRIVATE
-    common
-    epee
-    ${Boost_THREAD_LIBRARY}
-    ${Boost_CHRONO_LIBRARY}
-    ${Boost_REGEX_LIBRARY}
-    ${Boost_PROGRAM_OPTIONS_LIBRARY}
+    ringct
+    serialization
     ${CMAKE_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES}
     $ENV{LIB_FUZZING_ENGINE})
 set_property(TARGET bulletproof_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(bulletproof-plus_fuzz_tests bulletproof-plus.cpp fuzzer.cpp)
+target_link_libraries(bulletproof-plus_fuzz_tests
+  PRIVATE
+    ringct
+    serialization
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET bulletproof-plus_fuzz_tests
   PROPERTY
     FOLDER "tests")
 
@@ -207,7 +299,6 @@ target_link_libraries(tx-extra_fuzz_tests
     common
     epee
     ${Boost_THREAD_LIBRARY}
-    ${Boost_CHRONO_LIBRARY}
     ${Boost_REGEX_LIBRARY}
     ${Boost_PROGRAM_OPTIONS_LIBRARY}
     ${Boost_SYSTEM_LIBRARY}
@@ -224,7 +315,100 @@ target_link_libraries(utf8_fuzz_tests
     common
     epee
     ${Boost_THREAD_LIBRARY}
-    ${Boost_CHRONO_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES}
     $ENV{LIB_FUZZING_ENGINE})
+
+monero_add_minimal_executable(clsag_fuzz_tests clsag.cpp clsag_init.h fuzzer.cpp)
+target_link_libraries(clsag_fuzz_tests
+  PRIVATE
+    cryptonote_core
+    serialization
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET clsag_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(clsag_cout_fuzz_tests clsag_cout.cpp clsag_init.h fuzzer.cpp)
+target_link_libraries(clsag_cout_fuzz_tests
+  PRIVATE
+    cryptonote_core
+    serialization
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET clsag_cout_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(clsag_message_fuzz_tests clsag_message.cpp clsag_init.h fuzzer.cpp)
+target_link_libraries(clsag_message_fuzz_tests
+  PRIVATE
+    cryptonote_core
+    serialization
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET clsag_message_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(clsag_pubs_fuzz_tests clsag_pubs.cpp clsag_init.h fuzzer.cpp)
+target_link_libraries(clsag_pubs_fuzz_tests
+  PRIVATE
+    cryptonote_core
+    serialization
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET clsag_pubs_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(multisig-kex_fuzz_tests multisig_kex.cpp fuzzer.cpp)
+target_link_libraries(multisig-kex_fuzz_tests
+  PRIVATE
+    multisig
+    cryptonote_core
+    epee
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET multisig-kex_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(multisig-tx_fuzz_tests multisig_tx.cpp multisig_init.h fuzzer.cpp)
+target_link_libraries(multisig-tx_fuzz_tests
+  PRIVATE
+    wallet
+    multisig
+    cryptonote_core
+    p2p
+    epee
+    device
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET multisig-tx_fuzz_tests
+  PROPERTY
+    FOLDER "tests")
+
+monero_add_minimal_executable(multisig-info_fuzz_tests multisig_info.cpp multisig_init.h fuzzer.cpp)
+target_link_libraries(multisig-info_fuzz_tests
+  PRIVATE
+    wallet
+    multisig
+    cryptonote_core
+    p2p
+    epee
+    device
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${EXTRA_LIBRARIES}
+    $ENV{LIB_FUZZING_ENGINE})
+set_property(TARGET multisig-info_fuzz_tests
+  PROPERTY
+    FOLDER "tests")

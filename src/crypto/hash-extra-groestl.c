@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -34,5 +34,5 @@
 #include "groestl.h"
 
 void hash_extra_groestl(const void *data, size_t length, char *hash) {
-  groestl(data, length * 8, (uint8_t*)hash);
+  groestl((const BitSequence *)data, length * 8, (uint8_t*)hash);
 }

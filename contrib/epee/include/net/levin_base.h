@@ -29,6 +29,7 @@
 #ifndef _LEVIN_BASE_H_
 #define _LEVIN_BASE_H_
 
+#include <chrono>
 #include <cstdint>
 
 #include "byte_stream.h"
@@ -42,20 +43,6 @@ namespace epee
 class byte_slice;
 namespace levin
 {
-#pragma pack(push)
-#pragma pack(1)
-	struct bucket_head
-	{
-		uint64_t m_signature;
-		uint64_t m_cb;
-		bool     m_have_to_return_data;
-		uint32_t m_command;
-		int32_t  m_return_code;
-		uint32_t m_reservedA; //probably some flags in future
-		uint32_t m_reservedB; //probably some check sum in future
-	};
-#pragma pack(pop)
-
 
 #pragma pack(push)
 #pragma pack(1)
@@ -63,7 +50,7 @@ namespace levin
   {
     uint64_t m_signature;
     uint64_t m_cb;
-    bool     m_have_to_return_data;
+    uint8_t  m_have_to_return_data;
     uint32_t m_command;
     int32_t  m_return_code;
     uint32_t m_flags;
@@ -72,7 +59,7 @@ namespace levin
 #pragma pack(pop)
 
 
-#define LEVIN_DEFAULT_TIMEOUT_PRECONFIGURED 0
+constexpr const std::chrono::milliseconds LEVIN_DEFAULT_TIMEOUT_PRECONFIGURED{0};
 #define LEVIN_INITIAL_MAX_PACKET_SIZE  256*1024      // 256 KiB before handshake
 #define LEVIN_DEFAULT_MAX_PACKET_SIZE 100000000      //100MB by default after handshake
 
@@ -82,7 +69,6 @@ namespace levin
 #define LEVIN_PACKET_END		0x00000008
   
 
-#define LEVIN_PROTOCOL_VER_0         0
 #define LEVIN_PROTOCOL_VER_1         1
 
  
@@ -159,7 +145,7 @@ namespace levin
     byte_stream buffer;
   };
 
-  //! \return Intialized levin header.
+  //! \return Initialized levin header.
   bucket_head2 make_header(uint32_t command, uint64_t msg_size, uint32_t flags, bool expect_response) noexcept;
 
   /*! Generate a dummy levin message.

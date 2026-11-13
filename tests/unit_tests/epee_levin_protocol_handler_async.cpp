@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -30,6 +30,7 @@
 
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/thread.hpp>
+#include <boost/uuid/random_generator.hpp>
 
 #include "gtest/gtest.h"
 
@@ -126,19 +127,22 @@ namespace
     std::string m_last_in_buf;
   };
 
-  class test_connection : public epee::net_utils::i_service_endpoint
+  class test_connection : public epee::net_utils::service_endpoint<test_levin_protocol_handler>, public std::enable_shared_from_this<test_connection>
   {
   public:
-    test_connection(boost::asio::io_service& io_service, test_levin_protocol_handler_config& protocol_config)
-      : m_io_service(io_service)
-      , m_protocol_handler(this, protocol_config, m_context)
+    test_connection(boost::asio::io_context& io_service, test_levin_protocol_handler_config& protocol_config)
+      : epee::net_utils::service_endpoint<test_levin_protocol_handler>(protocol_config)
+      , std::enable_shared_from_this<test_connection>()
+      , m_io_service(io_service)
       , m_send_return(true)
     {
     }
 
     void start()
     {
-      ASSERT_TRUE(m_protocol_handler.after_init_connection());
+      using base_type = epee::net_utils::connection_context_base;
+      static_cast<base_type&>(context) = base_type{boost::uuids::random_generator{}(), {}, true, false};
+      ASSERT_TRUE(m_protocol_handler.m_config.after_init_connection(shared_from_this()));
     }
 
     // Implement epee::net_utils::i_service_endpoint interface
@@ -151,13 +155,11 @@ namespace
       return m_send_return;
     }
 
-    virtual bool close()                              { /*std::cout << "test_connection::close()" << std::endl; */return true; }
+    virtual bool close(const bool wait_for_shutdown)  { /*std::cout << "test_connection::close()" << std::endl; */return true; }
     virtual bool send_done()                          { /*std::cout << "test_connection::send_done()" << std::endl; */return true; }
     virtual bool call_run_once_service_io()           { std::cout << "test_connection::call_run_once_service_io()" << std::endl; return true; }
     virtual bool request_callback()                   { std::cout << "test_connection::request_callback()" << std::endl; return true; }
-    virtual boost::asio::io_service& get_io_service() { std::cout << "test_connection::get_io_service()" << std::endl; return m_io_service; }
-    virtual bool add_ref()                            { std::cout << "test_connection::add_ref()" << std::endl; return true; }
-    virtual bool release()                            { std::cout << "test_connection::release()" << std::endl; return true; }
+    virtual boost::asio::io_context& get_io_context() { std::cout << "test_connection::get_io_context()" << std::endl; return m_io_service; }
 
     size_t send_counter() const { return m_send_counter.get(); }
 
@@ -167,12 +169,8 @@ namespace
     bool send_return() const { return m_send_return; }
     void send_return(bool v) { m_send_return = v; }
 
-  public:
-    test_levin_protocol_handler m_protocol_handler;
-
   private:
-    boost::asio::io_service& m_io_service;
-    test_levin_connection_context m_context;
+    boost::asio::io_context& m_io_service;
 
     unit_test::call_counter m_send_counter;
     boost::mutex m_mutex;
@@ -185,10 +183,10 @@ namespace
   class async_protocol_handler_test : public ::testing::Test
   {
   public:
-    const static uint64_t invoke_timeout = 5 * 1000;
+    constexpr const static std::chrono::seconds invoke_timeout{5};
     const static size_t max_packet_size = 10 * 1024 * 1024;
 
-    typedef std::unique_ptr<test_connection> test_connection_ptr;
+    typedef std::shared_ptr<test_connection> test_connection_ptr;
 
     async_protocol_handler_test():
       m_pcommands_handler(new test_levin_commands_handler()),
@@ -216,7 +214,7 @@ namespace
     }
 
   protected:
-    boost::asio::io_service m_io_service;
+    boost::asio::io_context m_io_service;
     test_levin_protocol_handler_config m_handler_config;
     test_levin_commands_handler *m_pcommands_handler, &m_commands_handler;
   };
@@ -506,7 +504,6 @@ TEST_F(positive_test_connection_to_levin_protocol_handler_calls, handler_process
   }
 
   std::string compare_buffer(1024 * 4, 'c');
-  compare_buffer.resize(((1024 - sizeof(epee::levin::bucket_head2)) * 5) - sizeof(epee::levin::bucket_head2)); // add padding zeroes
 
   ASSERT_EQ(4u, m_commands_handler.notify_counter());
   ASSERT_EQ(0u, m_commands_handler.invoke_counter());
@@ -563,7 +560,7 @@ TEST_F(test_levin_protocol_handler__hanle_recv_with_invalid_data, handles_invali
 
 TEST_F(test_levin_protocol_handler__hanle_recv_with_invalid_data, handles_big_cb)
 {
-  m_req_head.m_cb = max_packet_size + 1;
+  m_req_head.m_cb = SWAP64LE(max_packet_size + 1);
   prepare_buf();
 
   ASSERT_FALSE(m_conn->m_protocol_handler.handle_recv(m_buf.data(), m_buf.size()));
@@ -573,7 +570,7 @@ TEST_F(test_levin_protocol_handler__hanle_recv_with_invalid_data, does_not_handl
 {
   prepare_buf();
 
-  ASSERT_TRUE(m_conn->m_protocol_handler.close());
+  ASSERT_TRUE(m_conn->m_protocol_handler.close(true));
   ASSERT_FALSE(m_conn->m_protocol_handler.handle_recv(m_buf.data(), m_buf.size()));
 }
 
@@ -639,15 +636,33 @@ TEST_F(test_levin_protocol_handler__hanle_recv_with_invalid_data, handles_unexpe
 
 TEST_F(test_levin_protocol_handler__hanle_recv_with_invalid_data, handles_short_fragment)
 {
-  m_req_head.m_cb = 1;
-  m_req_head.m_flags = LEVIN_PACKET_BEGIN;
-  m_req_head.m_command = 0;
+  m_req_head.m_cb = SWAP64LE(1);
+  m_req_head.m_flags = SWAP32LE(LEVIN_PACKET_BEGIN);
+  m_req_head.m_command = SWAP32LE(0);
   m_in_data.resize(1);
   prepare_buf();
 
   ASSERT_TRUE(m_conn->m_protocol_handler.handle_recv(m_buf.data(), m_buf.size()));
 
-  m_req_head.m_flags = LEVIN_PACKET_END;
+  m_req_head.m_flags = SWAP32LE(LEVIN_PACKET_END);
+  prepare_buf();
+
+  ASSERT_FALSE(m_conn->m_protocol_handler.handle_recv(m_buf.data(), m_buf.size()));
+}
+
+TEST_F(test_levin_protocol_handler__hanle_recv_with_invalid_data, handles_bad_cb)
+{
+  m_req_head.m_cb = SWAP64LE(sizeof(epee::levin::bucket_head2));
+  m_req_head.m_flags = SWAP32LE(LEVIN_PACKET_BEGIN);
+  m_req_head.m_command = SWAP32LE(0);
+  m_in_data.resize(sizeof(epee::levin::bucket_head2));
+  prepare_buf();
+
+  ASSERT_TRUE(m_conn->m_protocol_handler.handle_recv(m_buf.data(), m_buf.size()));
+
+  m_req_head.m_cb = SWAP64LE(1);
+  m_req_head.m_flags = SWAP32LE(LEVIN_PACKET_END);
+  m_in_data.resize(1);
   prepare_buf();
 
   ASSERT_FALSE(m_conn->m_protocol_handler.handle_recv(m_buf.data(), m_buf.size()));

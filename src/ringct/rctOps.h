@@ -1,5 +1,4 @@
-//#define DBG
-// Copyright (c) 2016, Monero Research Labs
+// Copyright (c) 2016-2026, Monero Research Labs
 //
 // Author: Shen Noether <shen.noether@gmx.com>
 //
@@ -37,15 +36,6 @@
 #include <cstddef>
 #include <tuple>
 
-#include "crypto/generic-ops.h"
-
-extern "C" {
-#include "crypto/random.h"
-#include "crypto/keccak.h"
-#include "rctCryptoOps.h"
-}
-#include "crypto/crypto.h"
-
 #include "rctTypes.h"
 
 //Define this flag when debugging to get additional info on the console
@@ -74,7 +64,6 @@ namespace rct {
     inline void identity(key &Id) { memcpy(&Id, &I, 32); }
     //Creates a key equal to the curve order
     inline key curveOrder() { return L; }
-    inline void curveOrder(key &l) { l = L; }
     //copies a scalar or point
     inline void copy(key &AA, const key &A) { memcpy(&AA, &A, 32); }
     inline key copy(const key & A) { key AA; memcpy(&AA, &A, 32); return AA; }
@@ -108,7 +97,7 @@ namespace rct {
     // make a pedersen commitment with given key
     key commit(xmr_amount amount, const key &mask);
     // make a pedersen commitment with zero key
-    key zeroCommit(xmr_amount amount);
+    key zeroCommitVartime(xmr_amount amount);
     //generates a random uint long long
     xmr_amount randXmrAmount(xmr_amount upperlimit);
 
@@ -166,8 +155,6 @@ namespace rct {
     key cn_fast_hash(const key &in);
     key hash_to_scalar(const key &in);
     //for mg sigs
-    key cn_fast_hash128(const void * in);
-    key hash_to_scalar128(const void * in);
     key cn_fast_hash(const ctkeyV &PC);
     key hash_to_scalar(const ctkeyV &PC);
     //for mg sigs 
@@ -179,11 +166,10 @@ namespace rct {
 
     void hash_to_p3(ge_p3 &hash8_p3, const key &k);
 
-    //sums a vector of curve points (for scalars use sc_add)
-    void sumKeys(key & Csum, const key &Cis);
 
-    //Elliptic Curve Diffie Helman: encodes and decodes the amount b and mask a
+    //Elliptic Curve Diffie-Hellman: encodes and decodes the amount b and mask a
     // where C= aG + bH
+    key genAmountEncodingFactor(const key &k);
     key genCommitmentMask(const key &sk);
     void ecdhEncode(ecdhTuple & unmasked, const key & sharedSec, bool v2);
     void ecdhDecode(ecdhTuple & masked, const key & sharedSec, bool v2);

@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -32,5 +32,16 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void generate_random_bytes_not_thread_safe(size_t n, void *result);
 void add_extra_entropy_not_thread_safe(const void *ptr, size_t bytes);
+
+//! @brief Return pointer to random, constant 16-byte key, thread-safe and static-init-safe
+const unsigned char *get_static_siphash_key(void);
+
+#ifdef __cplusplus
+}
+#endif

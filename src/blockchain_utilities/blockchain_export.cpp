@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -29,7 +29,6 @@
 #include "bootstrap_file.h"
 #include "blocksdat_file.h"
 #include "common/command_line.h"
-#include "cryptonote_core/tx_pool.h"
 #include "cryptonote_core/cryptonote_core.h"
 #include "blockchain_db/blockchain_db.h"
 #include "version.h"
@@ -38,6 +37,7 @@
 #define MONERO_DEFAULT_LOG_CATEGORY "bcutil"
 
 namespace po = boost::program_options;
+using namespace cryptonote;
 using namespace epee;
 
 int main(int argc, char* argv[])
@@ -68,6 +68,7 @@ int main(int argc, char* argv[])
   command_line::add_arg(desc_cmd_sett, arg_output_file);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_testnet_on);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_stagenet_on);
+  command_line::add_arg(desc_cmd_sett, cryptonote::arg_regtest_on);
   command_line::add_arg(desc_cmd_sett, arg_log_level);
   command_line::add_arg(desc_cmd_sett, arg_block_start);
   command_line::add_arg(desc_cmd_sett, arg_block_stop);
@@ -105,13 +106,6 @@ int main(int argc, char* argv[])
 
   LOG_PRINT_L0("Starting...");
 
-  bool opt_testnet = command_line::get_arg(vm, cryptonote::arg_testnet_on);
-  bool opt_stagenet = command_line::get_arg(vm, cryptonote::arg_stagenet_on);
-  if (opt_testnet && opt_stagenet)
-  {
-    std::cerr << "Can't specify more than one of --testnet and --stagenet" << std::endl;
-    return 1;
-  }
   bool opt_blocks_dat = command_line::get_arg(vm, arg_blocks_dat);
 
   std::string m_config_folder;
@@ -129,16 +123,8 @@ int main(int argc, char* argv[])
   // Use Blockchain instead of lower-level BlockchainDB for two reasons:
   // 1. Blockchain has the init() method for easy setup
   // 2. exporter needs to use get_current_blockchain_height(), get_block_id_by_height(), get_block_by_hash()
-  //
-  // cannot match blockchain_storage setup above with just one line,
-  // e.g.
-  //   Blockchain* core_storage = new Blockchain(NULL);
-  // because unlike blockchain_storage constructor, which takes a pointer to
-  // tx_memory_pool, Blockchain's constructor takes tx_memory_pool object.
   LOG_PRINT_L0("Initializing source blockchain (BlockchainDB)");
-  Blockchain* core_storage = NULL;
-  tx_memory_pool m_mempool(*core_storage);
-  core_storage = new Blockchain(m_mempool);
+  std::unique_ptr<BlockchainAndPool> core_storage = std::make_unique<BlockchainAndPool>();
 
   BlockchainDB* db = new_db();
   if (db == NULL)
@@ -162,9 +148,10 @@ int main(int argc, char* argv[])
     LOG_PRINT_L0("Error opening database: " << e.what());
     return 1;
   }
-  r = core_storage->init(db, opt_testnet ? cryptonote::TESTNET : opt_stagenet ? cryptonote::STAGENET : cryptonote::MAINNET);
+  const network_type net_type = core::get_network_type_from_args(vm);
+  r = core_storage->blockchain.init(db, net_type);
 
-  if (core_storage->get_blockchain_pruning_seed() && !opt_blocks_dat)
+  if (core_storage->blockchain.get_blockchain_pruning_seed() && !opt_blocks_dat)
   {
     LOG_PRINT_L0("Blockchain is pruned, cannot export");
     return 1;
@@ -177,12 +164,12 @@ int main(int argc, char* argv[])
   if (opt_blocks_dat)
   {
     BlocksdatFile blocksdat;
-    r = blocksdat.store_blockchain_raw(core_storage, NULL, output_file_path, block_stop);
+    r = blocksdat.store_blockchain_raw(&core_storage->blockchain, NULL, output_file_path, block_stop);
   }
   else
   {
     BootstrapFile bootstrap;
-    r = bootstrap.store_blockchain_raw(core_storage, NULL, output_file_path, block_start, block_stop);
+    r = bootstrap.store_blockchain_raw(&core_storage->blockchain, NULL, output_file_path, block_start, block_stop);
   }
   CHECK_AND_ASSERT_MES(r, 1, "Failed to export blockchain raw data");
   LOG_PRINT_L0("Blockchain raw data exported OK");

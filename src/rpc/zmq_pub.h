@@ -1,7 +1,7 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2020-2024, The Monero Project
 //
 // All rights reserved.
- //
+//
 // Redistribution and use in source and binary forms, with or without modification, are
 // permitted provided that the following conditions are met:
 //
@@ -39,6 +39,7 @@
 #include "cryptonote_basic/fwd.h"
 #include "net/zmq.h"
 #include "span.h"
+#include "cryptonote_basic/difficulty.h"
 
 namespace cryptonote { namespace listener
 {
@@ -59,6 +60,7 @@ class zmq_pub
     net::zmq::socket relay_;
     std::deque<std::vector<txpool_event>> txes_;
     std::array<std::size_t, 2> chain_subs_;
+    std::array<std::size_t, 1> miner_subs_;
     std::array<std::size_t, 2> txpool_subs_;
     boost::mutex sync_; //!< Synchronizes counts in `*_subs_` arrays.
 
@@ -79,14 +81,19 @@ class zmq_pub
     //! Process a client subscription request (from XPUB sockets). Thread-safe.
     bool sub_request(const boost::string_ref message);
 
-    /*! Forward ZMQ messages sent to `relay` via `send_chain_main` or
-      `send_txpool_add` to `pub`. Used by `ZmqServer`. */
+    /*! Forward ZMQ messages sent to `relay` via `send_chain_main`,
+      `send_txpool_add`, or `send_miner_data` to `pub`. Used by `ZmqServer`. */
     bool relay_to_pub(void* relay, void* pub);
 
     /*! Send a `ZMQ_PUB` notification for a change to the main chain.
         Thread-safe.
         \return Number of ZMQ messages sent to relay. */
     std::size_t send_chain_main(std::uint64_t height, epee::span<const cryptonote::block> blocks);
+
+    /*! Send a `ZMQ_PUB` notification for a new miner data.
+        Thread-safe.
+        \return Number of ZMQ messages sent to relay. */
+    std::size_t send_miner_data(uint8_t major_version, uint64_t height, const crypto::hash& prev_id, const crypto::hash& seed_hash, difficulty_type diff, uint64_t median_weight, uint64_t already_generated_coins, const std::vector<tx_block_template_backlog_entry>& tx_backlog);
 
     /*! Send a `ZMQ_PUB` notification for new tx(es) being added to the local
         pool. Thread-safe.
@@ -98,6 +105,13 @@ class zmq_pub
     {
       std::weak_ptr<zmq_pub> self_;
       void operator()(std::uint64_t height, epee::span<const cryptonote::block> blocks) const;
+    };
+
+    //! Callable for `send_miner_data` with weak ownership to `zmq_pub` object.
+    struct miner_data
+    {
+      std::weak_ptr<zmq_pub> self_;
+      void operator()(uint8_t major_version, uint64_t height, const crypto::hash& prev_id, const crypto::hash& seed_hash, difficulty_type diff, uint64_t median_weight, uint64_t already_generated_coins, const std::vector<tx_block_template_backlog_entry>& tx_backlog) const;
     };
 
     //! Callable for `send_txpool_add` with weak ownership to `zmq_pub` object.

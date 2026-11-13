@@ -1,4 +1,4 @@
-// Copyright (c) 2017, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -56,28 +56,28 @@ extern "C"
 //   1     1     52.8     70.4      70.2
 
 // Pippenger:
-// 	1	2	3	4	5	6	7	8	9	bestN
-// 2	555	598	621	804	1038	1733	2486	5020	8304	1
-// 4	783	747	800	1006	1428	2132	3285	5185	9806	2
-// 8	1174	1071	1095	1286	1640	2398	3869	6378	12080	2
-// 16	2279	1874	1745	1739	2144	2831	4209	6964	12007	4
-// 32	3910	3706	2588	2477	2782	3467	4856	7489	12618	4
-// 64	7184	5429	4710	4368	4010	4672	6027	8559	13684	5
-// 128	14097	10574	8452	7297	6841	6718	8615	10580	15641	6
-// 256	27715	20800	16000	13550	11875	11400	11505	14090	18460	6
-// 512	55100	41250	31740	26570	22030	19830	20760	21380	25215	6
-// 1024	111520	79000	61080	49720	43080	38320	37600	35040	36750	8
-// 2048	219480	162680	122120	102080	83760	70360	66600	63920	66160	8
-// 4096	453320	323080	247240	210200	180040	150240	132440	114920	110560	9
+//      1       2       3       4       5       6       7       8       9       bestN
+// 2    555     598     621     804     1038    1733    2486    5020    8304    1
+// 4    783     747     800     1006    1428    2132    3285    5185    9806    2
+// 8    1174    1071    1095    1286    1640    2398    3869    6378    12080   2
+// 16   2279    1874    1745    1739    2144    2831    4209    6964    12007   4
+// 32   3910    3706    2588    2477    2782    3467    4856    7489    12618   4
+// 64   7184    5429    4710    4368    4010    4672    6027    8559    13684   5
+// 128  14097   10574   8452    7297    6841    6718    8615    10580   15641   6
+// 256  27715   20800   16000   13550   11875   11400   11505   14090   18460   6
+// 512  55100   41250   31740   26570   22030   19830   20760   21380   25215   6
+// 1024 111520  79000   61080   49720   43080   38320   37600   35040   36750   8
+// 2048 219480  162680  122120  102080  83760   70360   66600   63920   66160   8
+// 4096 453320  323080  247240  210200  180040  150240  132440  114920  110560  9
 
-// 			2	4	8	16	32	64	128	256	512	1024	2048	4096
-// Bos Coster		858	994	1316	1949	3183	5512	9865	17830	33485	63160	124280	246320
-// Straus		226	341	548	980	1870	3538	7039	14490	29020	57200	118640	233640
-// Straus/cached	226	315	485	785	1514	2858	5753	11065	22970	45120	98880	194840
-// Pippenger		555	747	1071	1739	2477	4010	6718	11400	19830	35040	63920	110560
+//                2   4   8     16    32    64    128   256   512   1024  2048    4096
+// Bos Coster     858 994 1316  1949  3183  5512  9865  17830 33485 63160 124280  246320
+// Straus         226 341 548   980   1870  3538  7039  14490 29020 57200 118640  233640
+// Straus/cached  226 315 485   785   1514  2858  5753  11065 22970 45120 98880   194840
+// Pippenger      555 747 1071  1739  2477  4010  6718  11400 19830 35040 63920   110560
 
-// Best/cached		Straus	Straus	Straus	Straus	Straus	Straus	Straus	Straus	Pip	Pip	Pip	Pip
-// Best/uncached	Straus	Straus	Straus	Straus	Straus	Straus	Pip	Pip	Pip	Pip	Pip	Pip
+// Best/cached    Straus  Straus  Straus  Straus  Straus  Straus  Straus  Straus  Pip Pip Pip Pip
+// Best/uncached  Straus  Straus  Straus  Straus  Straus  Straus  Pip     Pip     Pip Pip Pip Pip
 
 // New timings:
 //   Pippenger:
@@ -154,77 +154,6 @@ static inline void add(ge_p3 &p3, const ge_p3 &other)
   add(p3, cached);
 }
 
-rct::key bos_coster_heap_conv(std::vector<MultiexpData> data)
-{
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(bos_coster, 1000000));
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(setup, 1000000));
-  size_t points = data.size();
-  CHECK_AND_ASSERT_THROW_MES(points > 1, "Not enough points");
-  std::vector<size_t> heap(points);
-  for (size_t n = 0; n < points; ++n)
-    heap[n] = n;
-
-  auto Comp = [&](size_t e0, size_t e1) { return data[e0].scalar < data[e1].scalar; };
-  std::make_heap(heap.begin(), heap.end(), Comp);
-  MULTIEXP_PERF(PERF_TIMER_STOP(setup));
-
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(loop, 1000000));
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(pop, 1000000)); MULTIEXP_PERF(PERF_TIMER_PAUSE(pop));
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(add, 1000000)); MULTIEXP_PERF(PERF_TIMER_PAUSE(add));
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(sub, 1000000)); MULTIEXP_PERF(PERF_TIMER_PAUSE(sub));
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(push, 1000000)); MULTIEXP_PERF(PERF_TIMER_PAUSE(push));
-  while (heap.size() > 1)
-  {
-    MULTIEXP_PERF(PERF_TIMER_RESUME(pop));
-    std::pop_heap(heap.begin(), heap.end(), Comp);
-    size_t index1 = heap.back();
-    heap.pop_back();
-    std::pop_heap(heap.begin(), heap.end(), Comp);
-    size_t index2 = heap.back();
-    heap.pop_back();
-    MULTIEXP_PERF(PERF_TIMER_PAUSE(pop));
-
-    MULTIEXP_PERF(PERF_TIMER_RESUME(add));
-    ge_cached cached;
-    ge_p3_to_cached(&cached, &data[index1].point);
-    ge_p1p1 p1;
-    ge_add(&p1, &data[index2].point, &cached);
-    ge_p1p1_to_p3(&data[index2].point, &p1);
-    MULTIEXP_PERF(PERF_TIMER_PAUSE(add));
-
-    MULTIEXP_PERF(PERF_TIMER_RESUME(sub));
-    sc_sub(data[index1].scalar.bytes, data[index1].scalar.bytes, data[index2].scalar.bytes);
-    MULTIEXP_PERF(PERF_TIMER_PAUSE(sub));
-
-    MULTIEXP_PERF(PERF_TIMER_RESUME(push));
-    if (!(data[index1].scalar == rct::zero()))
-    {
-      heap.push_back(index1);
-      std::push_heap(heap.begin(), heap.end(), Comp);
-    }
-
-    heap.push_back(index2);
-    std::push_heap(heap.begin(), heap.end(), Comp);
-    MULTIEXP_PERF(PERF_TIMER_PAUSE(push));
-  }
-  MULTIEXP_PERF(PERF_TIMER_STOP(push));
-  MULTIEXP_PERF(PERF_TIMER_STOP(sub));
-  MULTIEXP_PERF(PERF_TIMER_STOP(add));
-  MULTIEXP_PERF(PERF_TIMER_STOP(pop));
-  MULTIEXP_PERF(PERF_TIMER_STOP(loop));
-
-  MULTIEXP_PERF(PERF_TIMER_START_UNIT(end, 1000000));
-  //return rct::scalarmultKey(data[index1].point, data[index1].scalar);
-  std::pop_heap(heap.begin(), heap.end(), Comp);
-  size_t index1 = heap.back();
-  heap.pop_back();
-  ge_p2 p2;
-  ge_scalarmult(&p2, data[index1].scalar.bytes, &data[index1].point);
-  rct::key res;
-  ge_tobytes(res.bytes, &p2);
-  return res;
-}
-
 rct::key bos_coster_heap_conv_robust(std::vector<MultiexpData> data)
 {
   MULTIEXP_PERF(PERF_TIMER_START_UNIT(bos_coster, 1000000));
@@ -235,7 +164,7 @@ rct::key bos_coster_heap_conv_robust(std::vector<MultiexpData> data)
   heap.reserve(points);
   for (size_t n = 0; n < points; ++n)
   {
-    if (!(data[n].scalar == rct::zero()) && !ge_p3_is_point_at_infinity(&data[n].point))
+    if (!(data[n].scalar == rct::zero()) && !ge_p3_is_point_at_infinity_vartime(&data[n].point))
       heap.push_back(n);
   }
   points = heap.size();
@@ -442,14 +371,13 @@ size_t straus_get_cache_size(const std::shared_ptr<straus_cached_data> &cache)
   return sz;
 }
 
-rct::key straus(const std::vector<MultiexpData> &data, const std::shared_ptr<straus_cached_data> &cache, size_t STEP)
+ge_p3 straus_p3(const std::vector<MultiexpData> &data, const std::shared_ptr<straus_cached_data> &cache, size_t STEP)
 {
   CHECK_AND_ASSERT_THROW_MES(cache == NULL || cache->size >= data.size(), "Cache is too small");
   MULTIEXP_PERF(PERF_TIMER_UNIT(straus, 1000000));
   STEP = STEP ? STEP : 192;
 
   MULTIEXP_PERF(PERF_TIMER_START_UNIT(setup, 1000000));
-  static constexpr unsigned int mask = (1<<STRAUS_C)-1;
   std::shared_ptr<straus_cached_data> local_cache = cache == NULL ? straus_init_cache(data) : cache;
   ge_cached cached;
   ge_p1p1 p1;
@@ -458,7 +386,7 @@ rct::key straus(const std::vector<MultiexpData> &data, const std::shared_ptr<str
   MULTIEXP_PERF(PERF_TIMER_START_UNIT(skip, 1000000));
   std::vector<uint8_t> skip(data.size());
   for (size_t i = 0; i < data.size(); ++i)
-    skip[i] = data[i].scalar == rct::zero() || ge_p3_is_point_at_infinity(&data[i].point);
+    skip[i] = data[i].scalar == rct::zero() || ge_p3_is_point_at_infinity_vartime(&data[i].point);
   MULTIEXP_PERF(PERF_TIMER_STOP(skip));
 #endif
 
@@ -483,6 +411,7 @@ rct::key straus(const std::vector<MultiexpData> &data, const std::shared_ptr<str
     memcpy(bytes33,  data[j].scalar.bytes, 32);
     bytes33[32] = 0;
     bytes = bytes33;
+    static constexpr unsigned int mask = (1<<STRAUS_C)-1;
     for (size_t i = 0; i < 256; ++i)
       digits[j*256+i] = ((bytes[i>>3] | (bytes[(i>>3)+1]<<8)) >> (i&7)) & mask;
 #else
@@ -553,7 +482,13 @@ skipfirst:
     ge_p1p1_to_p3(&res_p3, &p1);
   }
 
+  return res_p3;
+}
+
+rct::key straus(const std::vector<MultiexpData> &data, const std::shared_ptr<straus_cached_data> &cache, size_t STEP)
+{
   rct::key res;
+  const ge_p3 res_p3 = straus_p3(data, cache, STEP);
   ge_p3_tobytes(res.bytes, &res_p3);
   return res;
 }
@@ -570,14 +505,6 @@ size_t get_pippenger_c(size_t N)
   return 9;
 }
 
-struct pippenger_cached_data
-{
-  size_t size;
-  ge_cached *cached;
-  pippenger_cached_data(): size(0), cached(NULL) {}
-  ~pippenger_cached_data() { aligned_free(cached); }
-};
-
 std::shared_ptr<pippenger_cached_data> pippenger_init_cache(const std::vector<MultiexpData> &data, size_t start_offset, size_t N)
 {
   MULTIEXP_PERF(PERF_TIMER_START_UNIT(pippenger_init_cache, 1000000));
@@ -585,13 +512,11 @@ std::shared_ptr<pippenger_cached_data> pippenger_init_cache(const std::vector<Mu
   if (N == 0)
     N = data.size() - start_offset;
   CHECK_AND_ASSERT_THROW_MES(N <= data.size() - start_offset, "Bad cache base data");
-  std::shared_ptr<pippenger_cached_data> cache(new pippenger_cached_data());
+  std::shared_ptr<pippenger_cached_data> cache = std::make_shared<pippenger_cached_data>();
 
-  cache->size = N;
-  cache->cached = (ge_cached*)aligned_realloc(cache->cached, N * sizeof(ge_cached), 4096);
-  CHECK_AND_ASSERT_THROW_MES(cache->cached, "Out of memory");
+  cache->resize(N);
   for (size_t i = 0; i < N; ++i)
-    ge_p3_to_cached(&cache->cached[i], &data[i+start_offset].point);
+    ge_p3_to_cached(&(*cache)[i], &data[i+start_offset].point);
 
   MULTIEXP_PERF(PERF_TIMER_STOP(pippenger_init_cache));
   return cache;
@@ -599,14 +524,14 @@ std::shared_ptr<pippenger_cached_data> pippenger_init_cache(const std::vector<Mu
 
 size_t pippenger_get_cache_size(const std::shared_ptr<pippenger_cached_data> &cache)
 {
-  return cache->size * sizeof(*cache->cached);
+  return cache->size() * sizeof(ge_cached);
 }
 
-rct::key pippenger(const std::vector<MultiexpData> &data, const std::shared_ptr<pippenger_cached_data> &cache, size_t cache_size, size_t c)
+ge_p3 pippenger_p3(const std::vector<MultiexpData> &data, const std::shared_ptr<pippenger_cached_data> &cache, size_t cache_size, size_t c)
 {
   if (cache != NULL && cache_size == 0)
-    cache_size = cache->size;
-  CHECK_AND_ASSERT_THROW_MES(cache == NULL || cache_size <= cache->size, "Cache is too small");
+    cache_size = cache->size();
+  CHECK_AND_ASSERT_THROW_MES(cache == NULL || cache_size <= cache->size(), "Cache is too small");
   if (c == 0)
     c = get_pippenger_c(data.size());
   CHECK_AND_ASSERT_THROW_MES(c <= 9, "c is too large");
@@ -660,9 +585,9 @@ rct::key pippenger(const std::vector<MultiexpData> &data, const std::shared_ptr<
       if (buckets_init[bucket])
       {
         if (i < cache_size)
-          add(buckets[bucket], local_cache->cached[i]);
+          add(buckets[bucket], (*local_cache)[i]);
         else
-          add(buckets[bucket], local_cache_2->cached[i - cache_size]);
+          add(buckets[bucket], (*local_cache_2)[i - cache_size]);
       }
       else
       {
@@ -699,8 +624,14 @@ rct::key pippenger(const std::vector<MultiexpData> &data, const std::shared_ptr<
     }
   }
 
+  return result;
+}
+
+rct::key pippenger(const std::vector<MultiexpData> &data, const std::shared_ptr<pippenger_cached_data> &cache, const size_t cache_size, const size_t c)
+{
   rct::key res;
-  ge_p3_tobytes(res.bytes, &result);
+  const ge_p3 result_p3 = pippenger_p3(data, cache, cache_size, c);
+  ge_p3_tobytes(res.bytes, &result_p3);
   return res;
 }
 

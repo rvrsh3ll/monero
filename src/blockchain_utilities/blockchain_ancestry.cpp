@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -37,11 +37,9 @@
 #include "common/command_line.h"
 #include "common/varint.h"
 #include "cryptonote_basic/cryptonote_boost_serialization.h"
-#include "cryptonote_core/tx_pool.h"
 #include "cryptonote_core/cryptonote_core.h"
-#include "cryptonote_core/blockchain.h"
-#include "blockchain_db/blockchain_db.h"
 #include "version.h"
+#include "misc_log_ex.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "bcutil"
@@ -161,7 +159,11 @@ struct ancestry_state_t
     {
       std::unordered_map<uint64_t, cryptonote::block> old_block_cache;
       a & old_block_cache;
-      block_cache.resize(old_block_cache.size());
+      uint64_t max_height = 0;
+      for (const auto& i: old_block_cache)
+        max_height = std::max(max_height, i.first);
+      CHECK_AND_ASSERT_THROW_MES(old_block_cache.empty() || max_height < block_cache.max_size(), "Corrupt ancestry state: block height too large");
+      block_cache.resize(old_block_cache.empty() ? 0 : max_height + 1);
       for (const auto& i: old_block_cache)
         block_cache[i.first] = i.second;
     }
@@ -358,6 +360,7 @@ int main(int argc, char* argv[])
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_data_dir);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_testnet_on);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_stagenet_on);
+  command_line::add_arg(desc_cmd_sett, cryptonote::arg_regtest_on);
   command_line::add_arg(desc_cmd_sett, arg_log_level);
   command_line::add_arg(desc_cmd_sett, arg_txid);
   command_line::add_arg(desc_cmd_sett, arg_output);
@@ -400,9 +403,7 @@ int main(int argc, char* argv[])
   LOG_PRINT_L0("Starting...");
 
   std::string opt_data_dir = command_line::get_arg(vm, cryptonote::arg_data_dir);
-  bool opt_testnet = command_line::get_arg(vm, cryptonote::arg_testnet_on);
-  bool opt_stagenet = command_line::get_arg(vm, cryptonote::arg_stagenet_on);
-  network_type net_type = opt_testnet ? TESTNET : opt_stagenet ? STAGENET : MAINNET;
+  const network_type net_type = core::get_network_type_from_args(vm);
   std::string opt_txid_string = command_line::get_arg(vm, arg_txid);
   std::string opt_output_string = command_line::get_arg(vm, arg_output);
   uint64_t opt_height = command_line::get_arg(vm, arg_height);
@@ -449,9 +450,7 @@ int main(int argc, char* argv[])
   // because unlike blockchain_storage constructor, which takes a pointer to
   // tx_memory_pool, Blockchain's constructor takes tx_memory_pool object.
   LOG_PRINT_L0("Initializing source blockchain (BlockchainDB)");
-  std::unique_ptr<Blockchain> core_storage;
-  tx_memory_pool m_mempool(*core_storage);
-  core_storage.reset(new Blockchain(m_mempool));
+  std::unique_ptr<BlockchainAndPool> core_storage = std::make_unique<BlockchainAndPool>();
   BlockchainDB *db = new_db();
   if (db == NULL)
   {
@@ -472,7 +471,7 @@ int main(int argc, char* argv[])
     LOG_PRINT_L0("Error opening database: " << e.what());
     return 1;
   }
-  r = core_storage->init(db, net_type);
+  r = core_storage->blockchain.init(db, net_type);
 
   CHECK_AND_ASSERT_MES(r, 1, "Failed to initialize source blockchain storage");
   LOG_PRINT_L0("Source blockchain storage initialized OK");
@@ -716,7 +715,7 @@ int main(int argc, char* argv[])
   }
 
 done:
-  core_storage->deinit();
+  core_storage->blockchain.deinit();
 
   if (opt_show_cache_stats)
   MINFO("cache: txes " << std::to_string(cached_txes*100./total_txes)

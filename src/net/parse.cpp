@@ -1,4 +1,4 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -28,6 +28,10 @@
 
 #include "parse.h"
 
+#include <boost/algorithm/string/predicate.hpp>
+#include <type_traits>
+#include "hex.h"
+#include "net/socks.h"
 #include "net/tor_address.h"
 #include "net/i2p_address.h"
 #include "string_tools.h"
@@ -35,9 +39,98 @@
 
 namespace net
 {
+    namespace
+    {
+        bool percent_decoding(std::string& out)
+        {
+            auto pos = out.find('%');
+            while (pos != std::string::npos)
+            {
+                if (out.size() - pos < 3)
+                    return false;
+                if (!epee::from_hex::to_buffer({reinterpret_cast<std::uint8_t*>(out.data()) + pos, 1}, {out.data() + pos + 1, 2}))
+                    return false;
+                out.erase(pos + 1, 2);
+                pos = out.find('%', pos + 1);
+            }
+
+            return true;
+        }
+    } // anonymous
+
+    scheme_and_authority::scheme_and_authority(boost::string_ref uri)
+      : scheme(), authority()
+    {
+        static_assert(std::is_same<std::string::size_type, boost::string_ref::size_type>());
+
+        // Stop at scheme end or path begin. URN not supported
+        const auto split = uri.find_first_of(":/");
+        if (split != boost::string_ref::npos && uri.substr(split).starts_with("://"))
+        {
+            scheme.assign(uri.data(), split);
+            uri = uri.substr(split + 3);
+        }
+
+        uri = uri.substr(0, uri.find('/'));
+        authority.assign(uri.data(), uri.size());
+    }
+
+    userinfo_and_hostport::userinfo_and_hostport(boost::string_ref authority)
+      : userinfo(), hostport()
+    {
+        static_assert(std::is_same<std::string::size_type, boost::string_ref::size_type>());
+
+        const auto split = authority.find('@');
+        if (split != boost::string_ref::npos)
+        {
+            userinfo.assign(authority.data(), split);
+            authority = authority.substr(split + 1);
+        }
+
+        hostport.assign(authority.data(), authority.size());
+    }
+
+    std::optional<user_and_pass> user_and_pass::get(boost::string_ref userinfo)
+    {
+        static_assert(std::is_same<std::string::size_type, boost::string_ref::size_type>());
+        std::optional<user_and_pass> out{std::in_place};
+
+        const auto split = userinfo.find(':');
+        if (split != boost::string_ref::npos)
+        {
+            out->user.assign(userinfo.data(), split);
+            userinfo = userinfo.substr(split + 1);
+        }
+        else
+        {
+            out->user.assign(userinfo.data(), userinfo.size());
+            userinfo = {};
+        }
+
+        out->pass.assign(userinfo.data(), userinfo.size());
+        if (percent_decoding(out->user) && percent_decoding(out->pass))
+            return out;
+        return std::nullopt;
+    }
+
+    std::optional<uri_components> uri_components::get(const boost::string_ref uri)
+    {
+        scheme_and_authority result1{uri};
+        userinfo_and_hostport result2{result1.authority};
+        auto result3 = user_and_pass::get(result2.userinfo);
+        if (!result3)
+            return std::nullopt;
+
+        std::optional<uri_components> out{std::in_place};
+        out->scheme = std::move(result1.scheme);
+        out->userinfo = std::move(*result3);
+        out->hostport = std::move(result2.hostport);
+        return out;
+    }
+
     void get_network_address_host_and_port(const std::string& address, std::string& host, std::string& port)
     {
-        // require ipv6 address format "[addr:addr:addr:...:addr]:port"
+        // If IPv6 address format with port "[addr:addr:addr:...:addr]:port"
         if (address.find(']') != std::string::npos)
         {
             host = address.substr(1, address.rfind(']') - 1);
@@ -46,6 +139,12 @@ namespace net
                 port = address.substr(address.rfind(':') + 1);
             }
         }
+        // Else if IPv6 address format without port e.g. "addr:addr:addr:...:addr"
+        else if (std::count(address.begin(), address.end(), ':') >= 2)
+        {
+            host = address;
+        }
+        // Else IPv4, Tor, I2P address or hostname
         else
         {
             host = address.substr(0, address.rfind(':'));
@@ -74,10 +173,10 @@ namespace net
         if (host_str_ref.ends_with(".onion"))
             return tor_address::make(address, default_port);
         if (host_str_ref.ends_with(".i2p"))
-            return i2p_address::make(address, default_port);
+            return i2p_address::make(address);
 
         boost::system::error_code ec;
-        boost::asio::ip::address_v6 v6 = boost::asio::ip::address_v6::from_string(host_str, ec);
+        boost::asio::ip::address_v6 v6 = boost::asio::ip::make_address_v6(host_str, ec);
         ipv6 = !ec;
 
         std::uint16_t port = default_port;
@@ -89,7 +188,12 @@ namespace net
 
         if (ipv6)
         {
-            return {epee::net_utils::ipv6_network_address{v6, port}};
+            const epee::net_utils::ipv6_network_address address{v6, port};
+            const boost::optional<epee::net_utils::ipv4_network_address> mapped =
+                epee::net_utils::get_ipv4_mapped_address(address);
+            if (mapped)
+                return {std::move(*mapped)};
+            return {address};
         }
         else
         {
@@ -97,7 +201,6 @@ namespace net
             if (epee::string_tools::get_ip_int32_from_string(ip, host_str))
                 return {epee::net_utils::ipv4_network_address{ip, port}};
         }
-
         return make_error_code(net::error::unsupported_address);
     }
 
@@ -157,5 +260,72 @@ namespace net
         }
 
         return result;
+    }
+
+    namespace socks
+    {
+        endpoint::endpoint()
+          : endpoint(boost::asio::ip::tcp::endpoint{})
+        {}
+
+        endpoint::endpoint(const boost::asio::ip::tcp::endpoint& address)
+          : address(address), userinfo(), ver(version::v4a)
+        {}
+
+        expect<endpoint> endpoint::get(const boost::string_ref uri, const bool resolve_host)
+        {
+            auto components = uri_components::get(uri);
+            if (!components)
+                return {net::error::invalid_encoding};
+
+            endpoint out{};
+            if (components->scheme.empty() || components->scheme == "socks" || components->scheme == "socks4a")
+                out.ver = version::v4a;
+            else if (components->scheme == "socks4")
+                out.ver = version::v4;
+            else if (components->scheme == "socks5")
+                out.ver = version::v5;
+            else
+                return {net::error::invalid_scheme};
+
+            // Only version 5 supports user/pass authentication
+            if (!components->userinfo.user.empty() || !components->userinfo.pass.empty())
+            {
+                if (out.ver != version::v5)
+                    return {net::error::unexpected_userinfo};
+            }
+
+            auto tcp_endpoint = get_tcp_endpoint(components->hostport);
+            if (tcp_endpoint)
+                out.address = std::move(*tcp_endpoint);
+            else if (resolve_host && tcp_endpoint.error() == make_error_code(net::error::unsupported_address))
+            {
+                std::string host, port_string;
+                get_network_address_host_and_port(components->hostport, host, port_string);
+                std::uint16_t port = 0;
+                if (!epee::string_tools::get_xtype_from_string(port, port_string) || port == 0)
+                    return {net::error::invalid_port};
+                if (host.empty() || host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos ||
+                    host.find("..") != std::string::npos ||
+                    boost::algorithm::iends_with(host, ".onion") || boost::algorithm::iends_with(host, ".onion.") ||
+                    boost::algorithm::iends_with(host, ".i2p") || boost::algorithm::iends_with(host, ".i2p."))
+                    return {net::error::invalid_host};
+
+                boost::asio::io_context io;
+                boost::asio::ip::tcp::resolver resolver{io};
+                boost::system::error_code ec;
+                const auto addresses = resolver.resolve(host, std::to_string(port), ec);
+                if (ec || addresses.empty())
+                    return {net::error::dns_query_failure};
+                for (const auto& address : addresses)
+                    out.resolved_addresses.push_back(address.endpoint());
+                out.address = out.resolved_addresses.front();
+            }
+            else
+                return tcp_endpoint.error();
+
+            out.userinfo = std::move(components->userinfo);
+            return out;
+        }
     }
 }

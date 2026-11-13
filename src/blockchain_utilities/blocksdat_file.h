@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -36,7 +36,6 @@
 #include <boost/filesystem/operations.hpp>
 
 #include "cryptonote_basic/cryptonote_basic.h"
-#include "cryptonote_basic/cryptonote_boost_serialization.h"
 #include "cryptonote_core/blockchain.h"
 #include "blockchain_db/blockchain_db.h"
 
@@ -50,10 +49,6 @@
 
 #include "blockchain_utilities.h"
 
-
-using namespace cryptonote;
-
-
 class BlocksdatFile
 {
 public:
@@ -63,7 +58,7 @@ public:
 
 protected:
 
-  Blockchain* m_blockchain_storage;
+  cryptonote::Blockchain* m_blockchain_storage;
 
   std::ofstream * m_raw_data_file;
 

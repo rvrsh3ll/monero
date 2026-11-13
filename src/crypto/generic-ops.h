@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -31,9 +31,24 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <functional>
 #include <sodium/crypto_verify_32.h>
+#include <sodium/crypto_shorthash_siphash24.h>
+
+// get declaration of std::hash
+#ifdef __GLIBCXX__
+namespace std _GLIBCXX_VISIBILITY(default) {
+  _GLIBCXX_BEGIN_NAMESPACE_VERSION
+  template<typename _Tp>
+  struct hash;
+  _GLIBCXX_END_NAMESPACE_VERSION
+}
+#else
+#include <typeindex>
+#endif
+
+#include "random.h"
 
 #define CRYPTO_MAKE_COMPARABLE(type) \
 namespace crypto { \
@@ -48,7 +63,7 @@ namespace crypto { \
 #define CRYPTO_MAKE_COMPARABLE_CONSTANT_TIME(type) \
 namespace crypto { \
   inline bool operator==(const type &_v1, const type &_v2) { \
-    static_assert(sizeof(_v1) == 32, "constant time comparison is only implenmted for 32 bytes"); \
+    static_assert(sizeof(_v1) == 32, "constant time comparison is only implemented for 32 bytes"); \
     return crypto_verify_32((const unsigned char*)&_v1, (const unsigned char*)&_v2) == 0; \
   } \
   inline bool operator!=(const type &_v1, const type &_v2) { \
@@ -56,18 +71,30 @@ namespace crypto { \
   } \
 }
 
+namespace crypto {
+  inline std::size_t siphash_to_size_t(const void *data, std::size_t length) {
+    static_assert(16 == crypto_shorthash_siphash24_KEYBYTES,
+      "crypto_siphash_key size must match the SipHash-2-4 key length");
+    static_assert(sizeof(std::uint64_t) == crypto_shorthash_siphash24_BYTES,
+      "std::uint64_t size must match the SipHash-2-4 digest length");
+    std::uint64_t h;
+    crypto_shorthash_siphash24(reinterpret_cast<unsigned char*>(&h), static_cast<const unsigned char*>(data), length,
+      get_static_siphash_key());
+    return h;
+  }
+}
+
 #define CRYPTO_DEFINE_HASH_FUNCTIONS(type) \
 namespace crypto { \
-  static_assert(sizeof(std::size_t) <= sizeof(type), "Size of " #type " must be at least that of size_t"); \
   inline std::size_t hash_value(const type &_v) { \
-    return reinterpret_cast<const std::size_t &>(_v); \
+    return siphash_to_size_t(&_v, sizeof(_v)); \
   } \
 } \
 namespace std { \
   template<> \
   struct hash<crypto::type> { \
     std::size_t operator()(const crypto::type &_v) const { \
-      return reinterpret_cast<const std::size_t &>(_v); \
+      return ::crypto::siphash_to_size_t(&_v, sizeof(_v)); \
     } \
   }; \
 }

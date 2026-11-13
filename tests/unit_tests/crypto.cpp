@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -27,13 +27,25 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <cstdint>
+#include <cstring>
 #include <gtest/gtest.h>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
-#include "cryptonote_basic/cryptonote_basic_impl.h"
+extern "C"
+{
+#include "crypto/crypto-ops.h"
+}
+#include "crypto/generators.h"
+#include "crypto/hash-ops.h"
 #include "cryptonote_basic/merge_mining.h"
+#include "fcmp_pp/fcmp_pp_crypto.h"
+#include "ringct/rctOps.h"
+#include "ringct/rctSigs.h"
+#include "ringct/rctTypes.h"
+#include "string_tools.h"
 
 namespace
 {
@@ -48,9 +60,6 @@ namespace
     "8b655970153799af2aeadc9ff1add0ea6c7251d54154cfa92c173a0dd39c1f94"
     "6c7251d54154cfa92c173a0dd39c1f948b655970153799af2aeadc9ff1add0ea";
 
-  template<typename T> void *addressof(T &t) { return &t; }
-  template<> void *addressof(crypto::secret_key &k) { return addressof(unwrap(unwrap(k))); }
-
   template<typename T>
   bool is_formatted()
   {
@@ -59,11 +68,20 @@ namespace
     static_assert(alignof(T) == 1, "T must have 1 byte alignment");
     static_assert(sizeof(T) <= sizeof(source), "T is too large for source");
     static_assert(sizeof(T) * 2 <= sizeof(expected), "T is too large for destination");
-    std::memcpy(addressof(value), source, sizeof(T));
+    static_assert(std::has_unique_object_representations_v<T>);
+    std::memcpy(std::addressof(value), source, sizeof(T));
 
     std::stringstream out;
     out << "BEGIN" << value << "END";  
     return out.str() == "BEGIN<" + std::string{expected, sizeof(T) * 2} + ">END";
+  }
+
+  void random_fe(fe rand_fe)
+  {
+    unsigned char s[32];
+    crypto::random32_unbiased(s);
+    if (fe_frombytes_vartime(rand_fe, s) != 0)
+      throw std::runtime_error("invalid random fe");
   }
 }
 
@@ -72,10 +90,10 @@ TEST(Crypto, Ostream)
   EXPECT_TRUE(is_formatted<crypto::hash8>());
   EXPECT_TRUE(is_formatted<crypto::hash>());
   EXPECT_TRUE(is_formatted<crypto::public_key>());
-  EXPECT_TRUE(is_formatted<crypto::secret_key>());
   EXPECT_TRUE(is_formatted<crypto::signature>());
   EXPECT_TRUE(is_formatted<crypto::key_derivation>());
   EXPECT_TRUE(is_formatted<crypto::key_image>());
+  EXPECT_TRUE(is_formatted<rct::key>());
 }
 
 TEST(Crypto, null_keys)
@@ -84,6 +102,26 @@ TEST(Crypto, null_keys)
   memset(zero, 0, 32);
   ASSERT_EQ(memcmp(crypto::null_skey.data, zero, 32), 0);
   ASSERT_EQ(memcmp(crypto::null_pkey.data, zero, 32), 0);
+}
+
+TEST(Crypto, groestl_unaligned_input)
+{
+  constexpr std::size_t input_size = 128;
+  alignas(std::uint32_t) std::uint8_t aligned[input_size];
+  alignas(std::uint32_t) std::uint8_t input[input_size + alignof(std::uint32_t)];
+  char expected[crypto::HASH_SIZE];
+  char actual[crypto::HASH_SIZE];
+
+  for (std::size_t i = 0; i < input_size; ++i)
+    aligned[i] = static_cast<std::uint8_t>(i);
+  crypto::hash_extra_groestl(aligned, input_size, expected);
+
+  for (std::size_t offset = 0; offset < alignof(std::uint32_t); ++offset)
+  {
+    std::memcpy(input + offset, aligned, input_size);
+    crypto::hash_extra_groestl(input + offset, input_size, actual);
+    EXPECT_EQ(0, std::memcmp(expected, actual, sizeof(expected)));
+  }
 }
 
 TEST(Crypto, verify_32)
@@ -105,6 +143,7 @@ TEST(Crypto, tree_branch)
 {
   crypto::hash inputs[6];
   crypto::hash branch[8];
+  crypto::hash branch_1[8 + 1];
   crypto::hash root, root2;
   size_t depth;
   uint32_t path, path2;
@@ -289,26 +328,290 @@ TEST(Crypto, tree_branch)
   ASSERT_FALSE(crypto::is_branch_in_tree(inputs[5].data, root.data, (const char(*)[32])branch, depth, path));
   ASSERT_FALSE(crypto::is_branch_in_tree(crypto::null_hash.data, root.data, (const char(*)[32])branch, depth, path));
 
+  // a version with an extra (dummy) hash
+  memcpy(branch_1, branch, sizeof(branch));
+  branch_1[depth] = crypto::null_hash;
+
   ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])branch, depth - 1, path));
-  ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])branch, depth + 1, path));
+  ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])branch_1, depth + 1, path));
   ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])branch, depth, path ^ 1));
   ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])branch, depth, path ^ 2));
   ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])branch, depth, path ^ 3));
-  ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])(branch + 1), depth, path));
+  ASSERT_FALSE(crypto::is_branch_in_tree(inputs[4].data, root.data, (const char(*)[32])(branch_1 + 1), depth, path));
 
   // five, not found
   ASSERT_FALSE(crypto::tree_branch((const char(*)[32])inputs, 5, crypto::null_hash.data, (char(*)[32])branch, &depth, &path));
 
   // depth encoding roundtrip
-  for (uint32_t n_chains = 1; n_chains <= 65; ++n_chains)
+  for (uint32_t n_chains = 1; n_chains <= 256; ++n_chains)
   {
-    for (uint32_t nonce = 0; nonce < 1024; ++nonce)
+    for (uint32_t nonce = 0xffffffff - 512; nonce != 1025; ++nonce)
     {
-      const uint32_t depth = cryptonote::encode_mm_depth(n_chains, nonce);
+      const uint64_t depth = cryptonote::encode_mm_depth(n_chains, nonce);
       uint32_t n_chains_2, nonce_2;
       ASSERT_TRUE(cryptonote::decode_mm_depth(depth, n_chains_2, nonce_2));
       ASSERT_EQ(n_chains, n_chains_2);
       ASSERT_EQ(nonce, nonce_2);
     }
   }
+
+  // 257 chains is too much
+  try { cryptonote::encode_mm_depth(257, 0); ASSERT_TRUE(false); }
+  catch (...) {}
+}
+
+TEST(Crypto, generator_consistency)
+{
+  // crypto/generators.h
+  const crypto::public_key G{crypto::get_G()};
+  const crypto::public_key H{crypto::get_H()};
+  const ge_p3 H_p3 = crypto::get_H_p3();
+
+  // crypto/crypto-ops.h
+  ASSERT_TRUE(memcmp(&H_p3, &ge_p3_H, sizeof(ge_p3)) == 0);
+
+  // ringct/rctOps.h
+  ASSERT_TRUE(memcmp(G.data, rct::G.bytes, 32) == 0);
+
+  // ringct/rctTypes.h
+  ASSERT_TRUE(memcmp(H.data, rct::H.bytes, 32) == 0);
+}
+
+TEST(Crypto, batch_inversion)
+{
+  const std::size_t MAX_TEST_ELEMS = 1000;
+
+  std::unique_ptr<fe[]> init_elems = std::make_unique<fe[]>(MAX_TEST_ELEMS);
+  std::unique_ptr<fe[]> norm_inverted = std::make_unique<fe[]>(MAX_TEST_ELEMS);
+
+  // Init test elems and individual inversions
+  for (std::size_t i = 0; i < MAX_TEST_ELEMS; ++i)
+  {
+    random_fe(init_elems[i]);
+    fe_invert(norm_inverted[i], init_elems[i]);
+  }
+
+  // Do batch inversions and compare to individual inversions
+  for (std::size_t n_elems = 1; n_elems <= MAX_TEST_ELEMS; ++n_elems)
+  {
+    std::unique_ptr<fe[]> batch_inverted = std::make_unique<fe[]>(n_elems);
+    ASSERT_EQ(fe_batch_invert(batch_inverted.get(), init_elems.get(), n_elems), 0);
+    for (std::size_t i = 0; i < n_elems; ++i)
+      ASSERT_EQ(fe_equals(batch_inverted[i], norm_inverted[i]), 1);
+  }
+}
+
+TEST(Crypto, batch_inversion_touching)
+{
+  // vals[0] and vals[1] are input, vals[2] and vals[3] are output
+  fe vals[4];
+
+  // Init input elems
+  for (std::size_t i = 0; i < 2; ++i)
+    random_fe(vals[i]);
+
+  ASSERT_EQ(0, fe_batch_invert(vals + 2, vals, 2));
+
+  // Do batch inversions and compare to individual inversions
+  for (std::size_t i = 0; i < 2; ++i)
+  {
+    fe inv_simple;
+    fe_invert(inv_simple, vals[i]);
+    ASSERT_EQ(1, fe_equals(inv_simple, vals[2 + i]));
+  }
+}
+
+TEST(Crypto, batch_invert_zero)
+{
+  const std::size_t TEST_ELEMS = 2;
+  std::unique_ptr<fe[]> init_elems = std::make_unique<fe[]>(TEST_ELEMS);
+
+  // Init test elems
+  random_fe(init_elems[0]);
+  fe_0(init_elems[1]);
+
+  // Do the batch inversion, should fail
+  std::unique_ptr<fe[]> batch_inverted = std::make_unique<fe[]>(TEST_ELEMS);
+  ASSERT_EQ(fe_batch_invert(batch_inverted.get(), init_elems.get(), TEST_ELEMS), -1);
+}
+
+TEST(Crypto, fe_equals)
+{
+  // Test equality
+  ASSERT_EQ(fe_equals(fe_d, fe_d), 1);
+
+  // Test inequality
+  fe fe_d2;
+  fe_add(fe_d2, fe_d, fe_d);
+  ASSERT_EQ(fe_equals(fe_d2, fe_d), 0);
+
+  // Test different fe reprs that are actually equal
+  unsigned char fe_d2_bytes[32];
+  fe fe_d2_reduced;
+  fe_tobytes(fe_d2_bytes, fe_d2);
+  fe_frombytes_vartime(fe_d2_reduced, fe_d2_bytes);
+  // We expect distinct fe_d2_reduced and fe_d2 reprs, since fe_add produces fe repr elems in a larger subdomain.
+  ASSERT_NE(memcmp(fe_d2_reduced, fe_d2, sizeof(fe)), 0);
+  ASSERT_EQ(fe_equals(fe_d2_reduced, fe_d2), 1);
+}
+
+TEST(Crypto, ec_constants_rct_parity)
+{
+  ASSERT_TRUE(memcmp(&crypto::EC_I,         &rct::I,         32) == 0);
+  ASSERT_TRUE(memcmp(sc_inv_eight, &rct::INV_EIGHT, 32) == 0);
+}
+
+#define CHECK_CLEARED(k, cleared) \
+  crypto::ec_point cleared2; \
+  const bool r = crypto::get_valid_torsion_cleared_point_vartime(rct::rct2pt(k), cleared2); \
+  ASSERT_TRUE(r); \
+  ASSERT_EQ(cleared, cleared2);
+
+TEST(Crypto, torsion_check_pass_random)
+{
+  std::vector<rct::key> pts;
+  for (int i = 0; i < 1000; ++i)
+  {
+    const rct::key pk = rct::pkGen();
+    ge_p3 x;
+    ASSERT_EQ(ge_frombytes_vartime(&x, pk.bytes), 0);
+    ASSERT_TRUE(rct::isInMainSubgroup(pk));
+    ASSERT_FALSE(fcmp_pp::mul8_is_identity_vartime(x));
+    crypto::ec_point cleared;
+    ge_clear_torsion_vartime(to_bytes(cleared), &x);
+    ASSERT_EQ(rct::rct2pt(pk), cleared);
+    CHECK_CLEARED(pk, cleared);
+    pts.emplace_back(pk);
+  }
+  ASSERT_TRUE(rct::verPointsForTorsion(pts));
+}
+
+TEST(Crypto, torsion_check_hardcoded)
+{
+  struct TorsionTestPoints { std::string point; bool torsion_free; };
+  static const std::vector<TorsionTestPoints> torsion_test_points = {
+      {"b10ba13e303cbe9abf7d5d44f1d417727abcc14903a74e071abd652ce1bf76dd", false},
+      {"9b2e4c0281c0b02e7c53291a94d1d0cbff8883f8024f5142ee494ffbbd088071", false}, // genesis (see config::GENESIS_TX)
+      {"785eda585dca4f3d27976106008ccfbca13146c8b21b8c7e4909032639a776e1", true},
+      {"9a7b10563aa266032cd075f4e347f348a3841ae4f41572633351a97dd44066b4", true},
+    };
+
+  std::vector<rct::key> all_pts, torsion_free_pts, torsioned_pts, torsion_cleared_pts;
+  for (const auto &point : torsion_test_points)
+  {
+    rct::key k;
+    epee::string_tools::hex_to_pod(point.point, k);
+    ge_p3 x;
+    ASSERT_EQ(ge_frombytes_vartime(&x, k.bytes), 0);
+    ASSERT_EQ(rct::isInMainSubgroup(k), point.torsion_free);
+    ASSERT_FALSE(fcmp_pp::mul8_is_identity_vartime(x));
+    crypto::ec_point cleared;
+    ge_clear_torsion_vartime(to_bytes(cleared), &x);
+    if (point.torsion_free)
+    {
+      ASSERT_EQ(rct::rct2pt(k), cleared);
+      torsion_free_pts.push_back(k);
+    }
+    else
+    {
+      ASSERT_NE(rct::rct2pt(k), cleared);
+      torsioned_pts.push_back(k);
+    }
+    CHECK_CLEARED(k, cleared);
+    all_pts.emplace_back(k);
+    torsion_cleared_pts.emplace_back(rct::pt2rct(cleared));
+  }
+
+  ASSERT_TRUE(rct::verPointsForTorsion(torsion_free_pts));
+  ASSERT_FALSE(rct::verPointsForTorsion(torsioned_pts));
+  ASSERT_FALSE(rct::verPointsForTorsion(all_pts));
+  ASSERT_TRUE(rct::verPointsForTorsion(torsion_cleared_pts));
+}
+
+TEST(Crypto, mul8_is_identity_vartime)
+{
+  static const std::vector<rct::key> mul8_identity_points = {
+      rct::I,
+      rct::Z
+    };
+
+  for (const auto &point : mul8_identity_points)
+  {
+    ge_p3 x;
+    ASSERT_EQ(ge_frombytes_vartime(&x, point.bytes), 0);
+    ASSERT_TRUE(fcmp_pp::mul8_is_identity_vartime(x));
+
+    crypto::ec_point _;
+    ASSERT_FALSE(crypto::get_valid_torsion_cleared_point_vartime(rct::rct2pt(point), _));
+  }
+}
+
+TEST(Crypto, fe_constants)
+{
+  // A / 3
+  fe inv_3;
+  static const fe fe_3{3, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  fe_invert(inv_3, fe_3);
+  fe a_inv_3;
+  fe_mul(a_inv_3, fe_a, inv_3);
+
+  // c = sqrt(-(A + 2))
+  // Since sqrt isn't implemented, instead showing: c^2 = -(A + 2)
+  // TODO: test fe_c directly once sqrt is implemented
+  fe c_sq;
+  fe_sq(c_sq, fe_c);
+  // -(A + 2) = -A - 2
+  static const fe fe_2{2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  fe ma_sub_2;
+  fe_sub(ma_sub_2, fe_ma, fe_2);
+  fe_reduce_vartime(ma_sub_2, ma_sub_2);
+
+  ASSERT_TRUE(memcmp(fe_a_inv_3, a_inv_3,  sizeof(fe)) == 0);
+  ASSERT_TRUE(memcmp(c_sq,       ma_sub_2, sizeof(fe)) == 0);
+
+  // Parity with spec
+  // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2 Page 19
+  unsigned char A_INV_3_PAPER[32] = {
+      0x2a, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+      0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+      0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+      0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xad, 0x24, 0x51
+    };
+
+  // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2 Pages 19-20
+  unsigned char FE_C_PAPER[32] = {
+      0x70, 0xd9, 0x12, 0x0b, 0x9f, 0x5f, 0xf9, 0x44,
+      0x2d, 0x84, 0xf7, 0x23, 0xfc, 0x03, 0xb0, 0x81,
+      0x3a, 0x5e, 0x2c, 0x2e, 0xb4, 0x82, 0xe5, 0x7d,
+      0x33, 0x91, 0xfb, 0x55, 0x00, 0xba, 0x81, 0xe7
+    };
+
+  // Reverse to have comparable endian order
+  unsigned char a_inv_3_bytes[32];
+  fe_tobytes(a_inv_3_bytes, fe_a_inv_3);
+  std::reverse(a_inv_3_bytes, a_inv_3_bytes + 32);
+
+  unsigned char fe_c_bytes[32];
+  fe_tobytes(fe_c_bytes, fe_c);
+  std::reverse(fe_c_bytes, fe_c_bytes + 32);
+
+  ASSERT_TRUE(memcmp(a_inv_3_bytes, A_INV_3_PAPER, 32) == 0);
+  ASSERT_TRUE(memcmp(fe_c_bytes,    FE_C_PAPER,    32) == 0);
+}
+
+TEST(Crypto, double_scalarmult_p3_zero_scalars)
+{
+  static const unsigned char zero[32] = {0};
+  const ge_p3 &G = crypto::get_G_p3();
+  ge_dsmp Gi;
+  ge_dsm_precomp(Gi, &G);
+
+  ge_p3 r3;
+  memset(&r3, 0x01, sizeof(r3));
+  ge_double_scalarmult_base_vartime_p3(&r3, zero, &G, zero);
+  EXPECT_TRUE(ge_p3_is_point_at_infinity_vartime(&r3));
+
+  memset(&r3, 0x01, sizeof(r3));
+  ge_double_scalarmult_precomp_vartime2_p3(&r3, zero, Gi, zero, Gi);
+  EXPECT_TRUE(ge_p3_is_point_at_infinity_vartime(&r3));
 }

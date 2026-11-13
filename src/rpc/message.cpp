@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -42,6 +42,7 @@ const char* Message::STATUS_RETRY = "Retry";
 const char* Message::STATUS_FAILED = "Failed";
 const char* Message::STATUS_BAD_REQUEST = "Invalid request type";
 const char* Message::STATUS_BAD_JSON = "Malformed json";
+const char* Message::STATUS_REQUEST_TOO_LARGE = "Request too large";
 
 namespace
 {
@@ -62,6 +63,17 @@ const rapidjson::Value& get_method_field(const rapidjson::Value& src)
 }
 }
 
+void validate_id_field(const rapidjson::Value& src)
+{
+  const auto member = src.FindMember(id_field);
+  if (member == src.MemberEnd())
+    return;
+
+  // If present, JSON-RPC 2.0 request ids must be String, Number, or Null.
+  if (!member->value.IsString() && !member->value.IsNumber() && !member->value.IsNull())
+    throw cryptonote::json::WRONG_TYPE{"Expected string, number or null"};
+}
+
 void Message::toJson(rapidjson::Writer<epee::byte_stream>& dest) const
 {
   dest.StartObject();
@@ -80,8 +92,9 @@ FullMessage::FullMessage(std::string&& json_string, bool request)
 {
   /* Insitu parsing does not copy data from `contents` to DOM,
      accelerating string heavy content. */
-  doc.ParseInsitu(std::addressof(contents[0]));
-  if (doc.HasParseError() || !doc.IsObject())
+  rapidjson::InsituStringStream stream{std::addressof(contents[0])};
+  doc.ParseStream<rapidjson::kParseIterativeFlag | rapidjson::kParseInsituFlag>(stream);
+  if (doc.HasParseError() || stream.Tell() != contents.size() || !doc.IsObject())
   {
     throw cryptonote::json::PARSE_FAIL();
   }
@@ -92,6 +105,7 @@ FullMessage::FullMessage(std::string&& json_string, bool request)
   {
     get_method_field(doc); // throws on errors
     OBJECT_HAS_MEMBER_OR_THROW(doc, params_field)
+    validate_id_field(doc);
   }
   else
   {
@@ -104,7 +118,8 @@ FullMessage::FullMessage(std::string&& json_string, bool request)
 
 std::string FullMessage::getRequestType() const
 {
-  return get_method_field(doc).GetString();
+  const rapidjson::Value& method = get_method_field(doc);
+  return {method.GetString(), method.GetStringLength()};
 }
 
 const rapidjson::Value& FullMessage::getMessage() const
@@ -230,6 +245,15 @@ epee::byte_slice BAD_JSON(const std::string& error_details)
   Message fail;
   fail.status = Message::STATUS_BAD_JSON;
   fail.error_details = error_details;
+  return FullMessage::getResponse(fail, invalid);
+}
+
+epee::byte_slice REQUEST_TOO_LARGE()
+{
+  rapidjson::Value invalid;
+  Message fail;
+  fail.status = Message::STATUS_REQUEST_TOO_LARGE;
+  fail.error_details = "Request exceeds maximum message size.";
   return FullMessage::getResponse(fail, invalid);
 }
 

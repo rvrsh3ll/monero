@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -30,9 +30,12 @@
 
 if (WIN32 OR STATIC)
   add_definitions(-DSTATICLIB)
-  # miniupnp changed their static define
-  add_definitions(-DMINIUPNP_STATICLIB)
 endif ()
+
+set(STACK_TRACE_USE_WRAP OFF)
+if (STACK_TRACE AND NOT STATIC AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(STACK_TRACE_USE_WRAP ON)
+endif()
 
 function (monero_private_headers group)
   source_group("${group}\\Private"
@@ -77,37 +80,15 @@ function (monero_add_executable name)
   enable_stack_trace("${name}")
   
   monero_set_target_no_relink("${name}")
-endfunction ()
-
-function (monero_add_library name)
-    monero_add_library_with_deps(NAME "${name}" SOURCES ${ARGN})
-endfunction()
-
-function (monero_add_library_with_deps)
-  cmake_parse_arguments(MONERO_ADD_LIBRARY "" "NAME" "DEPENDS;SOURCES" ${ARGN})
-  source_group("${MONERO_ADD_LIBRARY_NAME}" FILES ${MONERO_ADD_LIBRARY_SOURCES})
-
-  # Define a ("virtual") object library and an actual library that links those
-  # objects together. The virtual libraries can be arbitrarily combined to link
-  # any subset of objects into one library archive. This is used for releasing
-  # libwallet, which combines multiple components.
-  set(objlib obj_${MONERO_ADD_LIBRARY_NAME})
-  add_library(${objlib} OBJECT ${MONERO_ADD_LIBRARY_SOURCES})
-  add_library("${MONERO_ADD_LIBRARY_NAME}" $<TARGET_OBJECTS:${objlib}>)
-  monero_set_target_no_relink("${MONERO_ADD_LIBRARY_NAME}")
-  if (MONERO_ADD_LIBRARY_DEPENDS)
-    add_dependencies(${objlib} ${MONERO_ADD_LIBRARY_DEPENDS})
-  endif()
-  set_property(TARGET "${MONERO_ADD_LIBRARY_NAME}" PROPERTY FOLDER "libs")
-  target_compile_definitions(${objlib}
-    PRIVATE $<TARGET_PROPERTY:${MONERO_ADD_LIBRARY_NAME},INTERFACE_COMPILE_DEFINITIONS>)
+  monero_set_target_strip    ("${name}")
 endfunction ()
 
 include(Version)
-monero_add_library(version SOURCES ${CMAKE_BINARY_DIR}/version.cpp DEPENDS genversion)
+monero_add_library(version SOURCES ${PROJECT_BINARY_DIR}/version.cpp DEPENDS genversion)
 
 add_subdirectory(common)
 add_subdirectory(crypto)
+add_subdirectory(fcmp_pp)
 add_subdirectory(ringct)
 add_subdirectory(checkpoints)
 add_subdirectory(cryptonote_basic)
@@ -118,6 +99,7 @@ add_subdirectory(net)
 add_subdirectory(hardforks)
 add_subdirectory(blockchain_db)
 add_subdirectory(mnemonics)
+add_subdirectory(mnemonics/polyseed)
 add_subdirectory(rpc)
 if(NOT IOS)
   add_subdirectory(serialization)

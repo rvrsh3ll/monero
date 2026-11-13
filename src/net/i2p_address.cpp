@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020, The Monero Project
+// Copyright (c) 2019-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -29,36 +29,28 @@
 #include "i2p_address.h"
 
 #include <algorithm>
-#include <boost/spirit/include/karma_generate.hpp>
-#include <boost/spirit/include/karma_uint.hpp>
 #include <cassert>
 #include <cstring>
-#include <limits>
 
 #include "net/error.h"
+#include "net/host.h"
 #include "serialization/keyvalue_serialization.h"
 #include "storages/portable_storage.h"
-#include "string_tools_lexical.h"
 
 namespace net
 {
     namespace
     {
-        // !TODO only b32 addresses right now
-        constexpr const char tld[] = u8".b32.i2p";
-        constexpr const char unknown_host[] = "<unknown i2p host>";
-
-        constexpr const unsigned b32_length = 52;
-
         constexpr const char base32_alphabet[] =
             u8"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz234567";
 
-        expect<void> host_check(boost::string_ref host) noexcept
+        //! Validate a Base32 address (.b32.i2p)
+        expect<void> host_check_b32(boost::string_ref host) noexcept
         {
-            if (!host.ends_with(tld))
+            if (!host.ends_with(tld_b32))
                 return {net::error::expected_tld};
 
-            host.remove_suffix(sizeof(tld) - 1);
+            host.remove_suffix(sizeof(tld_b32) - 1);
 
             if (host.size() != b32_length)
                 return {net::error::invalid_i2p_address};
@@ -68,10 +60,59 @@ namespace net
             return success();
         }
 
+        //! Validate a human-readable hostname (.i2p)
+        expect<void> host_check_human(boost::string_ref host) noexcept
+        {
+            if (!host.ends_with(tld_i2p))
+                return {net::error::expected_tld};
+
+            host.remove_suffix(sizeof(tld_i2p) - 1);
+
+            if (host.empty() || host.size() > i2p_name_max_length)
+                return {net::error::invalid_i2p_address};
+
+            //! Reject addresses starting or ending with a dot or hyphen
+            if (host.front() == '.' || host.front() == '-' ||
+                host.back() == '.' || host.back() == '-')
+                return {net::error::invalid_i2p_address};
+
+            //! Reject invalid characters, and two dots/hyphens in a row (or a dot next to a hyphen)
+            char previous = '\0';
+            for (const char c : host)
+            {
+                if (!(('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '.' || c == '-'))
+                {
+                    return {net::error::invalid_i2p_address};
+                }
+                if ((c == '.' || c == '-') && (previous == '.' || previous == '-'))
+                {
+                    return {net::error::invalid_i2p_address};
+                }
+                previous = c;
+            }
+
+            return success();
+        }
+
+        //! Use appropriate function for address validation
+        expect<void> host_check(boost::string_ref host) noexcept
+        {
+            if (host.ends_with(tld_b32))
+            {
+                return host_check_b32(host);
+            }
+            else if (host.ends_with(tld_i2p))
+            {
+                return host_check_human(host);
+            }
+
+            return {net::error::expected_tld};
+        }
+
         struct i2p_serialized
         {
             std::string host;
-            std::uint16_t port;
+            std::uint16_t port; //! Leave for compatibility with older clients
 
             BEGIN_KV_SERIALIZE_MAP()
                 KV_SERIALIZE(host)
@@ -80,8 +121,7 @@ namespace net
         };
     }
 
-    i2p_address::i2p_address(const boost::string_ref host, const std::uint16_t port) noexcept
-      : port_(port)
+    i2p_address::i2p_address(const boost::string_ref host) noexcept
     {
         // this is a private constructor, throw if moved to public
         assert(host.size() < sizeof(host_));
@@ -97,53 +137,51 @@ namespace net
     }
 
     i2p_address::i2p_address() noexcept
-      : port_(0)
     {
         static_assert(sizeof(unknown_host) <= sizeof(host_), "bad buffer size");
         std::memcpy(host_, unknown_host, sizeof(unknown_host));
         std::memset(host_ + sizeof(unknown_host), 0, sizeof(host_) - sizeof(unknown_host));
     }
 
-    expect<i2p_address> i2p_address::make(const boost::string_ref address, const std::uint16_t default_port)
+    expect<i2p_address> i2p_address::make(const boost::string_ref address)
     {
         boost::string_ref host = address.substr(0, address.rfind(':'));
-        const boost::string_ref port =
-            address.substr(host.size() + (host.size() == address.size() ? 0 : 1));
+        std::string normalized_host{host};
+        net::canonicalize_host(normalized_host);
+        MONERO_CHECK(host_check(normalized_host));
 
-        MONERO_CHECK(host_check(host));
+        static_assert(sizeof(i2p_address::host_) >= b32_length + sizeof(tld_b32) &&
+                      sizeof(i2p_address::host_) >= i2p_name_max_length + sizeof(tld_i2p));
 
-        std::uint16_t porti = default_port;
-        if (!port.empty() && !epee::string_tools::get_xtype_from_string(porti, std::string{port}))
-            return {net::error::invalid_port};
-
-        static_assert(b32_length + sizeof(tld) == sizeof(i2p_address::host_), "bad internal host size");
-        return i2p_address{host, porti};
+        return i2p_address{normalized_host};
     }
 
     bool i2p_address::_load(epee::serialization::portable_storage& src, epee::serialization::section* hparent)
     {
         i2p_serialized in{};
-        if (in._load(src, hparent) && in.host.size() < sizeof(host_) && (in.host == unknown_host || !host_check(in.host).has_error()))
+        if (in._load(src, hparent) && in.host.size() < sizeof(host_))
         {
-            std::memcpy(host_, in.host.data(), in.host.size());
-            std::memset(host_ + in.host.size(), 0, sizeof(host_) - in.host.size());
-            port_ = in.port;
-            return true;
+            net::canonicalize_host(in.host);
+            if (in.host == unknown_host || !host_check(in.host).has_error())
+            {
+                std::memcpy(host_, in.host.data(), in.host.size());
+                std::memset(host_ + in.host.size(), 0, sizeof(host_) - in.host.size());
+                return true;
+            }
         }
         static_assert(sizeof(unknown_host) <= sizeof(host_), "bad buffer size");
         std::memcpy(host_, unknown_host, sizeof(unknown_host)); // include null terminator
-        port_ = 0;
         return false;
     }
 
     bool i2p_address::store(epee::serialization::portable_storage& dest, epee::serialization::section* hparent) const
     {
-        const i2p_serialized out{std::string{host_}, port_};
+        // Set port to 1 for backwards compatibility; zero is invalid port
+        const i2p_serialized out{std::string{host_}, 1};
         return out.store(dest, hparent);
     }
 
     i2p_address::i2p_address(const i2p_address& rhs) noexcept
-      : port_(rhs.port_)
     {
         std::memcpy(host_, rhs.host_, sizeof(host_));
     }
@@ -152,7 +190,6 @@ namespace net
     {
         if (this != std::addressof(rhs))
         {
-            port_ = rhs.port_;
             std::memcpy(host_, rhs.host_, sizeof(host_));
         }
         return *this;
@@ -166,13 +203,12 @@ namespace net
 
     bool i2p_address::equal(const i2p_address& rhs) const noexcept
     {
-        return port_ == rhs.port_ && is_same_host(rhs);
+        return is_same_host(rhs);
     }
 
     bool i2p_address::less(const i2p_address& rhs) const noexcept
     {
-        int res = std::strcmp(host_str(), rhs.host_str());
-        return res < 0 || (res == 0 && port() < rhs.port());
+        return std::strcmp(host_str(), rhs.host_str()) < 0;
     }
 
     bool i2p_address::is_same_host(const i2p_address& rhs) const noexcept
@@ -182,20 +218,6 @@ namespace net
 
     std::string i2p_address::str() const
     {
-        const std::size_t host_length = std::strlen(host_str());
-        const std::size_t port_length =
-            port_ == 0 ? 0 : std::numeric_limits<std::uint16_t>::digits10 + 2;
-
-        std::string out{};
-        out.reserve(host_length + port_length);
-        out.assign(host_str(), host_length);
-
-        if (port_ != 0)
-        {
-            out.push_back(':');
-            namespace karma = boost::spirit::karma;
-            karma::generate(std::back_inserter(out), karma::ushort_, port());
-        }
-        return out;
+        return host_str();
     }
 }

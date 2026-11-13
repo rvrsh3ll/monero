@@ -1,3 +1,4 @@
+#include <math.h>
 #include "net/abstract_http_client.h"
 #include "net/http_base.h"
 #include "net/net_parse_helpers.h"
@@ -64,8 +65,8 @@ namespace net_utils
   std::string hex_to_dec_2bytes(const char *s)
   {
     const char *hex = get_hex_vals();
-    int i0 = get_index(hex, toupper(s[0]));
-    int i1 = get_index(hex, toupper(s[1]));
+    int i0 = get_index(hex, toupper(static_cast<unsigned char>(s[0])));
+    int i1 = get_index(hex, toupper(static_cast<unsigned char>(s[1])));
     if (i0 < 0 || i1 < 0)
       return std::string("%") + std::string(1, s[0]) + std::string(1, s[1]);
     return std::string(1, i0 * 16 | i1);
@@ -116,16 +117,6 @@ namespace net_utils
     return result;
   }
   //----------------------------------------------------------------------------------------------------
-  std::string convert_to_url_format_force_all(const std::string& uri)
-  {
-    std::string result;
-
-    for(size_t i = 0; i!= uri.size(); i++)
-    {
-        result += convert(uri[i]);
-    }
-    return result;
-  }
 
 namespace http
 {
@@ -135,6 +126,13 @@ namespace http
     http::url_content parsed{};
     const bool r = parse_url(address, parsed);
     CHECK_AND_ASSERT_MES(r, false, "failed to parse url: " << address);
+    if (parsed.port == 0)
+    {
+      if (parsed.schema == "http")
+        parsed.port = 80;
+      else if (parsed.schema == "https")
+        parsed.port = 443;
+    }
     set_server(std::move(parsed.host), std::to_string(parsed.port), std::move(user), std::move(ssl_options));
     return true;
   }

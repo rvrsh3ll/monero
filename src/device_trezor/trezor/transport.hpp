@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -32,13 +32,14 @@
 
 
 #include <boost/asio.hpp>
-#include <boost/asio/deadline_timer.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/array.hpp>
 #include <boost/utility/string_ref.hpp>
 
 #include <typeinfo>
 #include <type_traits>
 #include "net/http_client.h"
+#include "scope_guard.h"
 
 #include "rapidjson/document.h"
 #include "rapidjson/writer.h"
@@ -86,7 +87,7 @@ namespace trezor {
     additional_params.push_back(std::make_pair("Content-Type","application/json; charset=utf-8"));
 
     const http::http_response_info* pri = nullptr;
-    const auto data_cleaner = epee::misc_utils::create_scope_leave_handler([&]() {
+    const epee::scope_guard data_cleaner([&]() {
       if (!req_param.empty()) {
         memwipe(&req_param[0], req_param.size());
       }
@@ -233,19 +234,19 @@ namespace trezor {
 
   private:
     void require_socket();
-    ssize_t receive(void * buff, size_t size, boost::system::error_code * error_code=nullptr, bool no_throw=false, boost::posix_time::time_duration timeout=boost::posix_time::seconds(10));
+    ssize_t receive(void * buff, size_t size, boost::system::error_code * error_code=nullptr, bool no_throw=false, boost::asio::steady_timer::duration timeout = std::chrono::seconds(10));
     void check_deadline();
     static void handle_receive(const boost::system::error_code& ec, std::size_t length,
                                boost::system::error_code* out_ec, std::size_t* out_length);
-    bool ping_int(boost::posix_time::time_duration timeout=boost::posix_time::milliseconds(1500));
+    bool ping_int(boost::asio::steady_timer::duration = std::chrono::milliseconds(1500));
 
     std::shared_ptr<Protocol> m_proto;
     std::string m_device_host;
     int m_device_port;
 
     std::unique_ptr<udp::socket> m_socket;
-    boost::asio::io_service m_io_service;
-    boost::asio::deadline_timer m_deadline;
+    boost::asio::io_context m_io_service;
+    boost::asio::steady_timer m_deadline;
     udp::endpoint m_endpoint;
   };
 
@@ -383,7 +384,7 @@ namespace trezor {
                        boost::optional<messages::MessageType> resp_type = boost::none)
   {
     // Require strictly protocol buffers response in the template.
-    BOOST_STATIC_ASSERT(boost::is_base_of<google::protobuf::Message, t_message>::value);
+    static_assert(std::is_base_of_v<google::protobuf::Message, t_message>);
 
     // Write the request
     transport.write(req);

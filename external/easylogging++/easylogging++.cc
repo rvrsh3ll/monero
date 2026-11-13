@@ -16,6 +16,7 @@
 
 #define EASYLOGGING_CC
 #include "easylogging++.h"
+#include <cstdint>
 
 #include <atomic>
 #include <unistd.h>
@@ -149,6 +150,11 @@ static el::Color colorFromLevel(el::Level level)
 
 static void setConsoleColor(el::Color color, bool bright)
 {
+  static const char *no_color_var = getenv("NO_COLOR");
+  static const bool no_color = no_color_var && *no_color_var; // apparently, NO_COLOR=0 means no color too (as per no-color.org)
+  if (no_color)
+    return;
+
 #if ELPP_OS_WINDOWS
   HANDLE h_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
   switch (color)
@@ -714,9 +720,8 @@ Logger::Logger(const std::string& id, const Configurations& configurations,
 }
 
 Logger::Logger(const Logger& logger) {
-  base::utils::safeDelete(m_typedConfigurations);
   m_id = logger.m_id;
-  m_typedConfigurations = logger.m_typedConfigurations;
+  m_typedConfigurations = logger.m_typedConfigurations ? new base::TypedConfigurations(*logger.m_typedConfigurations) : nullptr;
   m_parentApplicationName = logger.m_parentApplicationName;
   m_isConfigured = logger.m_isConfigured;
   m_configurations = logger.m_configurations;
@@ -728,7 +733,7 @@ Logger& Logger::operator=(const Logger& logger) {
   if (&logger != this) {
     base::utils::safeDelete(m_typedConfigurations);
     m_id = logger.m_id;
-    m_typedConfigurations = logger.m_typedConfigurations;
+    m_typedConfigurations = logger.m_typedConfigurations ? new base::TypedConfigurations(*logger.m_typedConfigurations) : nullptr;
     m_parentApplicationName = logger.m_parentApplicationName;
     m_isConfigured = logger.m_isConfigured;
     m_configurations = logger.m_configurations;
@@ -1240,11 +1245,19 @@ std::string OS::currentHost(void) {
 #endif  // ELPP_OS_UNIX && !ELPP_OS_ANDROID
 }
 
+static bool endswith(const std::string &s, const std::string &ending)
+{
+    return s.size() >= ending.size() && s.substr(s.size() - ending.size()) == ending;
+}
+
+bool OS::termSupportsColor(std::string& term) {
+  return term == "xterm" || term == "screen" || term == "linux" || term == "cygwin"
+        || endswith(term, "-color") || endswith(term, "-256color");
+}
+
 bool OS::termSupportsColor(void) {
   std::string term = getEnvironmentVariable("TERM", "");
-  return term == "xterm" || term == "xterm-color" || term == "xterm-256color"
-         || term == "screen" || term == "linux" || term == "cygwin"
-         || term == "screen-256color" || term == "screen.xterm-256color";
+  return termSupportsColor(term);
 }
 
 // DateTime
@@ -2490,11 +2503,11 @@ void DefaultLogDispatchCallback::handle(const LogDispatchData* data) {
 
 
 template<typename Transform>
-static inline void utf8canonical(std::string &s, Transform t = [](wint_t c)->wint_t { return c; })
+static inline void utf8canonical(std::string &s, Transform t = [](std::uint32_t c)->std::uint32_t { return c; })
 {
     size_t avail = s.size();
     const char *ptr = s.data();
-    wint_t cp = 0;
+    std::uint32_t cp = 0;
     int rbytes = 1, bytes = -1;
     char wbuf[8], *wptr;
     size_t w_offset = 0;
@@ -2573,7 +2586,7 @@ static inline void utf8canonical(std::string &s, Transform t = [](wint_t c)->win
 
 void sanitize(std::string &s)
 {
-  utf8canonical(s, [](wint_t c)->wint_t {
+  utf8canonical(s, [](std::uint32_t c)->std::uint32_t {
     if (c == 9 || c == 10 || c == 13)
       return c;
     if (c < 0x20)
@@ -2985,8 +2998,8 @@ void Writer::initializeLogger(Logger *logger, bool needLock) {
 }
 
 void Writer::processDispatch() {
-  static std::atomic_flag in_dispatch;
-  if (in_dispatch.test_and_set())
+  static __thread bool in_dispatch = false;
+  if (in_dispatch)
   {
     if (m_proceed && m_logger != NULL)
     {
@@ -2995,6 +3008,7 @@ void Writer::processDispatch() {
     }
     return;
   }
+  in_dispatch = true;
 #if ELPP_LOGGING_ENABLED
   if (ELPP->hasFlag(LoggingFlag::MultiLoggerSupport)) {
     bool firstDispatched = false;
@@ -3033,7 +3047,7 @@ void Writer::processDispatch() {
     m_logger->releaseLock();
   }
 #endif // ELPP_LOGGING_ENABLED
-  in_dispatch.clear();
+  in_dispatch = false;
 }
 
 void Writer::triggerDispatch(void) {
@@ -3052,8 +3066,9 @@ void Writer::triggerDispatch(void) {
   }
   if (m_proceed && m_level == Level::Fatal
       && !ELPP->hasFlag(LoggingFlag::DisableApplicationAbortOnFatalLog)) {
+    const std::string str = "Aborting application. Reason: Fatal log at [" + std::string(m_file) + ":" + std::to_string(m_line) + "]";
     base::Writer(Level::Warning, Color::Default, m_file, m_line, m_func).construct(1, base::consts::kDefaultLoggerId)
-        << "Aborting application. Reason: Fatal log at [" << m_file << ":" << m_line << "]";
+        << str;
     std::stringstream reasonStream;
     reasonStream << "Fatal log at [" << m_file << ":" << m_line << "]"
                  << " If you wish to disable 'abort on fatal log' please use "

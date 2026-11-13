@@ -2,32 +2,39 @@
 
 #include <streambuf>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace rdln
 {
   typedef enum { empty, partial, full } linestatus;
-  class readline_buffer : public std::stringbuf
+  class readline_buffer : public std::streambuf
   {
   public:
     readline_buffer();
+    ~readline_buffer();
     void start();
     void stop();
+    // Stop, and make any later start() do nothing.
+    void close();
     bool is_running() const
     {
       return m_cout_buf != NULL;
     }
-    linestatus get_line(std::string& line) const;
+    linestatus get_line(std::string& line);
     void set_prompt(const std::string& prompt);
     static void add_completion(const std::string& command);
     static const std::vector<std::string>& get_completions();
     
   protected:
     virtual int sync();
+    virtual int_type overflow(int_type c);
+    virtual std::streamsize xsputn(const char* s, std::streamsize n);
 
   private:
     std::streambuf* m_cout_buf;
-    size_t m_prompt_length;
+    std::string m_pending;
+    bool m_closed;
     static std::vector<std::string>& completion_commands();
   };
   
@@ -43,4 +50,3 @@ namespace rdln
 
   void clear_screen();
 }
-

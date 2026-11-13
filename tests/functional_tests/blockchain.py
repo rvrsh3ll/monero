@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2018 The Monero Project
+# Copyright (c) 2018-2024, The Monero Project
+
 # 
 # All rights reserved.
 # 
@@ -28,7 +29,8 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from __future__ import print_function
+import os
+import subprocess
 import time
 
 """Test daemon blockchain RPC calls
@@ -43,12 +45,16 @@ Test the following RPCs:
 """
 
 from framework.daemon import Daemon
+from framework.wallet import Wallet
 
 class BlockchainTest():
     def run_test(self):
         self.reset()
+        self._test_generate_blocks_command()
+        self.reset()
         self._test_generateblocks(5)
         self._test_alt_chains()
+        self.test_get_blocks_fast()
 
     def reset(self):
         print('Resetting blockchain')
@@ -57,12 +63,46 @@ class BlockchainTest():
         daemon.pop_blocks(res.height - 1)
         daemon.flush_txpool()
 
+    def _test_generate_blocks_command(self):
+        print('Test generating blocks with the daemon command')
+        daemon = Daemon()
+        address = '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
+        build_dir = os.path.dirname(os.path.dirname(os.environ['FUNCTIONAL_TESTS_DIRECTORY']))
+        monerod = os.path.join(build_dir, 'bin', 'monerod')
+
+        def run_command(*args):
+            return subprocess.run([monerod, '--rpc-bind-port', '18180', '--rpc-ssl', 'disabled', 'generate_blocks', address, *args],
+                                  capture_output = True, text = True, timeout = 120)
+
+        height = daemon.get_height().height
+        for args in [('1',), ('1', '1000000000')]:
+            result = run_command(*args)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert 'Generated 1 block' in result.stdout, result.stdout + result.stderr
+            height += 1
+            assert daemon.get_height().height == height
+            if len(args) == 2:
+                assert daemon.getblockheaderbyheight(height - 1).block_header.nonce >= 1000000000
+
+        for args in [('1x',), ('1', '4294967296')]:
+            result = run_command(*args)
+            assert 'Invalid syntax' in result.stdout, result.stdout + result.stderr
+            assert daemon.get_height().height == height
+
+    def _check_blocktemplate_reserved_offset(self, daemon, address, reserve_size):
+        res = daemon.getblocktemplate(address, reserve_size = reserve_size)
+        assert res.reserved_offset > 0
+        block_blob = bytes.fromhex(res.blocktemplate_blob)
+        reserved_bytes = block_blob[res.reserved_offset:res.reserved_offset + reserve_size]
+        assert reserved_bytes == bytes(reserve_size)
+
     def _test_generateblocks(self, blocks):
         assert blocks >= 2
 
         print("Test generating", blocks, 'blocks')
 
         daemon = Daemon()
+        address = '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
 
         # check info/height before generating blocks
         res_info = daemon.get_info()
@@ -80,13 +120,13 @@ class BlockchainTest():
         assert ok
 
         res = daemon.get_fee_estimate()
-        assert res.fee == 234562
+        assert res.fee == 1200000
         assert res.quantization_mask == 10000
         res = daemon.get_fee_estimate(10)
-        assert res.fee <= 234562
+        assert res.fee <= 1200000
 
         # generate blocks
-        res_generateblocks = daemon.generateblocks('42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm', blocks)
+        res_generateblocks = daemon.generateblocks(address, blocks)
 
         # check info/height after generateblocks blocks
         assert res_generateblocks.height == height + blocks - 1
@@ -131,14 +171,19 @@ class BlockchainTest():
         assert res_getblockheaderbyheight.block_header == block_header
 
         # getting a block template after that should have the right height, etc
-        res_getblocktemplate = daemon.getblocktemplate('42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm')
+        res_getblocktemplate = daemon.getblocktemplate(address)
         assert res_getblocktemplate.height == height + blocks
         assert res_getblocktemplate.reserved_offset > 0
         assert res_getblocktemplate.prev_hash == res_info.top_block_hash
         assert res_getblocktemplate.expected_reward >= 600000000000
+        assert res_getblocktemplate.cumulative_weight > 0
         assert len(res_getblocktemplate.blocktemplate_blob) > 0
         assert len(res_getblocktemplate.blockhashing_blob) > 0
         assert int(res_getblocktemplate.wide_difficulty, 16) == (res_getblocktemplate.difficulty_top64 << 64) + res_getblocktemplate.difficulty
+
+        # 255 matches TX_EXTRA_NONCE_MAX_COUNT in the C++ code.
+        for reserve_size in (1, 127, 128, 255):
+            self._check_blocktemplate_reserved_offset(daemon, address, reserve_size)
 
         # diff etc should be the same
         assert res_getblocktemplate.prev_hash == res_info.top_block_hash
@@ -218,9 +263,12 @@ class BlockchainTest():
         assert res.emission_amount < extrapolated and res.emission_amount > extrapolated - 1e12
         assert res.fee_amount == 0
         sum_blocks_emission = res.emission_amount
-        res = daemon.get_coinbase_tx_sum(1, sum_blocks)
+        res = daemon.get_coinbase_tx_sum(1, sum_blocks - 1)
         assert res.emission_amount == sum_blocks_emission - 17592186044415
         assert res.fee_amount == 0
+        # height + count must not exceed the blockchain height
+        res = daemon.get_coinbase_tx_sum(1, sum_blocks)
+        assert res.status != 'OK'
 
         res = daemon.get_output_distribution([0, 1, 17592186044415], 0, 0)
         assert len(res.distributions) == 3
@@ -242,10 +290,10 @@ class BlockchainTest():
             assert res.histogram[i].recent_instances == 0
 
         res = daemon.get_fee_estimate()
-        assert res.fee == 234560
+        assert res.fee == 1200000
         assert res.quantization_mask == 10000
         res = daemon.get_fee_estimate(10)
-        assert res.fee <= 234560
+        assert res.fee <= 1200000
 
     def _test_alt_chains(self):
         print('Testing alt chains')
@@ -338,6 +386,102 @@ class BlockchainTest():
 
         print('Saving blockchain explicitely')
         daemon.save_bc()
+
+    def test_get_blocks_fast(self):
+        print('Testing the /get_blocks.bin RPC endpoint')
+
+        daemon = Daemon()
+
+        n_blocks = daemon.get_height()['height']
+        assert(n_blocks >= 3)
+
+        genesis_block_id = daemon.getblockheaderbyheight(0)['block_header']['hash']
+
+        target_block_index = n_blocks-1
+        target_block_id = daemon.getblockheaderbyheight(target_block_index)['block_header']['hash']
+
+        print('First, mining to wallet and creating 2 transactions in the top block')
+
+        wallet = Wallet()
+        seed = 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
+        main_address = '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
+
+        try: wallet.close_wallet()
+        except: pass
+        wallet.auto_refresh(enable = False)
+        wallet.restore_deterministic_wallet(seed)
+        assert wallet.get_transfers() == {}
+        assert wallet.get_address().address == main_address
+
+        wallet.refresh()
+        res = wallet.get_transfers()
+        assert len(res['in']) > 0
+        first_recv_height = res['in'][0]['height']
+
+        N_TO_MINE = 20 + max(0, first_recv_height + 60 - n_blocks)
+        daemon.generateblocks(main_address, N_TO_MINE)
+        wallet.refresh()
+
+        dst = {'address': '8BQKgTSSqJjP14AKnZUBwnXWj46MuNmLvHfPTpmry52DbfNjjHVvHUk4mczU8nj8yZ57zBhksTJ8kM5xKeJXw55kCMVqyG7', 'amount': 1000000000000}
+
+        res = wallet.get_transfers()
+        assert len(res['in']) >= N_TO_MINE
+        last_recv_height = max(x['height'] for x in res['in'])
+        assert last_recv_height == n_blocks + N_TO_MINE - 1, last_recv_height
+        assert wallet.get_balance().unlocked_balance > dst['amount'] * 2
+
+        res = wallet.transfer([dst])
+        res = wallet.transfer([dst])
+
+        assert len(daemon.get_transaction_pool_hashes()['tx_hashes']) == 2
+
+        daemon.generateblocks(main_address, 1)
+
+        print('Calling /get_blocks.bin (blocks only) and testing response...')
+
+        res = daemon.get_blocks_fast(0, [target_block_id, genesis_block_id])
+        assert len(res.blocks) == N_TO_MINE + 1 + 1
+        assert len(res.blocks) == len(res.output_indices)
+
+        for i in range(len(res.blocks)):
+            is_last = i == len(res.blocks) - 1
+            block = res.blocks[i]
+            assert block.pruned
+            block_indices = res.output_indices[i]['indices']
+            n_txs = len(block['txs']) if 'txs' in block else 0
+            if is_last:
+                assert n_txs == 2
+                assert len(block_indices) == 3
+            else:
+                assert n_txs == 0
+                assert len(block_indices) == 1
+            for tx_idx in range(n_txs):
+                tx = block.txs[tx_idx]
+                tx_indices = block_indices[1 + tx_idx]['indices']
+                assert tx.prunable_hash != (b'\0' * 32) # non-null
+                assert len(tx_indices) == 2
+
+        print('Calling /get_blocks.bin (blocks and incremental pool, no new blocks) and testing response...')
+
+        time.sleep(1)
+        res = daemon.get_blocks_fast(0, [], requested_info = 2)
+        assert res.pool_info_extent == 2
+        pool_info_since = res.daemon_time
+
+        wallet.refresh()
+        pending_txid = wallet.transfer([dst]).tx_hash
+        current_height = daemon.get_height().height
+
+        res = daemon.get_blocks_fast(
+            current_height,
+            [],
+            requested_info = 1,
+            pool_info_since = pool_info_since)
+        assert not res.get('blocks')
+        assert res.pool_info_extent == 1
+        assert [tx.tx_hash.hex() for tx in res.added_pool_txs] == [pending_txid]
+
+        daemon.flush_txpool([pending_txid])
 
 
 if __name__ == '__main__':

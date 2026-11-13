@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -37,6 +37,7 @@
 #include <boost/utility/string_ref.hpp>
 #include <chrono>
 #include <utility>
+#include <tuple>
 
 #include "common/command_line.h"
 #include "cryptonote_core/cryptonote_core.h"
@@ -54,6 +55,7 @@ namespace
 {
     constexpr const boost::chrono::milliseconds future_poll_interval{500};
     constexpr const std::chrono::seconds socks_connect_timeout{P2P_DEFAULT_SOCKS_CONNECT_TIMEOUT};
+    constexpr const std::chrono::seconds sam_connect_timeout{P2P_DEFAULT_I2P_SAM_CONNECT_TIMEOUT};
 
     std::int64_t get_max_connections(const boost::iterator_range<boost::string_ref::const_iterator> value) noexcept
     {
@@ -67,21 +69,18 @@ namespace
         return 0;
     }
 
-    template<typename T>
-    epee::net_utils::network_address get_address(const boost::string_ref value)
+    boost::optional<std::int64_t> get_i2p_sam_max_connections(const boost::iterator_range<boost::string_ref::const_iterator> value)
     {
-        expect<T> address = T::make(value);
-        if (!address)
-        {
-            MERROR(
-                "Failed to parse " << epee::net_utils::zone_to_string(T::get_zone()) << " address \"" << value << "\": " << address.error().message()
-            );
-            return {};
-        }
-        return {std::move(*address)};
+        if (value.empty())
+            return std::int64_t{-1};
+
+        std::uint32_t out = 0;
+        if (!epee::string_tools::get_xtype_from_string(out, std::string{value.begin(), value.end()}))
+            return boost::none;
+        return std::int64_t{out};
     }
 
-    bool start_socks(std::shared_ptr<net::socks::client> client, const boost::asio::ip::tcp::endpoint& proxy, const epee::net_utils::network_address& remote)
+    bool start_socks(std::shared_ptr<net::socks::client> client, const net::socks::endpoint& proxy, const boost::asio::ip::tcp::endpoint& proxy_address, const epee::net_utils::network_address& remote)
     {
         CHECK_AND_ASSERT_MES(client != nullptr, false, "Unexpected null client");
 
@@ -89,20 +88,37 @@ namespace
         switch (remote.get_type_id())
         {
         case net::tor_address::get_type_id():
-            set = client->set_connect_command(remote.as<net::tor_address>());
+            set = client->set_connect_command(remote.as<net::tor_address>(), std::addressof(proxy.userinfo));
             break;
         case net::i2p_address::get_type_id():
-            set = client->set_connect_command(remote.as<net::i2p_address>());
+            set = client->set_connect_command(remote.as<net::i2p_address>(), std::addressof(proxy.userinfo));
             break;
+        case epee::net_utils::ipv4_network_address::get_type_id():
+            set = client->set_connect_command(remote.as<epee::net_utils::ipv4_network_address>(), std::addressof(proxy.userinfo));
+            break;
+        case epee::net_utils::ipv6_network_address::get_type_id():
+            if (client->socks_version() == net::socks::version::v5)
+            {
+                set = client->set_connect_command(remote.as<epee::net_utils::ipv6_network_address>(), std::addressof(proxy.userinfo));
+                break;
+            }
+            [[fallthrough]];
         default:
-            MERROR("Unsupported network address in socks_connect");
+            MERROR("Unsupported network address in socks_connect. Try socks5://");
             return false;
         }
 
         const bool sent =
-            set && net::socks::client::connect_and_send(std::move(client), proxy);
+            set && net::socks::client::connect_and_send(std::move(client), proxy_address);
         CHECK_AND_ASSERT_MES(sent, false, "Unexpected failure to init socks client");
         return true;
+    }
+
+    [[nodiscard]] bool start_sam(std::shared_ptr<net::sam::client> client, const boost::asio::ip::tcp::endpoint& router, const net::i2p_address& remote)
+    {
+        CHECK_AND_ASSERT_MES(client != nullptr, false, "Unexpected null client");
+        if (!client->set_connect_command(remote)) return false;
+        return net::sam::client::connect_and_send(std::move(client), router);
     }
 }
 
@@ -144,18 +160,19 @@ namespace nodetool
     const command_line::arg_descriptor<std::vector<std::string> > arg_p2p_add_exclusive_node   = {"add-exclusive-node", "Specify list of peers to connect to only."
                                                                                                   " If this option is given the options add-priority-node and seed-node are ignored"};
     const command_line::arg_descriptor<std::vector<std::string> > arg_p2p_seed_node   = {"seed-node", "Connect to a node to retrieve peer addresses, and disconnect"};
-    const command_line::arg_descriptor<std::vector<std::string> > arg_tx_proxy = {"tx-proxy", "Send local txes through proxy: <network-type>,<socks-ip:port>[,max_connections][,disable_noise] i.e. \"tor,127.0.0.1:9050,100,disable_noise\""};
+    const command_line::arg_descriptor<std::vector<std::string> > arg_tx_proxy = {"tx-proxy", "Send local txes through proxy: <network-type>,[socks5://[user:pass@]]<socks-host:port>[,max_connections][,disable_noise] i.e. \"tor,127.0.0.1:9050,100,disable_noise\""};
     const command_line::arg_descriptor<std::vector<std::string> > arg_anonymous_inbound = {"anonymous-inbound", "<hidden-service-address>,<[bind-ip:]port>[,max_connections] i.e. \"x.onion,127.0.0.1:18083,100\""};
+    const command_line::arg_descriptor<std::string> arg_i2p_sam = {"i2p-sam", "Use I2P router's SAM bridge for proxying network traffic: <router-ip:sam-port>[,max_out_connections[,max_in_connections]] i.e. \"127.0.0.1:7656,32,0\" (0 disables that direction). Inbound keeps a persistent I2P key in the data directory, and its address is announced to peers"};
     const command_line::arg_descriptor<std::string> arg_ban_list = {"ban-list", "Specify ban list file, one IP address per line"};
     const command_line::arg_descriptor<bool> arg_p2p_hide_my_port   =    {"hide-my-port", "Do not announce yourself as peerlist candidate", false, true};
     const command_line::arg_descriptor<bool> arg_no_sync = {"no-sync", "Don't synchronize the blockchain with other peers", false};
     const command_line::arg_descriptor<bool> arg_enable_dns_blocklist = {"enable-dns-blocklist", "Apply realtime blocklist from DNS", false};
 
     const command_line::arg_descriptor<bool>        arg_no_igd  = {"no-igd", "Disable UPnP port mapping"};
-    const command_line::arg_descriptor<std::string> arg_igd = {"igd", "UPnP port mapping (disabled, enabled, delayed)", "delayed"};
+    const command_line::arg_descriptor<std::string> arg_igd = {"igd", "UPnP port mapping (disabled)", "disabled"};
     const command_line::arg_descriptor<bool>        arg_p2p_use_ipv6  = {"p2p-use-ipv6", "Enable IPv6 for p2p", false};
     const command_line::arg_descriptor<bool>        arg_p2p_ignore_ipv4  = {"p2p-ignore-ipv4", "Ignore unsuccessful IPv4 bind for p2p", false};
-    const command_line::arg_descriptor<int64_t>     arg_out_peers = {"out-peers", "set max number of out peers", -1};
+    const command_line::arg_descriptor<int64_t>     arg_out_peers = {"out-peers", "set max number of out peers", P2P_DEFAULT_CONNECTIONS_COUNT};
     const command_line::arg_descriptor<int64_t>     arg_in_peers = {"in-peers", "set max number of in peers", -1};
     const command_line::arg_descriptor<int> arg_tos_flag = {"tos-flag", "set TOS flag", -1};
 
@@ -166,7 +183,7 @@ namespace nodetool
     const command_line::arg_descriptor<bool> arg_pad_transactions = {
       "pad-transactions", "Pad relayed transactions to help defend against traffic volume analysis", false
     };
-    const command_line::arg_descriptor<uint32_t> arg_max_connections_per_ip = {"max-connections-per-ip", "Maximum number of connections allowed from the same IP address", 1};
+    const command_line::arg_descriptor<uint32_t> arg_max_connections_per_ip = {"max-connections-per-ip", "Maximum number of inbound p2p connections allowed from the same IPv4 address or shared across a public IPv6 /64 subnet", 1};
 
     boost::optional<std::vector<proxy>> get_proxies(boost::program_options::variables_map const& vm)
     {
@@ -186,7 +203,7 @@ namespace nodetool
             const boost::string_ref zone{next->begin(), next->size()};
 
             ++next;
-            CHECK_AND_ASSERT_MES(!next.eof() && !next->empty(), boost::none, "No ipv4:port given for --" << arg_tx_proxy.name);
+            CHECK_AND_ASSERT_MES(!next.eof() && !next->empty(), boost::none, "No host:port given for --" << arg_tx_proxy.name);
             const boost::string_ref proxy{next->begin(), next->size()};
 
             ++next;
@@ -224,14 +241,14 @@ namespace nodetool
                 return boost::none;
             }
 
-            std::uint32_t ip = 0;
-            std::uint16_t port = 0;
-            if (!epee::string_tools::parse_peer_from_string(ip, port, std::string{proxy}) || port == 0)
+            auto endpoint = net::socks::endpoint::get(proxy, true);
+            if (!endpoint)
             {
-                MERROR("Invalid ipv4:port given for --" << arg_tx_proxy.name);
+                MERROR("Invalid --" << arg_tx_proxy.name << " value: " << endpoint.error().message());
                 return boost::none;
             }
-            proxies.back().address = ip::tcp::endpoint{ip::address_v4{boost::endian::native_to_big(ip)}, port};
+
+            proxies.back().address = std::move(*endpoint);
         }
 
         return proxies;
@@ -253,11 +270,10 @@ namespace nodetool
             const boost::string_ref address{next->begin(), next->size()};
 
             ++next;
-            CHECK_AND_ASSERT_MES(!next.eof() && !next->empty(), boost::none, "No local ipv4:port given for --" << arg_anonymous_inbound.name);
+            CHECK_AND_ASSERT_MES(!next.eof() && !next->empty(), boost::none, "No local port given for --" << arg_anonymous_inbound.name);
             const boost::string_ref bind{next->begin(), next->size()};
-
-            const std::size_t colon = bind.find_first_of(':');
-            CHECK_AND_ASSERT_MES(colon < bind.size(), boost::none, "No local port given for --" << arg_anonymous_inbound.name);
+            const std::string local_bind = bind.find(':') == boost::string_ref::npos ? "127.0.0.1:" + std::string{bind} : std::string{bind};
+            const std::size_t colon = local_bind.find(':');
 
             ++next;
             if (!next.eof())
@@ -286,22 +302,54 @@ namespace nodetool
                 return boost::none;
             }
 
-            // get_address returns default constructed address on error
             if (inbounds.back().our_address == epee::net_utils::network_address{})
                 return boost::none;
 
             std::uint32_t ip = 0;
             std::uint16_t port = 0;
-            if (!epee::string_tools::parse_peer_from_string(ip, port, std::string{bind}))
+            if (!epee::string_tools::parse_peer_from_string(ip, port, local_bind))
             {
                 MERROR("Invalid ipv4:port given for --" << arg_anonymous_inbound.name);
                 return boost::none;
             }
-            inbounds.back().local_ip = std::string{bind.substr(0, colon)};
-            inbounds.back().local_port = std::string{bind.substr(colon + 1)};
+            inbounds.back().local_ip = local_bind.substr(0, colon);
+            inbounds.back().local_port = local_bind.substr(colon + 1);
         }
 
         return inbounds;
+    }
+
+    boost::optional<i2p_sam_config> get_i2p_sam_config(const boost::program_options::variables_map& vm)
+    {
+        i2p_sam_config out{};
+
+        const std::string arg = command_line::get_arg(vm, arg_i2p_sam);
+        const boost::string_ref arg_ref{arg};
+
+        auto next = boost::algorithm::make_split_iterator(arg_ref, boost::algorithm::first_finder(","));
+        CHECK_AND_ASSERT_MES(!next.eof() && !next->empty(), boost::none, "No ip:port given for --" << arg_i2p_sam.name);
+        out.endpoint = std::string{next->begin(), next->size()};
+
+        ++next;
+        for (unsigned int count = 0; !next.eof(); ++count, ++next)
+        {
+            if (2 <= count)
+            {
+                MERROR("Too many ',' characters given to --" << arg_i2p_sam.name);
+                return boost::none;
+            }
+
+            const auto max_connections = get_i2p_sam_max_connections(*next);
+            if (!max_connections)
+            {
+                MERROR("Invalid max connections given to --" << arg_i2p_sam.name);
+                return boost::none;
+            }
+
+            (count == 0 ? out.max_out_connections : out.max_in_connections) = *max_connections;
+        }
+
+        return out;
     }
 
     bool is_filtered_command(const epee::net_utils::network_address& address, int command)
@@ -324,7 +372,7 @@ namespace nodetool
     }
 
     boost::optional<boost::asio::ip::tcp::socket>
-    socks_connect_internal(const std::atomic<bool>& stop_signal, boost::asio::io_service& service, const boost::asio::ip::tcp::endpoint& proxy, const epee::net_utils::network_address& remote)
+    socks_connect_attempt(const std::atomic<bool>& stop_signal, boost::asio::io_context& service, const net::socks::endpoint& proxy, const boost::asio::ip::tcp::endpoint& proxy_address, const epee::net_utils::network_address& remote)
     {
         using socket_type = net::socks::client::stream_type::socket;
         using client_result = std::pair<boost::system::error_code, socket_type>;
@@ -339,15 +387,17 @@ namespace nodetool
             }
         };
 
+        net::socks::client::close_on_exit close_client{};
         boost::unique_future<client_result> socks_result{};
         {
             boost::promise<client_result> socks_promise{};
             socks_result = socks_promise.get_future();
 
             auto client = net::socks::make_connect_client(
-                boost::asio::ip::tcp::socket{service}, net::socks::version::v4a, notify{std::move(socks_promise)}
+                boost::asio::ip::tcp::socket{service}, proxy.ver, notify{std::move(socks_promise)}
              );
-            if (!start_socks(std::move(client), proxy, remote))
+            close_client.self = client;
+            if (!start_socks(std::move(client), proxy, proxy_address, remote))
                 return boost::none;
         }
 
@@ -356,7 +406,7 @@ namespace nodetool
         {
             if (socks_connect_timeout < std::chrono::steady_clock::now() - start)
             {
-                MERROR("Timeout on socks connect (" << proxy << " to " << remote.str() << ")");
+                MERROR("Timeout on socks connect (" << proxy_address << " to " << remote.str() << ")");
                 return boost::none;
             }
 
@@ -368,13 +418,95 @@ namespace nodetool
         {
             auto result = socks_result.get();
             if (!result.first)
+            {
+                close_client.self.reset();
                 return {std::move(result.second)};
+            }
 
-            MERROR("Failed to make socks connection to " << remote.str() << " (via " << proxy << "): " << result.first.message());
+            MERROR("Failed to make socks connection to " << remote.str() << " (via " << proxy_address << "): " << result.first.message());
         }
         catch (boost::broken_promise const&)
         {}
 
+        return boost::none;
+    }
+
+    boost::optional<std::pair<boost::asio::ip::tcp::socket, std::string>>
+    sam_connect_internal(const std::atomic<bool>& stop_signal, boost::asio::io_context& service, const boost::asio::ip::tcp::endpoint& router, const net::i2p_address& remote, const std::string& session_id)
+    {
+        using socket_type = net::sam::client::stream_type::socket;
+        using client_result = std::tuple<boost::system::error_code, socket_type, std::string>;
+
+        struct notify
+        {
+            boost::promise<client_result> sam_promise;
+
+            void operator()(boost::system::error_code error, socket_type&& sock, std::string&& initial_data)
+            {
+                sam_promise.set_value(std::make_tuple(error, std::move(sock), std::move(initial_data)));
+            }
+        };
+
+        net::sam::client::close_on_exit close_client{};
+        boost::unique_future<client_result> sam_result{};
+        {
+            boost::promise<client_result> sam_promise{};
+            sam_result = sam_promise.get_future();
+
+            auto client = net::sam::make_connect_client(
+                boost::asio::ip::tcp::socket{service}, notify{std::move(sam_promise)}
+            );
+            close_client.self = client;
+
+            client->set_session_id(session_id);
+
+            if (!start_sam(std::move(client), router, remote))
+                return boost::none;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        while (sam_result.wait_for(future_poll_interval) == boost::future_status::timeout)
+        {
+            if (sam_connect_timeout < std::chrono::steady_clock::now() - start)
+            {
+                MERROR("Timeout on SAM connect (" << router << " to " << remote.str() << ")");
+                return boost::none;
+            }
+
+            if (stop_signal) return boost::none;
+        }
+
+        try
+        {
+            auto result = sam_result.get();
+            const auto& error = std::get<0>(result);
+            if (!error)
+            {
+                close_client.self.reset();
+                return {std::make_pair(std::move(std::get<1>(result)), std::move(std::get<2>(result)))};
+            }
+
+            MERROR("Failed to make SAM connection to " << remote.str() << " (via " << router << "): " << error.message());
+        }
+        catch (const boost::broken_promise&) {}
+
+        return boost::none;
+    }
+
+    boost::optional<boost::asio::ip::tcp::socket>
+    socks_connect_internal(const std::atomic<bool>& stop_signal, boost::asio::io_context& service, const net::socks::endpoint& proxy, const epee::net_utils::network_address& remote)
+    {
+        if (proxy.resolved_addresses.empty())
+            return socks_connect_attempt(stop_signal, service, proxy, proxy.address, remote);
+
+        for (const auto& address : proxy.resolved_addresses)
+        {
+            if (stop_signal)
+                break;
+            auto socket = socks_connect_attempt(stop_signal, service, proxy, address, remote);
+            if (socket)
+                return socket;
+        }
         return boost::none;
     }
 }

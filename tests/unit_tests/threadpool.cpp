@@ -1,4 +1,5 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
+
 // 
 // All rights reserved.
 // 
@@ -27,6 +28,7 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <atomic>
+#include <stdexcept>
 #include "gtest/gtest.h"
 #include "misc_language.h"
 #include "common/threadpool.h"
@@ -63,6 +65,23 @@ TEST(threadpool, one_thread)
   ASSERT_EQ(counter, 4096);
 }
 
+TEST(threadpool, inline_exception_restores_depth)
+{
+  std::shared_ptr<tools::threadpool> tpool(tools::threadpool::getNewForUnitTests(1));
+  bool ran = false;
+  tools::threadpool::waiter waiter(*tpool);
+  tpool->submit(&waiter, [&] {
+    // A nested non-leaf task runs inline, including on the waiting thread.
+    EXPECT_THROW(tpool->submit(&waiter, [] { throw std::runtime_error("test"); }), std::runtime_error);
+    EXPECT_THROW(tpool->submit(&waiter, [] { throw 1; }), int);
+  });
+  ASSERT_TRUE(waiter.wait());
+  tpool->submit(&waiter, [&] { ran = true; });
+  EXPECT_FALSE(ran);
+  ASSERT_TRUE(waiter.wait());
+  EXPECT_TRUE(ran);
+}
+
 TEST(threadpool, many_threads)
 {
   std::shared_ptr<tools::threadpool> tpool(tools::threadpool::getNewForUnitTests(256));
@@ -87,16 +106,6 @@ static uint64_t fibonacci(std::shared_ptr<tools::threadpool> tpool, uint64_t n)
   tpool->submit(&waiter, [&tpool, &f2, n](){ f2 = fibonacci(tpool, n-2); });
   waiter.wait();
   return f1 + f2;
-}
-
-TEST(threadpool, reentrency)
-{
-  std::shared_ptr<tools::threadpool> tpool(tools::threadpool::getNewForUnitTests(4));
-  tools::threadpool::waiter waiter(*tpool);
-
-  uint64_t f = fibonacci(tpool, 13);
-  waiter.wait();
-  ASSERT_EQ(f, 233);
 }
 
 TEST(threadpool, reentrancy)
@@ -143,4 +152,64 @@ TEST(threadpool, leaf_reentrancy)
   }
   waiter.wait();
   ASSERT_EQ(counter, 500000);
+}
+
+static bool check_test_and_set(const std::size_t n, const std::function<bool(std::size_t)> &fail_condition)
+{
+  std::shared_ptr<tools::threadpool> tpool(tools::threadpool::getNewForUnitTests(std::max<std::size_t>(n, 1)));
+  tools::threadpool::waiter waiter(*tpool);
+
+  std::atomic_flag fail_occurred{};
+  for (std::size_t i = 0; i < n; ++i)
+  {
+    tpool->submit(&waiter, [&, i](){ if (fail_condition(i)) { fail_occurred.test_and_set(); }}, true);
+  }
+
+  return waiter.wait() && !fail_occurred.test_and_set();
+}
+
+TEST(threadpool, test_and_set)
+{
+  // No failure
+  ASSERT_TRUE(check_test_and_set(0, [](std::size_t i) -> bool { return false; }));
+  static const std::size_t N = 4;
+  ASSERT_TRUE(check_test_and_set(N, [](std::size_t i) -> bool { return false; }));
+
+  // 1 failure
+  ASSERT_FALSE(check_test_and_set(N, [](std::size_t i) -> bool { return i == 0; }));
+  ASSERT_FALSE(check_test_and_set(N, [](std::size_t i) -> bool { return i == 1; }));
+  ASSERT_FALSE(check_test_and_set(N, [](std::size_t i) -> bool { return i == 2; }));
+  ASSERT_FALSE(check_test_and_set(N, [](std::size_t i) -> bool { return i == 3; }));
+
+  // Multiple failures
+  ASSERT_FALSE(check_test_and_set(N, [](std::size_t i) -> bool { return i > 0; }));
+  ASSERT_FALSE(check_test_and_set(N, [](std::size_t i) -> bool { return true; }));
+}
+
+TEST(threadpool, worker_job_throws_with_null_waiter)
+{
+  // submit() documents that the waiter may be NULL, but the worker's
+  // exception handler dereferenced it unconditionally. A throwing job
+  // without a waiter used to crash the worker thread.
+  std::shared_ptr<tools::threadpool> tpool(tools::threadpool::getNewForUnitTests(1));
+  tools::threadpool::waiter waiter(*tpool);
+  std::atomic<bool> ran(false);
+  tpool->submit(nullptr, [] { throw std::runtime_error("boom"); });
+  tpool->submit(&waiter, [&ran] { ran = true; });
+  ASSERT_TRUE(waiter.wait());
+  EXPECT_TRUE(ran);
+}
+
+TEST(threadpool, worker_job_throws_non_std_exception)
+{
+  // #11400 only covered the inline (caller) path with throw 1; the worker
+  // path only caught std::exception, so a non-std::exception thrown from a
+  // worker job escaped run() and terminated the worker thread.
+  std::shared_ptr<tools::threadpool> tpool(tools::threadpool::getNewForUnitTests(1));
+  tools::threadpool::waiter waiter(*tpool);
+  std::atomic<bool> ran(false);
+  tpool->submit(nullptr, [] { throw 1; });
+  tpool->submit(&waiter, [&ran] { ran = true; });
+  ASSERT_TRUE(waiter.wait());
+  EXPECT_TRUE(ran);
 }

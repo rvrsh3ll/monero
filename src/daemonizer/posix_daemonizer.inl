@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -28,8 +28,10 @@
 
 #pragma once
 
+#include "daemonizer/daemonizer.h"
 #include "common/scoped_message_writer.h"
 #include "common/util.h"
+#include "common/command_line.h"
 #include "daemonizer/posix_fork.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -47,10 +49,6 @@ namespace daemonizer
       "pidfile"
     , "File path to write the daemon's PID to (optional, requires --detach)"
     };
-    const command_line::arg_descriptor<bool> arg_non_interactive = {
-      "non-interactive"
-    , "Run non-interactive"
-    };
   }
 
   inline void init_options(
@@ -60,7 +58,6 @@ namespace daemonizer
   {
     command_line::add_arg(normal_options, arg_detach);
     command_line::add_arg(normal_options, arg_pidfile);
-    command_line::add_arg(normal_options, arg_non_interactive);
   }
 
   inline boost::filesystem::path get_default_data_dir()

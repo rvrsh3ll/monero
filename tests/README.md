@@ -43,18 +43,14 @@ ctest
 
 To run the same tests on a release build, replace `debug` with `release`.
 
-# Daemon tests
-
-[TODO]
-
 # Functional tests
 
 [TODO]
-Functional tests are located under the `tests/functional` directory.
+Functional tests are located under the `tests/functional_tests` directory.
 
 Building all the tests requires installing the following dependencies:
 ```bash
-pip install requests psutil monotonic
+pip install requests zmq deepdiff
 ```
 
 First, run a regtest daemon in the offline mode and with a fixed difficulty:
@@ -70,11 +66,127 @@ velvet lymph giddy number token physics poetry unquoted nibs useful sabotage lim
 
 Open the wallet file with `monero-wallet-rpc` with RPC port 18083. Finally, start tests by invoking ./blockchain.py or ./speed.py
 
+## Parameters
+
+Configuration of individual tests.
+
+### Mining test
+
+The following environment variables may be set to control the mining test:
+
+- `MINING_NO_MEASUREMENT` - set to anything to use large enough and fixed mining timeouts (use case: very slow PCs and no intention to change the mining code)
+- `MINING_SILENT`         - set to anything to disable mining logging
+
+For example, to customize the run of the functional tests, you may run the following commands from the build directory:
+
+```bash
+export MINING_NO_MEASUREMENT=1
+ctest -V -R functional_tests_rpc
+unset MINING_NO_MEASUREMENT
+```
+
 # Fuzz tests
 
-Fuzz tests are written using American Fuzzy Lop (AFL), and located under the `tests/fuzz` directory.
+Fuzz tests are located under the `tests/fuzz` directory and can be run with American Fuzzy Lop (AFL) or Clang's libFuzzer.
 
 An additional helper utility is provided `contrib/fuzz_testing/fuzz.sh`. AFL must be installed, and some additional setup may be necessary for the script to run properly.
+
+## libFuzzer
+
+The fuzz tests can also be built locally with Clang's libFuzzer, without using Docker or the OSS-Fuzz helper scripts. This uses the same `OSSFUZZ` CMake path as OSS-Fuzz and provides libFuzzer through `LIB_FUZZING_ENGINE`.
+
+```sh
+$ LIB_FUZZING_ENGINE="-fsanitize=fuzzer" \
+  cmake -S . -B build/libfuzzer \
+    -D OSSFUZZ=ON \
+    -D BUILD_TESTS=ON \
+    -D STATIC=OFF \
+    -D USE_LTO=OFF \
+    -D CMAKE_BUILD_TYPE=RelWithDebInfo \
+    -D CMAKE_C_COMPILER=clang \
+    -D CMAKE_CXX_COMPILER=clang++ \
+    -D CMAKE_C_FLAGS="-fsanitize=fuzzer-no-link,address,undefined" \
+    -D CMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link,address,undefined" \
+    -D CMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+$ make -C build/libfuzzer base58_fuzz_tests
+```
+
+Use a Clang toolchain that includes the libFuzzer runtime. Some platform-provided Clang installations do not include it; if linking fails with a missing `libclang_rt.fuzzer` library, install a complete LLVM toolchain and point `CMAKE_C_COMPILER` and `CMAKE_CXX_COMPILER` at that `clang` and `clang++`.
+
+`LIB_FUZZING_ENGINE` is read during CMake configure, so keep it on the `cmake -S ...` command, not only on the later build command.
+
+Run a fuzzer with its existing seed corpus:
+
+```sh
+$ mkdir -p build/libfuzzer/corpus/base58
+$ cp tests/data/fuzz/base58/* build/libfuzzer/corpus/base58/
+$ ./build/libfuzzer/tests/fuzz/base58_fuzz_tests build/libfuzzer/corpus/base58 -max_total_time=60
+```
+
+## OSS-Fuzz
+
+Monero is integrated into [OSS-Fuzz](https://github.com/google/oss-fuzz) and the project integration
+is available [here](https://github.com/google/oss-fuzz/tree/master/projects/monero). OSS-Fuzz builds
+and runs the fuzzers continuously, so long as Monero's OSS-Fuzz [build script](https://github.com/google/oss-fuzz/blob/master/projects/monero/build.sh) builds them.
+
+Issues found by OSS-Fuzz are publicly available (following a disclosure deadline) on the OSS-Fuzz issue tracker [here](https://issues.oss-fuzz.com/issues?q=project%3Dmonero).
+The issue tracker only displays limited information, and only maintainers with emails listed in the [project.yaml](https://github.com/google/oss-fuzz/blob/master/projects/monero/project.yaml) have access to full details.
+
+Coverage reports are built on a daily basis and data about this can be found at [introspector.oss-fuzz.com](https://introspector.oss-fuzz.com) [here](https://introspector.oss-fuzz.com/project-profile?project=monero).
+
+### Build and run fuzzers by way of OSS-Fuzz
+
+**Building Monero's fuzzers with OSS-Fuzz**
+
+```sh
+$ git clone https://github.com/google/oss-fuzz
+$ cd oss-fuzz
+$ python3 infra/helper.py build_fuzzers monero
+
+# Display what was build
+$ ls build/out/monero/
+base58_fuzz_tests                       cold-outputs_fuzz_tests_seed_corpus.zip      llvm-symbolizer                              signature_fuzz_tests
+base58_fuzz_tests_seed_corpus.zip       cold-transaction_fuzz_tests                  load-from-binary_fuzz_tests                  signature_fuzz_tests_seed_corpus.zip
+block_fuzz_tests                        cold-transaction_fuzz_tests_seed_corpus.zip  load-from-binary_fuzz_tests_seed_corpus.zip  transaction_fuzz_tests
+block_fuzz_tests_seed_corpus.zip        http-client_fuzz_tests                       load-from-json_fuzz_tests                    transaction_fuzz_tests_seed_corpus.zip
+bulletproof_fuzz_tests                  http-client_fuzz_tests_seed_corpus.zip       load-from-json_fuzz_tests_seed_corpus.zip    tx-extra_fuzz_tests
+bulletproof_fuzz_tests_seed_corpus.zip  levin_fuzz_tests                             parse-url_fuzz_tests                         tx-extra_fuzz_tests_seed_corpus.zip
+cold-outputs_fuzz_tests                 levin_fuzz_tests_seed_corpus.zip             parse-url_fuzz_tests_seed_corpus.zip
+```
+
+**Run fuzzing harness with OSS-Fuzz**
+
+Assuming you performed the above steps for building the fuzzers and are in the OSS-Fuzz root directory:
+
+```sh
+$ python3 infra/helper.py run_fuzzer monero base58_fuzz_tests
+...
+...
+INFO: Loaded 1 modules   (9075 inline 8-bit counters): 9075 [0x55d1c3d6cfd8, 0x55d1c3d6f34b),
+INFO: Loaded 1 PC tables (9075 PCs): 9075 [0x55d1c3d6f350,0x55d1c3d92a80),
+INFO:        1 files found in /tmp/base58_fuzz_tests_corpus
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 1 min: 95b max: 95b total: 95b rss: 33Mb
+#2      INITED cov: 18 ft: 19 corp: 1/95b exec/s: 0 rss: 33Mb
+#3      NEW    cov: 19 ft: 23 corp: 2/190b lim: 95 exec/s: 0 rss: 34Mb L: 95/95 MS: 1 ChangeByte-
+#4      NEW    cov: 20 ft: 24 corp: 3/285b lim: 95 exec/s: 0 rss: 34Mb L: 95/95 MS: 1 ChangeByte-
+#5      NEW    cov: 22 ft: 26 corp: 4/359b lim: 95 exec/s: 0 rss: 34Mb L: 74/95 MS: 1 EraseBytes-
+#6      NEW    cov: 23 ft: 29 corp: 5/454b lim: 95 exec/s: 0 rss: 34Mb L: 95/95 MS: 1 ChangeByte-
+#8      NEW    cov: 24 ft: 30 corp: 6/549b lim: 95 exec/s: 0 rss: 34Mb L: 95/95 MS: 2 CrossOver-ChangeBit-
+#12     NEW    cov: 25 ft: 35 corp: 7/606b lim: 95 exec/s: 0 rss: 34Mb L: 57/95 MS: 4 ChangeBinInt-ShuffleBytes-ShuffleBytes-EraseBytes-
+#14     NEW    cov: 26 ft: 38 corp: 8/655b lim: 95 exec/s: 0 rss: 34Mb L: 49/95 MS: 2 ChangeBinInt-EraseBytes-
+#17     NEW    cov: 27 ft: 40 corp: 9/708b lim: 95 exec/s: 0 rss: 34Mb L: 53/95 MS: 3 ChangeASCIIInt-ChangeBit-EraseBytes-
+#18     NEW    cov: 28 ft: 41 corp: 10/803b lim: 95 exec/s: 0 rss: 34Mb L: 95/95 MS: 1 ChangeByte-
+#20     NEW    cov: 28 ft: 42 corp: 11/852b lim: 95 exec/s: 0 rss: 34Mb L: 49/95 MS: 2 ChangeASCIIInt-ShuffleBytes-
+#22     REDUCE cov: 28 ft: 42 corp: 11/847b lim: 95 exec/s: 0 rss: 34Mb L: 90/95 MS: 2 ChangeBinInt-CrossOver-
+#25     NEW    cov: 29 ft: 47 corp: 12/942b lim: 95 exec/s: 0 rss: 34Mb L: 95/95 MS: 3 ChangeBit-ChangeBit-CopyPart-
+#39     REDUCE cov: 29 ft: 47 corp: 12/941b lim: 95 exec/s: 0 rss: 34Mb L: 94/95 MS: 4 ChangeByte-CopyPart-ChangeASCIIInt-EraseBytes-
+#41     NEW    cov: 30 ft: 48 corp: 13/991b lim: 95 exec/s: 0 rss: 34Mb L: 50/95 MS: 2 CopyPart-CrossOver-
+#57     NEW    cov: 31 ft: 49 corp: 14/1068b lim: 95 exec/s: 0 rss: 34Mb L: 77/95 MS: 1 InsertRepeatedBytes-
+#63     NEW    cov: 32 ft: 50 corp: 15/1147b lim: 95 exec/s: 0 rss: 34Mb L: 79/95 MS: 1 CrossOver-
+...
+```
+
 
 # Hash tests
 
@@ -89,9 +201,27 @@ ctest
 
 To run the same tests on a release build, replace `debug` with `release`.
 
+To run specific hash test, you can use `ctest` `-R` parameter. For example to run only `blake2b` hash tests:
+
+```
+ctest -R hash-blake2b
+```
+
 # Libwallet API tests
 
-[TODO]
+The libwallet API tests are located under `tests/libwallet_api_tests/`.
+They are run through `ctest` like the functional tests and do not require a
+pre-existing testnet blockchain or manually created wallets. The CTest wrapper
+starts a temporary fakechain daemon, creates temporary wallets and ring database
+directories, mines the required blocks, and removes the process when the test
+finishes.
+
+These tests are added to CTest when the build is configured with
+`BUILD_GUI_DEPS=ON`. To run only this test from such a build directory:
+
+```bash
+ctest --test-dir build -R libwallet_api_tests --output-on-failure
+```
 
 # Net Load tests
 
@@ -135,4 +265,27 @@ When writing new tests, please implement all functions in `.cpp` or `.c` files, 
 
 ## Writing fuzz tests
 
-[TODO]
+Fuzz tests live in `tests/fuzz` and normally use `tests/fuzz/fuzzer.h`.
+Small file-oriented fuzzers should use the helper macros:
+
+```cpp
+#include "fuzzer.h"
+
+BEGIN_INIT_SIMPLE_FUZZER()
+  // Optional one-time setup.
+END_INIT_SIMPLE_FUZZER()
+
+BEGIN_SIMPLE_FUZZER()
+  // Use buf and len as the fuzz input.
+END_SIMPLE_FUZZER()
+```
+
+In normal AFL builds, `BEGIN_SIMPLE_FUZZER` loads one corpus file and provides
+`buf`, `len`, and `s`. In `OSSFUZZ`/libFuzzer builds, it exposes
+`LLVMFuzzerTestOneInput` and provides `buf` and `len` directly.
+
+Add the new source file to `tests/fuzz/CMakeLists.txt`, link only the libraries
+needed by the target, and add small seed inputs under `tests/data/fuzz/<name>`
+when useful. Existing fuzzers such as `base58.cpp`, `load_from_binary.cpp`, and
+`levin.cpp` are good templates. RPC fuzzing has additional structure documented
+in `tests/fuzz/fuzz_rpc/README.md`.

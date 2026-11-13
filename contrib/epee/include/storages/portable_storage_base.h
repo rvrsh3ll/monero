@@ -57,7 +57,7 @@
 #define SERIALIZE_TYPE_UINT32               6
 #define SERIALIZE_TYPE_UINT16               7
 #define SERIALIZE_TYPE_UINT8                8
-#define SERIALIZE_TYPE_DUOBLE               9
+#define SERIALIZE_TYPE_DOUBLE               9
 #define SERIALIZE_TYPE_STRING               10
 #define SERIALIZE_TYPE_BOOL                 11
 #define SERIALIZE_TYPE_OBJECT               12
@@ -160,7 +160,6 @@ namespace epee
 
     typedef boost::variant<uint64_t, uint32_t, uint16_t, uint8_t, int64_t, int32_t, int16_t, int8_t, double, bool, std::string, section, array_entry> storage_entry;
 
-    typedef std::string binarybuffer;//it's ok      
 
     /************************************************************************/
     /*                                                                      */

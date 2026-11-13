@@ -1,4 +1,5 @@
-# Copyright (c) 2018 The Monero Project
+# Copyright (c) 2018-2024, The Monero Project
+
 # 
 # All rights reserved.
 # 
@@ -27,48 +28,44 @@
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import requests
+from requests.auth import HTTPDigestAuth
 import json
+
+from . import epee_binary
 
 class Response(dict):
     def __init__(self, d):
-        for k in d.keys():
-            if type(d[k]) == dict:
-                self[k] = Response(d[k])
-            elif type(d[k]) == list:
-                self[k] = []
-                for i in range(len(d[k])):
-                    if type(d[k][i]) == dict:
-                        self[k].append(Response(d[k][i]))
-                    else:
-                        self[k].append(d[k][i])
-            else:
-                self[k] = d[k]
+        for k, v in d.items():
+            self[k] = self._decode(v)
+
+    @staticmethod
+    def _decode(o):
+        if isinstance(o, dict):
+            return Response(o)
+        elif isinstance(o, list):
+            return [Response._decode(i) for i in o]
+        else:
+            return o
 
     def __getattr__(self, key):
         return self[key]
     def __setattr__(self, key, value):
         self[key] = value
-    def __eq__(self, other):
-        if type(other) == dict:
-            return self == Response(other)
-        if self.keys() != other.keys():
-            return False
-        for k in self.keys():
-            if self[k] != other[k]:
-                return False
-        return True
 
 class JSONRPC(object):
-    def __init__(self, url):
+    def __init__(self, url, username=None, password=None):
         self.url = url
+        self.username = username
+        self.password = password
 
     def send_request(self, path, inputs, result_field = None):
         res = requests.post(
             self.url + path,
             data=json.dumps(inputs),
-            headers={'content-type': 'application/json'})
+            headers={'content-type': 'application/json'},
+            auth=HTTPDigestAuth(self.username, self.password) if self.username is not None else None)
         res = res.json()
-        
+
         assert 'error' not in res, res
 
         if result_field:
@@ -79,5 +76,20 @@ class JSONRPC(object):
     def send_json_rpc_request(self, inputs):
         return self.send_request("/json_rpc", inputs, 'result')
 
+    def send_binary_request(self, path, inputs):
+        binary_req = epee_binary.Serializer().serialize(inputs)
 
+        res = requests.post(
+            self.url + path,
+            data=binary_req,
+            headers={'content-type': 'application/octet-stream'},
+            auth=HTTPDigestAuth(self.username, self.password) if self.username is not None else None,
+            stream=True)
 
+        assert res.status_code == 200, res.status_code
+
+        res = epee_binary.Deserializer(res.raw).deserialize()
+
+        assert res['status'] == b'OK', res['status']
+
+        return Response(res)

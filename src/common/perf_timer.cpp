@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -27,7 +27,8 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <vector>
-#include "misc_os_dependent.h"
+#include <atomic>
+#include "time_helper.h"
 #include "perf_timer.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -62,7 +63,7 @@ namespace tools
     while (1)
     {
       t1 = epee::misc_utils::get_ns_count();
-      if (t1 - t0 > 1*1000000000) break; // work one second
+      if (t1 - t0 > 1*100000000) break; // work 0.1 seconds
     }
 
     uint64_t r1 = get_tick_count();
@@ -72,12 +73,25 @@ namespace tools
 #endif
 
 #ifdef __x86_64__
-  uint64_t ticks_per_ns = get_ticks_per_ns();
+  namespace
+  {
+    std::atomic<uint64_t> ticks_per_ns_value{0};
+
+    uint64_t calibrate_ticks_per_ns()
+    {
+      const uint64_t tpns = get_ticks_per_ns();
+      ticks_per_ns_value.store(tpns, std::memory_order_release);
+      return tpns;
+    }
+  }
 #endif
 
   uint64_t ticks_to_ns(uint64_t ticks)
   {
 #if defined(__x86_64__)
+    uint64_t ticks_per_ns = ticks_per_ns_value.load(std::memory_order_acquire);
+    if (ticks_per_ns == 0)
+      ticks_per_ns = calibrate_ticks_per_ns();
     return 256 * ticks / ticks_per_ns;
 #else
     return ticks;
@@ -90,18 +104,12 @@ namespace tools
 
 el::Level performance_timer_log_level = el::Level::Info;
 
-static __thread std::vector<LoggingPerformanceTimer*> *performance_timers = NULL;
-
-void set_performance_timer_log_level(el::Level level)
-{
-  if (level != el::Level::Debug && level != el::Level::Trace && level != el::Level::Info
-   && level != el::Level::Warning && level != el::Level::Error && level != el::Level::Fatal)
-  {
-    MERROR("Wrong log level: " << el::LevelHelper::convertToString(level) << ", using Info");
-    level = el::Level::Info;
-  }
-  performance_timer_log_level = level;
-}
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+  #warning "Building with fuzzing mode UNSAFE FOR PRODUCTION!"
+  thread_local std::vector<LoggingPerformanceTimer*> *performance_timers = NULL;
+#else
+  static thread_local std::vector<LoggingPerformanceTimer*> *performance_timers = NULL;
+#endif
 
 PerformanceTimer::PerformanceTimer(bool paused): started(true), paused(paused)
 {
@@ -150,7 +158,7 @@ LoggingPerformanceTimer::~LoggingPerformanceTimer()
   const bool log = ELPP->vRegistry()->allowed(level, cat.c_str());
   if (log)
   {
-    char s[12];
+    char s[24];
     snprintf(s, sizeof(s), "%8llu  ", (unsigned long long)(ticks_to_ns(ticks) / (1000000000 / unit)));
     size_t size = 0; for (const auto *tmp: *performance_timers) if (!tmp->paused || tmp==this) ++size;
     PERF_LOG_ALWAYS(level, cat.c_str(), "PERF " << s << std::string(size * 2, ' ') << "  " << name);

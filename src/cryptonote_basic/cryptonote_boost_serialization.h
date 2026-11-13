@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -71,7 +71,11 @@ namespace boost
   {
     a & reinterpret_cast<char (&)[sizeof(crypto::key_image)]>(x);
   }
-
+  template <class Archive>
+  inline void serialize(Archive &a, crypto::view_tag &x, const boost::serialization::version_type ver)
+  {
+    a & reinterpret_cast<char (&)[sizeof(crypto::view_tag)]>(x);
+  }
   template <class Archive>
   inline void serialize(Archive &a, crypto::signature &x, const boost::serialization::version_type ver)
   {
@@ -103,9 +107,19 @@ namespace boost
   }
 
   template <class Archive>
-  inline void serialize(Archive &a, cryptonote::txout_to_scripthash &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, cryptonote::txout_to_tagged_key &x, const boost::serialization::version_type ver)
   {
-    a & x.hash;
+    a & x.key;
+    a & x.view_tag;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::txout_to_carrot_v1 &x, const boost::serialization::version_type ver)
+  {
+    a & x.key;
+    // TODO: the rest of Carrot
+    // a & x.view_tag.bytes;
+    // a & x.encrypted_janus_anchor.bytes;
   }
 
   template <class Archive>
@@ -228,6 +242,20 @@ namespace boost
   }
 
   template <class Archive>
+  inline void serialize(Archive &a, rct::BulletproofPlus &x, const boost::serialization::version_type ver)
+  {
+    a & x.V;
+    a & x.A;
+    a & x.A1;
+    a & x.B;
+    a & x.r1;
+    a & x.s1;
+    a & x.d1;
+    a & x.L;
+    a & x.R;
+  }
+
+  template <class Archive>
   inline void serialize(Archive &a, rct::boroSig &x, const boost::serialization::version_type ver)
   {
     a & x.s0;
@@ -269,15 +297,6 @@ namespace boost
   }
 
   template <class Archive>
-  inline void serialize(Archive &a, rct::multisig_out &x, const boost::serialization::version_type ver)
-  {
-    a & x.c;
-    if (ver < 1)
-      return;
-    a & x.mu_p;
-  }
-
-  template <class Archive>
   inline typename std::enable_if<Archive::is_loading::value, void>::type serializeOutPk(Archive &a, rct::ctkeyV &outPk_, const boost::serialization::version_type ver)
   {
     rct::keyV outPk;
@@ -305,7 +324,7 @@ namespace boost
     a & x.type;
     if (x.type == rct::RCTTypeNull)
       return;
-    if (x.type != rct::RCTTypeFull && x.type != rct::RCTTypeSimple && x.type != rct::RCTTypeBulletproof && x.type != rct::RCTTypeBulletproof2 && x.type != rct::RCTTypeCLSAG)
+    if (x.type != rct::RCTTypeFull && x.type != rct::RCTTypeSimple && x.type != rct::RCTTypeBulletproof && x.type != rct::RCTTypeBulletproof2 && x.type != rct::RCTTypeCLSAG && x.type != rct::RCTTypeBulletproofPlus)
       throw boost::archive::archive_exception(boost::archive::archive_exception::other_exception, "Unsupported rct type");
     // a & x.message; message is not serialized, as it can be reconstructed from the tx data
     // a & x.mixRing; mixRing is not serialized, as it can be reconstructed from the offsets
@@ -321,7 +340,11 @@ namespace boost
   {
     a & x.rangeSigs;
     if (x.rangeSigs.empty())
+    {
       a & x.bulletproofs;
+      if (ver >= 2u)
+        a & x.bulletproofs_plus;
+    }
     a & x.MGs;
     if (ver >= 1u)
       a & x.CLSAGs;
@@ -335,7 +358,7 @@ namespace boost
     a & x.type;
     if (x.type == rct::RCTTypeNull)
       return;
-    if (x.type != rct::RCTTypeFull && x.type != rct::RCTTypeSimple && x.type != rct::RCTTypeBulletproof && x.type != rct::RCTTypeBulletproof2 && x.type != rct::RCTTypeCLSAG)
+    if (x.type != rct::RCTTypeFull && x.type != rct::RCTTypeSimple && x.type != rct::RCTTypeBulletproof && x.type != rct::RCTTypeBulletproof2 && x.type != rct::RCTTypeCLSAG && x.type != rct::RCTTypeBulletproofPlus)
       throw boost::archive::archive_exception(boost::archive::archive_exception::other_exception, "Unsupported rct type");
     // a & x.message; message is not serialized, as it can be reconstructed from the tx data
     // a & x.mixRing; mixRing is not serialized, as it can be reconstructed from the offsets
@@ -347,11 +370,15 @@ namespace boost
     //--------------
     a & x.p.rangeSigs;
     if (x.p.rangeSigs.empty())
+    {
       a & x.p.bulletproofs;
+      if (ver >= 2u)
+        a & x.p.bulletproofs_plus;
+    }
     a & x.p.MGs;
     if (ver >= 1u)
       a & x.p.CLSAGs;
-    if (x.type == rct::RCTTypeBulletproof || x.type == rct::RCTTypeBulletproof2 || x.type == rct::RCTTypeCLSAG)
+    if (x.type == rct::RCTTypeBulletproof || x.type == rct::RCTTypeBulletproof2 || x.type == rct::RCTTypeCLSAG || x.type == rct::RCTTypeBulletproofPlus)
       a & x.p.pseudoOuts;
   }
 
@@ -392,6 +419,5 @@ namespace boost
 }
 }
 
-BOOST_CLASS_VERSION(rct::rctSigPrunable, 1)
-BOOST_CLASS_VERSION(rct::rctSig, 1)
-BOOST_CLASS_VERSION(rct::multisig_out, 1)
+BOOST_CLASS_VERSION(rct::rctSigPrunable, 2)
+BOOST_CLASS_VERSION(rct::rctSig, 2)

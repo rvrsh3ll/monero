@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -36,7 +36,6 @@ set(common_sources
   error.cpp
   expect.cpp
   util.cpp
-  i18n.cpp
   notify.cpp
   password.cpp
   perf_timer.cpp
@@ -52,64 +51,45 @@ if (STACK_TRACE)
   list(APPEND common_sources stack_trace.cpp)
 endif()
 
-if (BACKCOMPAT)
-  list(APPEND common_sources compat/glibc_compat.cpp)
-endif()
-
 set(common_headers)
 
-set(common_private_headers
-  apply_permutation.h
-  base58.h
-  boost_serialization_helper.h
-  command_line.h
-  common_fwd.h
-  dns_utils.h
-  download.h
-  error.h
-  expect.h
-  http_connection.h
-  notify.h
-  pod-class.h
-  pruning.h
-  rpc_client.h
-  scoped_message_writer.h
-  unordered_containers_boost_serialization.h
-  util.h
-  varint.h
-  i18n.h
-  password.h
-  perf_timer.h
-  spawn.h
-  stack_trace.h
-  threadpool.h
-  updates.h
-  aligned.h
-  timings.h
-  combinator.h
-  utf8.h)
+monero_find_all_headers(common_private_headers "${CMAKE_CURRENT_SOURCE_DIR}")
 
 monero_private_headers(common
   ${common_private_headers})
 monero_add_library(common
   ${common_sources}
   ${common_headers}
-  ${common_private_headers}
-  DEPENDS generate_translations_header)
+  ${common_private_headers})
+
+if (STACK_TRACE_USE_WRAP)
+  target_compile_definitions(obj_common PRIVATE STACK_TRACE_USE_WRAP)
+endif()
+
 target_link_libraries(common
   PUBLIC
     cncrypto
-    ${UNBOUND_LIBRARY}
+    unbound
     ${LIBUNWIND_LIBRARIES}
     ${Boost_DATE_TIME_LIBRARY}
     ${Boost_FILESYSTEM_LIBRARY}
     ${Boost_SYSTEM_LIBRARY}
     ${Boost_THREAD_LIBRARY}
     ${Boost_REGEX_LIBRARY}
-    ${Boost_CHRONO_LIBRARY}
   PRIVATE
     ${OPENSSL_LIBRARIES}
     ${EXTRA_LIBRARIES})
+
+if (STACK_TRACE_USE_WRAP)
+  set_property(TARGET common APPEND PROPERTY LINK_FLAGS
+    "-Wl,--wrap=__cxa_throw")
+  set_property(TARGET common APPEND PROPERTY INTERFACE_LINK_OPTIONS
+    "-Wl,--wrap=__cxa_throw"
+    "-Wl,-u,__wrap___cxa_throw")
+endif()
+target_include_directories(common
+  PRIVATE
+    ${Boost_INCLUDE_DIRS})
 
 #monero_install_headers(common
 #  ${common_headers})

@@ -1093,7 +1093,7 @@ class File : base::StaticClass {
   static std::string extractPathFromFilename(const std::string& fullPath,
       const char* seperator = base::consts::kFilePathSeperator);
   /// @brief builds stripped filename and puts it in buff
-  static void buildStrippedFilename(const char* filename, char buff[], const std::string &commonPrefix = NULL,
+  static void buildStrippedFilename(const char* filename, char buff[], const std::string &commonPrefix = "",
                                     std::size_t limit = base::consts::kSourceFilenameMaxLength);
   /// @brief builds base filename and puts it in buff
   static void buildBaseFilename(const std::string& fullPath, char buff[],
@@ -1210,7 +1210,9 @@ class OS : base::StaticClass {
   ///
   /// @detail For android systems this is device name with its manufacturer and model seperated by hyphen
   static std::string currentHost(void);
-  /// @brief Whether or not terminal supports colors
+  /// @brief Whether or not the named terminal supports colors
+  static bool termSupportsColor(std::string& term);
+  /// @brief Whether or not the process's current terminal supports colors
   static bool termSupportsColor(void);
 };
 /// @brief Contains utilities for cross-platform date/time. This class make use of el::base::utils::Str
@@ -1818,7 +1820,7 @@ class Configurations : public base::utils::RegistryWithPred<Configuration, Confi
   ///
   /// @detail Any existing configuration for specified level will be replaced. Also note that configuration types
   /// ConfigurationType::SubsecondPrecision and ConfigurationType::PerformanceTracking will be ignored if not set for
-  /// Level::Global because these configurations are not dependant on level.
+  /// Level::Global because these configurations are not dependent on level.
   /// @param level Level to set configuration for (el::Level).
   /// @param configurationType Type of configuration (el::ConfigurationType)
   /// @param value A string based value. Regardless of what the data type of configuration is, it will always be string
@@ -1993,7 +1995,7 @@ class TypedConfigurations : public base::threading::ThreadSafe {
   }
 
   template <typename Conf_T>
-  inline Conf_T& getConfigByRef(Level level, std::unordered_map<Level, Conf_T>* confMap, const char* confName) {
+  inline const Conf_T& getConfigByRef(Level level, std::unordered_map<Level, Conf_T>* confMap, const char* confName) {
     base::threading::ScopedLock scopedLock(lock());
     return unsafeGetConfigByRef(level, confMap, confName);  // This is not unsafe anymore - mutex locked in scope
   }
@@ -2016,8 +2018,9 @@ class TypedConfigurations : public base::threading::ThreadSafe {
   }
 
   template <typename Conf_T>
-  Conf_T& unsafeGetConfigByRef(Level level, std::unordered_map<Level, Conf_T>* confMap, const char* confName) {
+  const Conf_T& unsafeGetConfigByRef(Level level, std::unordered_map<Level, Conf_T>* confMap, const char* confName) {
     ELPP_UNUSED(confName);
+    static const Conf_T empty;
     typename std::unordered_map<Level, Conf_T>::iterator it = confMap->find(level);
     if (it == confMap->end()) {
       try {
@@ -2026,6 +2029,7 @@ class TypedConfigurations : public base::threading::ThreadSafe {
         ELPP_INTERNAL_ERROR("Unable to get configuration [" << confName << "] for level ["
                             << LevelHelper::convertToString(level) << "]"
                             << std::endl << "Please ensure you have properly configured logger.", false);
+        return empty;
       }
     }
     return it->second;
@@ -2788,6 +2792,7 @@ class Storage : base::NoCopy, public base::threading::ThreadSafe {
   }
 };
 extern ELPP_EXPORT base::type::StoragePointer elStorage;
+ELPP_EXPORT void sanitize(std::string& s);
 #define ELPP el::base::Storage::getELPP()
 class DefaultLogDispatchCallback : public LogDispatchCallback {
  protected:
@@ -3259,47 +3264,25 @@ class Writer : base::NoCopy {
          const char* func, base::DispatchAction dispatchAction = base::DispatchAction::NormalLog,
          base::type::VerboseLevel verboseLevel = 0) :
     m_msg(nullptr), m_level(level), m_color(color), m_file(file), m_line(line), m_func(func), m_verboseLevel(verboseLevel),
-    m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction) {
+    m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction), m_sync(ELPP->lock()) {
   }
 
   Writer(LogMessage* msg, base::DispatchAction dispatchAction = base::DispatchAction::NormalLog) :
     m_msg(msg), m_level(msg != nullptr ? msg->level() : Level::Unknown),
-    m_line(0), m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction) {
+    m_line(0), m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction), m_sync(ELPP->lock()) {
   }
 
   virtual ~Writer(void) {
     processDispatch();
   }
 
-  template <typename T>
-  inline typename std::enable_if<std::is_integral<T>::value, Writer&>::type
-  operator<<(T log) {
+  Writer& operator<<(const std::string &log) {
 #if ELPP_LOGGING_ENABLED
   if (m_proceed) {
     m_messageBuilder << log;
   }
 #endif  // ELPP_LOGGING_ENABLED
   return *this;
-  }
-
-  template <typename T>
-  inline typename std::enable_if<!std::is_integral<T>::value, Writer&>::type
-  operator<<(const T& log) {
-#if ELPP_LOGGING_ENABLED
-    if (m_proceed) {
-      m_messageBuilder << log;
-    }
-#endif  // ELPP_LOGGING_ENABLED
-    return *this;
-  }
-
-  inline Writer& operator<<(std::ostream& (*log)(std::ostream&)) {
-#if ELPP_LOGGING_ENABLED
-    if (m_proceed) {
-      m_messageBuilder << log;
-    }
-#endif  // ELPP_LOGGING_ENABLED
-    return *this;
   }
 
   inline operator bool() {
@@ -3322,6 +3305,7 @@ class Writer : base::NoCopy {
   base::MessageBuilder m_messageBuilder;
   base::DispatchAction m_dispatchAction;
   std::vector<std::string> m_loggerIds;
+  base::threading::ScopedLock m_sync;
   friend class el::Helpers;
 
   void initializeLogger(const std::string& loggerId, bool lookup = true, bool needLock = true);
@@ -3617,8 +3601,9 @@ class DefaultPerformanceTrackingCallback : public PerformanceTrackingCallback {
         ss << ELPP_LITERAL("]");
       }
     }
+    const std::string str = ss.str();
     el::base::Writer(m_data->performanceTracker()->level(), m_data->file(), m_data->line(), m_data->func()).construct(1,
-        m_data->loggerId().c_str()) << ss.str();
+        m_data->loggerId().c_str()) << str;
   }
  private:
   const PerformanceTrackingData* m_data;

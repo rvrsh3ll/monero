@@ -2,7 +2,7 @@
 /// @author rfree (current maintainer/user in monero.cc project - most of code is from CryptoNote)
 /// @brief This is the original cryptonote protocol network-events handler, modified by us
 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -39,6 +39,7 @@
 
 #include "byte_slice.h"
 #include "math_helper.h"
+#include "syncobj.h"
 #include "storages/levin_abstract_invoke2.h"
 #include "warnings.h"
 #include "cryptonote_protocol_defs.h"
@@ -49,13 +50,10 @@
 #include "net/levin_base.h"
 #include "p2p/net_node_common.h"
 #include <boost/circular_buffer.hpp>
+#include <atomic>
 
 PUSH_WARNINGS
 DISABLE_VS_WARNINGS(4355)
-
-#define LOCALHOST_INT 2130706433
-#define CURRENCY_PROTOCOL_MAX_OBJECT_REQUEST_COUNT 100
-static_assert(CURRENCY_PROTOCOL_MAX_OBJECT_REQUEST_COUNT >= BLOCKS_SYNCHRONIZING_DEFAULT_COUNT_PRE_V4, "Invalid CURRENCY_PROTOCOL_MAX_OBJECT_REQUEST_COUNT");
 
 namespace cryptonote
 {
@@ -111,14 +109,31 @@ namespace cryptonote
     void log_connections();
     std::list<connection_info> get_connections();
     const block_queue &get_block_queue() const { return m_block_queue; }
+    std::uint64_t max_average_of_blocksize_in_queue()
+    {
+      const uint64_t max_average = m_block_queue.get_max_block_size_average();
+      MINFO("Maximum average of blocksize for current batches : " << max_average);
+      return max_average;
+    }
     void stop();
     void on_connection_close(cryptonote_connection_context &context);
-    void set_max_out_peers(unsigned int max) { m_max_out_peers = max; }
+    void set_max_out_peers(epee::net_utils::zone zone, unsigned int max) { CRITICAL_REGION_LOCAL(m_max_out_peers_lock); m_max_out_peers[zone] = max; }
+    unsigned int get_max_out_peers(epee::net_utils::zone zone) const
+    {
+      CRITICAL_REGION_LOCAL(m_max_out_peers_lock);
+      const auto it = m_max_out_peers.find(zone);
+      if (it == m_max_out_peers.end())
+      {
+        MWARNING(epee::net_utils::zone_to_string(zone) << " max out peers not set, using default");
+        return P2P_DEFAULT_CONNECTIONS_COUNT;
+      }
+      return it->second;
+    }
     bool no_sync() const { return m_no_sync; }
     void set_no_sync(bool value) { m_no_sync = value; }
     std::string get_peers_overview() const;
     std::pair<uint32_t, uint32_t> get_next_needed_pruning_stripe() const;
-    bool needs_new_sync_connections() const;
+    bool needs_new_sync_connections(epee::net_utils::zone zone) const;
     bool is_busy_syncing();
 
   private:
@@ -134,18 +149,18 @@ namespace cryptonote
     int handle_notify_get_txpool_complement(int command, NOTIFY_GET_TXPOOL_COMPLEMENT::request& arg, cryptonote_connection_context& context);
 		
     //----------------- i_bc_protocol_layout ---------------------------------------
-    virtual bool relay_block(NOTIFY_NEW_BLOCK::request& arg, cryptonote_connection_context& exclude_context);
+    virtual bool relay_block(NOTIFY_NEW_FLUFFY_BLOCK::request& arg, cryptonote_connection_context& exclude_context);
     virtual bool relay_transactions(NOTIFY_NEW_TRANSACTIONS::request& arg, const boost::uuids::uuid& source, epee::net_utils::zone zone, relay_method tx_relay);
     //----------------------------------------------------------------------------------
     //bool get_payload_sync_data(HANDSHAKE_DATA::request& hshd, cryptonote_connection_context& context);
     bool should_drop_connection(cryptonote_connection_context& context, uint32_t next_stripe);
     bool request_missing_objects(cryptonote_connection_context& context, bool check_having_blocks, bool force_next_span = false);
-    size_t get_synchronizing_connections_count();
     bool on_connection_synchronized();
     bool should_download_next_span(cryptonote_connection_context& context, bool standby);
     bool should_ask_for_pruned_data(cryptonote_connection_context& context, uint64_t first_block_height, uint64_t nblocks, bool check_block_weights) const;
     void drop_connection(cryptonote_connection_context &context, bool add_fail, bool flush_all_spans);
     void drop_connection_with_score(cryptonote_connection_context &context, unsigned int score, bool flush_all_spans);
+    void drop_connection(const boost::uuids::uuid&);
     void drop_connections(const epee::net_utils::network_address address);
     bool kick_idle_peers();
     bool check_standby_peers();
@@ -155,6 +170,7 @@ namespace cryptonote
     size_t skip_unneeded_hashes(cryptonote_connection_context& context, bool check_block_queue) const;
     bool request_txpool_complement(cryptonote_connection_context &context);
     void hit_score(cryptonote_connection_context &context, int32_t score);
+    void calculate_block_queue_limit(double blocks_per_second);
 
     t_core& m_core;
 
@@ -167,22 +183,26 @@ namespace cryptonote
     std::atomic<bool> m_ask_for_txpool_complement;
     boost::mutex m_sync_lock;
     block_queue m_block_queue;
+    boost::mutex m_check_span_queue_mutex;
     epee::math_helper::once_a_time_seconds<8> m_idle_peer_kicker;
     epee::math_helper::once_a_time_milliseconds<100> m_standby_checker;
     epee::math_helper::once_a_time_seconds<101> m_sync_search_checker;
     epee::math_helper::once_a_time_seconds<43> m_bad_peer_checker;
-    std::atomic<unsigned int> m_max_out_peers;
+    std::unordered_map<epee::net_utils::zone, unsigned int> m_max_out_peers;
+    mutable epee::critical_section m_max_out_peers_lock;
     tools::PerformanceTimer m_sync_timer, m_add_timer;
-    uint64_t m_last_add_end_time;
-    uint64_t m_sync_spans_downloaded, m_sync_old_spans_downloaded, m_sync_bad_spans_downloaded;
-    uint64_t m_sync_download_chain_size, m_sync_download_objects_size;
+    uint64_t m_last_add_end_time = 0;
+    uint64_t m_sync_spans_downloaded = 0, m_sync_old_spans_downloaded = 0, m_sync_bad_spans_downloaded = 0;
+    uint64_t m_sync_download_chain_size = 0, m_sync_download_objects_size = 0;
     size_t m_block_download_max_size;
     bool m_sync_pruned_blocks;
+    size_t m_block_sync_queue_time;
+    std::atomic<uint64_t> m_block_queue_limit;
 
     // Values for sync time estimates
     boost::posix_time::ptime m_sync_start_time;
     boost::posix_time::ptime m_period_start_time;
-    uint64_t m_sync_start_height;
+    uint64_t m_sync_start_height = 0;
     uint64_t m_period_start_height;
     uint64_t get_estimated_remaining_sync_seconds(uint64_t current_blockchain_height, uint64_t target_blockchain_height);
     std::string get_periodic_sync_estimate(uint64_t current_blockchain_height, uint64_t target_blockchain_height);

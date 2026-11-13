@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -158,6 +158,19 @@ namespace cryptonote
     return m_points.rbegin()->first;
   }
   //---------------------------------------------------------------------------
+  uint64_t checkpoints::get_nearest_checkpoint_height(uint64_t block_height) const
+  {
+    if (m_points.empty())
+      return 0;
+
+    auto it = m_points.lower_bound(block_height);
+    if (it == m_points.begin())
+      return 0;
+
+    --it;
+    return it->first;
+  }
+  //---------------------------------------------------------------------------
   const std::map<uint64_t, crypto::hash>& checkpoints::get_points() const
   {
     return m_points;
@@ -239,6 +252,26 @@ namespace cryptonote
     ADD_CHECKPOINT2(2046000, "5e867f0b8baefed9244a681df97fc885d8ab36c3dfcd24c7a3abf3b8ac8b8314", "0x9cb8b6ff2978c6");
     ADD_CHECKPOINT2(2092500, "c4e00820c9c7989b49153d5e90ae095a18a11d990e82fcc3be54e6ed785472b5", "0xb4e585a31369cb");
     ADD_CHECKPOINT2(2182500, "0d22b5f81982eff21d094af9e821dc2007e6342069e3b1a37b15d97646353124", "0xead4a874083492");
+    ADD_CHECKPOINT2(2661600, "41c9060e8426012238e8a26da26fcb90797436896cc70886a894c2c560bcccf2", "0x2e0d87526ff161f");
+    ADD_CHECKPOINT2(2677000, "1b9fee6246eeb176bd17d637bf252e9af54a4218675f01b4449cc0901867f9eb", "0x2f165bc1a5163ba");
+    ADD_CHECKPOINT2(2706000, "d8eb144c5e1fe6b329ecc900ec95e7792fccff84175fb23a25ed59d7299a511c", "0x310f7d89372f705");
+    ADD_CHECKPOINT2(2720000, "b19fb41dff15bd1016afbee9f8469f05aab715c9e5d1b974466a11fd58ecbb86", "0x3216b5851ddbb61");
+    ADD_CHECKPOINT2(2817000, "39726d19ccaac01d150bec827b877ffae710b516bd633503662036ef4422e577", "0x3900669561954c1");
+    ADD_CHECKPOINT2(2844000, "28fc7b446dfef5b469f5778eb72ddf32a307a5f5a9823d1c394e772349e05d40", "0x3af384ec0e97d12");
+    ADD_CHECKPOINT2(2851000, "5bf0e47fc782263191a33f63a67db6c711781dc2a3c442e17ed901ec401be5c9", "0x3b6cd8a8ed610e8");
+    ADD_CHECKPOINT2(2971000, "3d4cac5ac515eeabd18769ab943af85f36db51d28720def0d0e6effc2c8f5ce3", "0x436e532738b8b5b");
+    ADD_CHECKPOINT2(2985000, "08f5e6b7301c1b6ed88268a28f8677a06e8ff943b3f9e48d3080f71f9c134bfb", "0x444b7b42a633c96");
+    ADD_CHECKPOINT2(3088000, "bddf8ca09110d33d6d497f13a113630c2b6af1c84d4f3a6f35cb1446f2604ade", "0x4aed3615c2f8c3e");
+    ADD_CHECKPOINT2(3102800, "083f4a34f9490403b564286e7f13fd1ed45c52c86fa47195f151594e5bc87504", "0x4bbed52d4da5dfb");
+    ADD_CHECKPOINT2(3198000, "1d685b39be51e4e84e0af69fa78e023c7cb21de7d33acd012d0371d5f78712d5", "0x517d415fee3a816");
+    ADD_CHECKPOINT2(3375700, "96ef57b830ef7a7ccb61ada8595a4670765b6954d8cbf45c6cf583700a676302", "0x61209b7da8a0fa6");
+    ADD_CHECKPOINT2(3451000, "0cbc912e06e1adae11f6c9cb675d3159d225b4b04d4a6c61defe50ae1816dd60", "0x6aa5fc4226bab97");
+    ADD_CHECKPOINT2(3482000, "629071b10ddad67bdc6156102aba8e008a754c91da252eede852fff9175a9f0a", "0x6f1063da7e70c0e");
+    ADD_CHECKPOINT2(3516300, "fa08acbcda99fcc3cd94a749364a29fa6de9501a023cb6673d0c68fdf988b7c3", "0x738f0af4d65d459");
+    ADD_CHECKPOINT2(3541000, "74c457bed9ceef40f31f43bb8fab804077519d45c910dcad2acf4dd8556195c7", "0x76ff158c682d218");
+    ADD_CHECKPOINT2(3576000, "5da4891bfd06be270193bd949f2a623a2b0cb0ebfaad21c70a6cb18e418e5b6a", "0x7cb2e203e867b57");
+    ADD_CHECKPOINT2(3661900, "ac392757a92123f68d63cd72f0d1410f63df1102a53b5d39fc4d53d0998b20a3", "0x8a38f2195826a97");
+    ADD_CHECKPOINT2(3784000, "d2962a542632343fc953760e3e26cc5bb219eb4ed65f5b2e7c6a67251b9a05df", "0x9d3d116d1153593");
     return true;
   }
 

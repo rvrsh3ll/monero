@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -30,6 +30,7 @@
 
 
 
+#include <boost/thread/lock_guard.hpp>
 #include "device_default.hpp"
 #include "int-util.h"
 #include "crypto/wallet/crypto.h"
@@ -82,19 +83,32 @@ namespace hw {
             return true;
         }
 
+        // serialize mode access so callers cannot observe another wallet's transient signing mode
         bool  device_default::set_mode(device_mode mode) {
+            boost::lock_guard<boost::recursive_mutex> lock(device_locker);
             return device::set_mode(mode);
+        }
+
+        device::device_mode device_default::get_mode() const {
+            boost::lock_guard<boost::recursive_mutex> lock(device_locker);
+            return device::get_mode();
         }
 
         /* ======================================================================= */
         /*  LOCKER                                                                 */
         /* ======================================================================= */ 
     
-        void device_default::lock() { }
+        void device_default::lock() {
+            device_locker.lock();
+        }
 
-        bool device_default::try_lock() { return true; }
+        bool device_default::try_lock() {
+            return device_locker.try_lock();
+        }
 
-        void device_default::unlock() { }
+        void device_default::unlock() {
+            device_locker.unlock();
+        }
 
         /* ======================================================================= */
         /*                             WALLET & ADDRESS                            */
@@ -103,7 +117,7 @@ namespace hw {
         bool  device_default::generate_chacha_key(const cryptonote::account_keys &keys, crypto::chacha_key &key, uint64_t kdf_rounds) {
             const crypto::secret_key &view_key = keys.m_view_secret_key;
             const crypto::secret_key &spend_key = keys.m_spend_secret_key;
-            epee::mlocked<tools::scrubbed_arr<char, sizeof(view_key) + sizeof(spend_key) + 1>> data;
+            epee::mlocked<tools::scrubbed<std::array<char, sizeof(view_key) + sizeof(spend_key) + 1>>> data;
             memcpy(data.data(), &view_key, sizeof(view_key));
             memcpy(data.data() + sizeof(view_key), &spend_key, sizeof(spend_key));
             data[sizeof(data) - 1] = config::HASH_KEY_WALLET;
@@ -195,15 +209,15 @@ namespace hw {
         }
 
         crypto::secret_key  device_default::get_subaddress_secret_key(const crypto::secret_key &a, const cryptonote::subaddress_index &index) {
-            char data[sizeof(config::HASH_KEY_SUBADDRESS) + sizeof(crypto::secret_key) + 2 * sizeof(uint32_t)];
-            memcpy(data, config::HASH_KEY_SUBADDRESS, sizeof(config::HASH_KEY_SUBADDRESS));
-            memcpy(data + sizeof(config::HASH_KEY_SUBADDRESS), &a, sizeof(crypto::secret_key));
+            epee::mlocked<tools::scrubbed<std::array<char, sizeof(config::HASH_KEY_SUBADDRESS) + sizeof(crypto::secret_key) + 2 * sizeof(uint32_t)>>> data;
+            memcpy(data.data(), config::HASH_KEY_SUBADDRESS, sizeof(config::HASH_KEY_SUBADDRESS));
+            memcpy(data.data() + sizeof(config::HASH_KEY_SUBADDRESS), &a, sizeof(crypto::secret_key));
             uint32_t idx = SWAP32LE(index.major);
-            memcpy(data + sizeof(config::HASH_KEY_SUBADDRESS) + sizeof(crypto::secret_key), &idx, sizeof(uint32_t));
+            memcpy(data.data() + sizeof(config::HASH_KEY_SUBADDRESS) + sizeof(crypto::secret_key), &idx, sizeof(uint32_t));
             idx = SWAP32LE(index.minor);
-            memcpy(data + sizeof(config::HASH_KEY_SUBADDRESS) + sizeof(crypto::secret_key) + sizeof(uint32_t), &idx, sizeof(uint32_t));
+            memcpy(data.data() + sizeof(config::HASH_KEY_SUBADDRESS) + sizeof(crypto::secret_key) + sizeof(uint32_t), &idx, sizeof(uint32_t));
             crypto::secret_key m;
-            crypto::hash_to_scalar(data, sizeof(data), m);
+            crypto::hash_to_scalar(data.data(), sizeof(data), m);
             return m;
         }
 
@@ -263,6 +277,11 @@ namespace hw {
             return true;
         }
 
+        bool device_default::derive_view_tag(const crypto::key_derivation &derivation, const std::size_t output_index, crypto::view_tag &view_tag) {
+            crypto::derive_view_tag(derivation, output_index, view_tag);
+            return true;
+        }
+
         bool device_default::conceal_derivation(crypto::key_derivation &derivation, const crypto::public_key &tx_pub_key, const std::vector<crypto::public_key> &additional_tx_pub_keys, const crypto::key_derivation &main_derivation, const std::vector<crypto::key_derivation> &additional_derivations){
             return true;
         }
@@ -291,7 +310,8 @@ namespace hw {
                                                             const cryptonote::tx_destination_entry &dst_entr, const boost::optional<cryptonote::account_public_address> &change_addr, const size_t output_index,
                                                             const bool &need_additional_txkeys, const std::vector<crypto::secret_key> &additional_tx_keys,
                                                             std::vector<crypto::public_key> &additional_tx_public_keys,
-                                                            std::vector<rct::key> &amount_keys,  crypto::public_key &out_eph_public_key) {
+                                                            std::vector<rct::key> &amount_keys,  crypto::public_key &out_eph_public_key,
+                                                            const bool use_view_tags, crypto::view_tag &view_tag) {
 
             crypto::key_derivation derivation;
 
@@ -311,13 +331,15 @@ namespace hw {
             {
             // sending change to yourself; derivation = a*R
                 r = generate_key_derivation(txkey_pub, sender_account_keys.m_view_secret_key, derivation);
-                CHECK_AND_ASSERT_MES(r, false, "at creation outs: failed to generate_key_derivation(" << txkey_pub << ", " << sender_account_keys.m_view_secret_key << ")");
+                CHECK_AND_ASSERT_MES(r, false, "at creation outs: failed to generate_key_derivation(" << txkey_pub << ", <viewkey>)");
             }
             else
             {
             // sending to the recipient; derivation = r*A (or s*C in the subaddress scheme)
-                r = generate_key_derivation(dst_entr.addr.m_view_public_key, dst_entr.is_subaddress && need_additional_txkeys ? additional_txkey.sec : tx_key, derivation);
-                CHECK_AND_ASSERT_MES(r, false, "at creation outs: failed to generate_key_derivation(" << dst_entr.addr.m_view_public_key << ", " << (dst_entr.is_subaddress && need_additional_txkeys ? additional_txkey.sec : tx_key) << ")");
+                const crypto::secret_key &tx_privkey{dst_entr.is_subaddress && need_additional_txkeys ? additional_txkey.sec : tx_key};
+                r = generate_key_derivation(dst_entr.addr.m_view_public_key, tx_privkey, derivation);
+                CHECK_AND_ASSERT_MES(r, false, "at creation outs: failed to generate_key_derivation("
+                    << dst_entr.addr.m_view_public_key << ", " << crypto::secret_key_explicit_print_ref{tx_privkey} << ")");
             }
 
             if (need_additional_txkeys)
@@ -331,6 +353,12 @@ namespace hw {
                 derivation_to_scalar(derivation, output_index, scalar1);
                 amount_keys.push_back(rct::sk2rct(scalar1));
             }
+
+            if (use_view_tags)
+            {
+                derive_view_tag(derivation, output_index, view_tag);
+            }
+
             r = derive_public_key(derivation, output_index, dst_entr.addr.m_spend_public_key, out_eph_public_key);
             CHECK_AND_ASSERT_MES(r, false, "at creation outs: failed to derive_public_key(" << derivation << ", " << output_index << ", "<< dst_entr.addr.m_spend_public_key << ")");
 

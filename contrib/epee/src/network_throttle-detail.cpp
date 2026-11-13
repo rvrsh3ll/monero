@@ -1,8 +1,8 @@
 /// @file
 /// @author rfree (current maintainer in monero.cc project)
-/// @brief implementaion for throttling of connection (count and rate-limit speed etc)
+/// @brief implementation for throttling of connection (count and rate-limit speed etc)
 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -33,21 +33,12 @@
 /* rfree: implementation for throttle details */
 
 #include <string>
-#include <vector>
-#include <atomic>
-
-#include <boost/asio.hpp>
-
-#include <memory>
 
 #include "syncobj.h"
 
-#include "net/net_utils_base.h" 
 #include "misc_log_ex.h" 
 #include <boost/chrono.hpp>
-#include "misc_language.h"
-#include "pragma_comp_defs.h"
-#include <sstream>
+#include <fstream>
 #include <iomanip>
 #include <algorithm>
 
@@ -55,7 +46,6 @@
 
 #include <boost/asio/basic_socket.hpp>
 #include <boost/asio/ip/unicast.hpp>
-#include "net/abstract_tcp_server2.h"
 
 // TODO:
 #include "net/network_throttle-detail.hpp"
@@ -65,7 +55,7 @@
 
 // ################################################################################################
 // ################################################################################################
-// the "header part". Not separeted out for .hpp because point of this modification is 
+// the "header part". Not separated out for .hpp because point of this modification is
 // to rebuild just 1 translation unit while working on this code.
 // (But maybe common parts will be separated out later though - if needed)
 // ################################################################################################
@@ -187,6 +177,23 @@ void network_throttle::handle_trafic_exact(size_t packet_size)
 	_handle_trafic_exact(packet_size, packet_size);
 }
 
+namespace
+{
+	struct output_history
+	{
+		const boost::circular_buffer< network_throttle::packet_info >& history;
+	};
+
+	std::ostream& operator<<(std::ostream& out, const output_history& source)
+	{
+		out << '[';
+		for (auto sample: source.history)
+			out << sample.m_size << ' ';
+		out << ']';
+		return out;
+	}
+}
+
 void network_throttle::_handle_trafic_exact(size_t packet_size, size_t orginal_size)
 {
 	tick();
@@ -197,14 +204,11 @@ void network_throttle::_handle_trafic_exact(size_t packet_size, size_t orginal_s
 	m_total_packets++;
 	m_total_bytes += packet_size;
 
-	std::ostringstream oss; oss << "["; 	for (auto sample: m_history) oss << sample.m_size << " ";	 oss << "]" << std::ends;
-	std::string history_str = oss.str();
-
 	MTRACE("Throttle " << m_name << ": packet of ~"<<packet_size<<"b " << " (from "<<orginal_size<<" b)"
         << " Speed AVG=" << std::setw(4) <<  ((long int)(cts .average/1024)) <<"[w="<<cts .window<<"]"
         <<           " " << std::setw(4) <<  ((long int)(cts2.average/1024)) <<"[w="<<cts2.window<<"]"
 				<<" / " << " Limit="<< ((long int)(m_target_speed/1024)) <<" KiB/sec "
-				<< " " << history_str
+				<< " " << output_history{m_history}
 		);
 }
 
@@ -253,7 +257,7 @@ void network_throttle::calculate_times(size_t packet_size, calculate_times_struc
 
 	if (!m_any_packet_yet) {
 		cts.window=0; cts.average=0; cts.delay=0; 
-		cts.recomendetDataSize = m_network_minimal_segment; // should be overrided by caller anyway
+		cts.recomendetDataSize = m_network_minimal_segment; // should be overridden by caller anyway
 		return ; // no packet yet, I can not decide about sleep time
 	}
 
@@ -275,7 +279,7 @@ void network_throttle::calculate_times(size_t packet_size, calculate_times_struc
 	const double D1 = (Epast - M*cts.window) / M; // delay - how long to sleep to get back to target speed
 	const double D2 = (Enow  - M*cts.window) / M; // delay - how long to sleep to get back to target speed (including current packet)
 
-    cts.delay = (D1*0.80 + D2*0.20); // finall sleep depends on both with/without current packet
+    cts.delay = (D1*0.80 + D2*0.20); // final sleep depends on both with/without current packet
 	//				update_overheat();
 	cts.average = Epast/cts.window; // current avg. speed (for info)
 
@@ -290,8 +294,6 @@ void network_throttle::calculate_times(size_t packet_size, calculate_times_struc
     }
 
 	if (dbg) {
-		std::ostringstream oss; oss << "["; 	for (auto sample: m_history) oss << sample.m_size << " ";	 oss << "]" << std::ends;
-		std::string history_str = oss.str();
 		MTRACE((cts.delay > 0 ? "SLEEP" : "")
 			<< "dbg " << m_name << ": " 
 			<< "speed is A=" << std::setw(8) <<cts.average<<" vs "
@@ -301,7 +303,7 @@ void network_throttle::calculate_times(size_t packet_size, calculate_times_struc
 			<< "E="<< std::setw(8) << E << " (Enow="<<std::setw(8)<<Enow<<") "
             << "M=" << std::setw(8) << M <<" W="<< std::setw(8) << cts.window << " "
             << "R=" << std::setw(8) << cts.recomendetDataSize << " Wgood" << std::setw(8) << Wgood << " "
-			<< "History: " << std::setw(8) << history_str << " "
+			<< "History: " << std::setw(8) << output_history{m_history} << " "
 			<< "m_last_sample_time=" << std::setw(8) << m_last_sample_time
 		);
 
@@ -343,7 +345,7 @@ size_t network_throttle::get_recommended_size_of_planned_transport() const {
 
 double network_throttle::get_current_speed() const {
 	unsigned int bytes_transferred = 0;
-	if (m_history.size() == 0 || m_slot_size == 0)
+	if (m_history.size() <= 1 || m_slot_size == 0)
 		return 0;
 		
 	auto it = m_history.begin();

@@ -1,4 +1,4 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -31,12 +31,84 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/utility/string_ref.hpp>
 #include <cstdint>
+#include <optional>
+#include <vector>
 
 #include "common/expect.h"
+#include "net/fwd.h"
 #include "net/net_utils_base.h"
 
 namespace net
 {
+    //! \brief Separates scheme, authority, and path sections of a URI.
+    struct scheme_and_authority
+    {
+        //! \param uri with optional scheme, authority, and optional path. No URNs.
+        explicit scheme_and_authority(boost::string_ref uri);
+
+        std::string scheme;
+        std::string authority;
+    };
+
+    //! \brief Separates the userinfo and host+port from URI authority.
+    struct userinfo_and_hostport
+    {
+        //! \param authority portion of a URI.
+        explicit userinfo_and_hostport(boost::string_ref authority);
+
+        std::string userinfo;
+        std::string hostport;
+    };
+
+    //! \brief Separates the user and pass sections from URI userinfo.
+    struct user_and_pass
+    {
+        user_and_pass()
+          : user(), pass()
+        {}
+
+        /*!
+         * \param userinfo section of a URI.
+         * \return User and pass with percent encoding removed. `std::nullopt`
+         *    if bad percent encoding
+         */
+        static std::optional<user_and_pass> get(boost::string_ref userinfo);
+
+        std::string user;
+        std::string pass;
+    };
+
+    //! \brief Separates scheme, user, pass, and host+port sections of a URI.
+    struct uri_components
+    {
+        uri_components()
+          : scheme(), userinfo(), hostport()
+        {}
+
+        /*!
+         * \param uri with optional scheme, optional user, optional pass,
+         *    authority, and optional path. URN not supported.
+         * \return Scheme, user, pass, and host+port sections of a URI with
+         *    percent encoding removed on user and pass. `std::nullopt` if
+         *    bad percent encoding.
+         */
+        static std::optional<uri_components> get(boost::string_ref uri);
+
+        std::string scheme;
+        user_and_pass userinfo;
+        std::string hostport;
+    };
+
+    /*!
+     * \brief Takes a valid address string (IP, Tor, I2P, or DNS name) and splits it into host and port
+     *
+     * The host of an IPv6 addresses in the format "[x:x:..:x]:port" will have the braces stripped.
+     * For example, when the address is "[ffff::2023]", host will be set to "ffff::2023".
+     *
+     * \param address The address string one wants to split
+     * \param[out] host The host part of the address string. Is always set.
+     * \param[out] port The port part of the address string. Is only set when address string contains a port.
+    */
     void get_network_address_host_and_port(const std::string& address, std::string& host, std::string& port);
 
     /*!
@@ -55,7 +127,7 @@ namespace net
         get_network_address(boost::string_ref address, std::uint16_t default_port);
 
     /*!
-      Identifies an IPv4 subnet in CIDR notatioa and returns it as a generic
+      Identifies an IPv4 subnet in CIDR notation and returns it as a generic
       `network_address`. If the type is unsupported, it might be a hostname,
       and `error() == net::error::kUnsupportedAddress` is returned.
 
@@ -68,5 +140,24 @@ namespace net
         get_ipv4_subnet_address(boost::string_ref address, bool allow_implicit_32 = false);
 
     expect<boost::asio::ip::tcp::endpoint> get_tcp_endpoint(const boost::string_ref address);
+
+    namespace socks
+    {
+        //! \brief Separates TCP address, user+pass, and socks version
+        struct endpoint
+        {
+            endpoint();
+            explicit endpoint(const boost::asio::ip::tcp::endpoint& address);
+
+            //! \param uri with optional scheme, optional userinfo, and host+port.
+            //! \param resolve_host whether to resolve a proxy hostname with local DNS.
+            static expect<endpoint> get(boost::string_ref uri, bool resolve_host = false);
+
+            boost::asio::ip::tcp::endpoint address;
+            std::vector<boost::asio::ip::tcp::endpoint> resolved_addresses;
+            user_and_pass userinfo;
+            version ver;
+        };
+    }
 }
 

@@ -29,7 +29,7 @@
 #include <fstream>
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
-#ifdef WIN32
+#ifdef _WIN32
 #include <windows.h>
 #include "string_tools.h"
 #endif
@@ -63,14 +63,21 @@ namespace file_io_utils
  
 	bool is_file_exist(const std::string& path)
 	{
-		boost::filesystem::path p(path);
-		return boost::filesystem::exists(p);
+		try
+		{
+			boost::filesystem::path p(path);
+			return boost::filesystem::exists(p);
+		}
+		catch (...)
+		{
+			return false;
+		}
 	}
 
 
 	bool save_string_to_file(const std::string& path_to_file, const std::string& str)
 	{
-#ifdef WIN32
+#ifdef _WIN32
                 std::wstring wide_path;
                 try { wide_path = string_tools::utf8_to_utf16(path_to_file); } catch (...) { return false; }
                 HANDLE file_handle = CreateFileW(wide_path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -102,35 +109,12 @@ namespace file_io_utils
 	}
 
 
-	bool get_file_time(const std::string& path_to_file, time_t& ft)
-	{
-		boost::system::error_code ec;
-		ft = boost::filesystem::last_write_time(boost::filesystem::path(path_to_file), ec);
-		if(!ec)
-			return true;
-		else
-			return false;
-	}
-
-
-	bool set_file_time(const std::string& path_to_file, const time_t& ft)
-	{
-		boost::system::error_code ec;
-		boost::filesystem::last_write_time(boost::filesystem::path(path_to_file), ft, ec);
-		if(!ec)
-			return true;
-		else
-			return false;
-	}
-
-
-
 	bool load_file_to_string(const std::string& path_to_file, std::string& target_str, size_t max_size)
 	{
-#ifdef WIN32
+#ifdef _WIN32
                 std::wstring wide_path;
                 try { wide_path = string_tools::utf8_to_utf16(path_to_file); } catch (...) { return false; }
-                HANDLE file_handle = CreateFileW(wide_path.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                HANDLE file_handle = CreateFileW(wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
                 if (file_handle == INVALID_HANDLE_VALUE)
                     return false;
                 DWORD file_size = GetFileSize(file_handle, NULL);
@@ -172,60 +156,5 @@ namespace file_io_utils
 		}
 #endif
 	}
-
-
-	bool append_string_to_file(const std::string& path_to_file, const std::string& str)
-	{
-                // No special Windows implementation because so far not used in Monero code
-		try
-		{
-			std::ofstream fstream;
-			fstream.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-			fstream.open(path_to_file.c_str(), std::ios_base::binary | std::ios_base::out | std::ios_base::app);
-			fstream << str;
-			fstream.close();
-			return true;
-		}
-
-		catch(...)
-		{
-			return false;
-		}
-	}
-
-
-	bool get_file_size(const std::string& path_to_file, uint64_t &size)
-	{
-#ifdef WIN32
-                std::wstring wide_path;
-                try { wide_path = string_tools::utf8_to_utf16(path_to_file); } catch (...) { return false; }
-                HANDLE file_handle = CreateFileW(wide_path.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (file_handle == INVALID_HANDLE_VALUE)
-                    return false;
-                LARGE_INTEGER file_size;
-                BOOL result = GetFileSizeEx(file_handle, &file_size);
-                CloseHandle(file_handle);
-                if (result) {
-                    size = file_size.QuadPart;
-                }
-                return size;
-#else
-		try
-		{
-			std::ifstream fstream;
-			fstream.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-			fstream.open(path_to_file, std::ios_base::binary | std::ios_base::in | std::ios::ate);
-			size = fstream.tellg();
-			fstream.close();
-			return true;
-		}
-
-		catch(...)
-		{
-			return false;
-		}
-#endif
-	}
-
 }
 }

@@ -2,7 +2,7 @@
 /// @author rfree (current maintainer in monero.cc project)
 /// @brief This is the place to implement our handlers for protocol network actions, e.g. for ratelimit for download-requests
 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -30,27 +30,17 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <string>
-#include <vector>
-
-#include <memory>
-
 #include "syncobj.h"
 
-#include "net/net_utils_base.h" 
 #include "misc_log_ex.h" 
 #include <boost/chrono.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/thread.hpp> 
-#include "misc_language.h"
-#include "pragma_comp_defs.h"
 #include <algorithm>
 
 
 #include "cryptonote_protocol_handler.h"
 #include "net/network_throttle.hpp"
-
-#include "cryptonote_core/cryptonote_core.h" // e.g. for the send_stop_signal()
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net.cn"
@@ -65,7 +55,7 @@
 
 namespace cryptonote {
 
-class cryptonote_protocol_handler_base_pimpl { // placeholer if needed
+class cryptonote_protocol_handler_base_pimpl { // placeholder if needed
 	public:
 
 };
@@ -79,7 +69,7 @@ class cryptonote_protocol_handler_base_pimpl { // placeholer if needed
 
 namespace cryptonote { 
 
-double cryptonote_protocol_handler_base::estimate_one_block_size() noexcept { // for estimating size of blocks to downloa
+double cryptonote_protocol_handler_base::estimate_one_block_size() noexcept { // for estimating size of blocks to download
  const double size_min = 500; // XXX 500
  //const int history_len = 20; // how many blocks to average over
 
@@ -136,8 +126,6 @@ void cryptonote_protocol_handler_base::handler_response_blocks_now(size_t packet
 	{
 	  CRITICAL_REGION_LOCAL(	network_throttle_manager::m_lock_get_global_throttle_out );
 		network_throttle_manager::get_global_throttle_out().handle_trafic_tcp( packet_size ); // increase counter - global
-		//epee::critical_region_t<decltype(m_throttle_global_lock)> guard(m_throttle_global_lock); // *** critical *** 
-		//m_throttle_global.m_out.handle_trafic_tcp( packet_size ); // increase counter - global
 	}
 }
 

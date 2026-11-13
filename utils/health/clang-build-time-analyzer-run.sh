@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -56,7 +56,7 @@ mkdir -p "$DIR_BUILD" && cd "$DIR_BUILD"
 cmake ../.. \
 -DCMAKE_C_COMPILER=clang \
 -DCMAKE_CXX_COMPILER=clang++ \
--DUSE_CCACHE=OFF \
+-DCOMPILER_CACHE=none \
 -DUSE_COMPILATION_TIME_PROFILER=ON \
 -DBUILD_SHARED_LIBS=ON \
 -DBUILD_TESTS=ON

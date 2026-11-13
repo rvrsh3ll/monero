@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -40,7 +40,7 @@ namespace hw {
 
 
 
-    /** HID class base. Commands are formated as follow:
+    /** HID class base. Commands are formatted as follows:
      *
      * |----------------------------------------------------------|
      * |  2 bytes  |  1 byte  |  2 bytes  | 2 bytes  |  len bytes |

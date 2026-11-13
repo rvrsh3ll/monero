@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -51,7 +51,7 @@ macro (monero_clang_tidy LANGUAGE)
 			    # An example of selectively enabling checks:
 			    #-checks=bugprone-*,cppcoreguidelines-avoid-goto # Have to be in one line :(
 			)
-			# Current list of checks is avaibale under:
+			# Current list of checks is available under:
 			# https://clang.llvm.org/extra/clang-tidy/
 			if (${LANGUAGE} STREQUAL "C")
 				set(CMAKE_C_CLANG_TIDY

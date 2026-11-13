@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -48,10 +48,6 @@
 
 #include "blockchain_utilities.h"
 
-
-using namespace cryptonote;
-
-
 class BootstrapFile
 {
 public:
@@ -66,24 +62,27 @@ public:
 
 protected:
 
-  Blockchain* m_blockchain_storage;
+  cryptonote::Blockchain* m_blockchain_storage;
 
-  tx_memory_pool* m_tx_pool;
+  cryptonote::tx_memory_pool* m_tx_pool;
   typedef std::vector<char> buffer_type;
   std::ofstream * m_raw_data_file;
   buffer_type m_buffer;
   boost::iostreams::stream<boost::iostreams::back_insert_device<buffer_type>>* m_output_stream;
 
   // open export file for write
-  bool open_writer(const boost::filesystem::path& file_path, uint64_t start_block, uint64_t stop_block);
+  bool open_writer(const boost::filesystem::path& file_path, uint64_t start_block,
+      uint64_t stop_block, uint64_t& next_block);
   bool initialize_file(uint64_t start_block, uint64_t stop_block);
   bool close();
-  void write_block(block& block);
+  void write_block(cryptonote::block& block);
   void flush_chunk();
 
 private:
 
-  uint64_t m_height;
+  uint64_t count_bytes(std::ifstream& import_file, const uint64_t* file_size,
+      uint64_t& file_offset, uint64_t blocks, uint64_t& h, bool& quit);
+
   uint64_t m_cur_height; // tracks current height during export
   uint32_t m_max_chunk;
 };

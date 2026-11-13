@@ -29,11 +29,12 @@
 #pragma once
 #include "memwipe.h"
 
-#include <boost/utility/string_ref.hpp>
+#include <boost/utility/string_view.hpp>
 
 #include <string>
 #include <utility>
 #include <list>
+#include <stdint.h>
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net.http"
@@ -55,21 +56,9 @@ namespace net_utils
 			http_method_unknown
 		};
 
-		enum http_content_type
-		{
-			http_content_type_text_html,
-			http_content_type_image_gif, 
-			http_content_type_other,
-			http_content_type_not_set
-		};
-
 		typedef std::list<std::pair<std::string, std::string> > fields_list;
 
-		std::string get_value_from_fields_list(const std::string& param_name, const net_utils::http::fields_list& fields);
-
-		std::string get_value_from_uri_line(const std::string& param_name, const std::string& uri);
-
-		static inline void add_field(std::string& out, const boost::string_ref name, const boost::string_ref value)
+		static inline void add_field(std::string& out, boost::string_view name, boost::string_view value)
 		{
 			out.append(name.data(), name.size()).append(": ");
 			out.append(value.data(), value.size()).append("\r\n");
@@ -79,6 +68,42 @@ namespace net_utils
 			add_field(out, field.first, field.second);
 		}
 
+		namespace detail
+		{
+			inline bool parse_header_line(boost::string_view line, boost::string_view& name, boost::string_view& value)
+			{
+				if(!line.empty() && line.back() == '\r')
+					line.remove_suffix(1);
+				if(line.empty())
+					return false;
+				if(line.front() == ' ' || line.front() == '\t')
+					return false;
+
+				const size_t colon = line.find(':');
+				if(colon == boost::string_view::npos || colon == 0)
+					return false;
+
+				name = line.substr(0, colon);
+				value = line.substr(colon + 1);
+				while(!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+					value.remove_prefix(1);
+				while(!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+					value.remove_suffix(1);
+
+				for(char c : name)
+				{
+					const bool alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+					const bool allowed = alnum ||
+						c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+						c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+						c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+					if(!allowed)
+						return false;
+				}
+
+				return true;
+			}
+		}
 
 		struct http_header_info
 		{
@@ -167,8 +192,8 @@ namespace net_utils
 			std::string			m_body;
 			std::string			m_mime_tipe;
 			http_header_info    m_header_info;
-			int                 m_http_ver_hi;// OUT paramter only
-			int                 m_http_ver_lo;// OUT paramter only
+			int                 m_http_ver_hi;// OUT parameter only
+			int                 m_http_ver_lo;// OUT parameter only
 
 			void clear()
 			{

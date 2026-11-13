@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -29,6 +29,7 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include <assert.h>
+#include <sodium/crypto_verify_32.h>
 #include <stdint.h>
 
 #include "warnings.h"
@@ -38,12 +39,10 @@ DISABLE_VS_WARNINGS(4146 4244)
 
 /* Predeclarations */
 
-static void fe_mul(fe, const fe, const fe);
-static void fe_sq(fe, const fe);
 static void ge_madd(ge_p1p1 *, const ge_p3 *, const ge_precomp *);
 static void ge_msub(ge_p1p1 *, const ge_p3 *, const ge_precomp *);
 static void ge_p2_0(ge_p2 *);
-static void ge_p3_dbl(ge_p1p1 *, const ge_p3 *);
+static void ge_p3_0(ge_p3 *);
 static void fe_divpowm1(fe, const fe, const fe);
 
 /* Common functions */
@@ -72,7 +71,7 @@ uint64_t load_4(const unsigned char *in)
 h = 0
 */
 
-static void fe_0(fe h) {
+void fe_0(fe h) {
   h[0] = 0;
   h[1] = 0;
   h[2] = 0;
@@ -91,7 +90,7 @@ static void fe_0(fe h) {
 h = 1
 */
 
-static void fe_1(fe h) {
+void fe_1(fe h) {
   h[0] = 1;
   h[1] = 0;
   h[2] = 0;
@@ -314,6 +313,61 @@ void fe_invert(fe out, const fe z) {
   return;
 }
 
+// return 1 if a == b, else 0
+int fe_equals(const fe a, const fe b) {
+  unsigned char a_bytes[32];
+  unsigned char b_bytes[32];
+  fe_tobytes(a_bytes, a);
+  fe_tobytes(b_bytes, b);
+  return crypto_verify_32(a_bytes, b_bytes) == 0;
+}
+
+/* From fe_isnonzero.c, modified */
+
+static int fe_isnonzero(const fe f) {
+  unsigned char s[32];
+  fe_tobytes(s, f);
+  return (((int) (s[0] | s[1] | s[2] | s[3] | s[4] | s[5] | s[6] | s[7] | s[8] |
+    s[9] | s[10] | s[11] | s[12] | s[13] | s[14] | s[15] | s[16] | s[17] |
+    s[18] | s[19] | s[20] | s[21] | s[22] | s[23] | s[24] | s[25] | s[26] |
+    s[27] | s[28] | s[29] | s[30] | s[31]) - 1) >> 8) + 1;
+}
+
+// Montgomery's trick
+// https://iacr.org/archive/pkc2004/29470042/29470042.pdf 2.2
+int fe_batch_invert(fe* __restrict out, const fe* __restrict in, const unsigned int n) {
+  if (n == 0) {
+    return 0;
+  }
+
+  assert(out);
+  assert(in);
+  assert(in != out); // also should not overlap
+
+  // Step 1: collect initial muls
+  fe_copy(out[0], in[0]);
+  for (unsigned int i = 1; i < n; ++i) {
+    fe_mul(out[i], out[i-1], in[i]);
+  }
+
+  // Step 2: get the inverse of all elems multiplied together
+  if (!fe_isnonzero(out[n-1])) {
+    // Don't divide by 0
+    return -1;
+  }
+  fe a;
+  fe_invert(a, out[n-1]);
+
+  // Step 3: get each inverse
+  for (unsigned int i = n; i > 1; --i) {
+    fe_mul(out[i-1], a, out[i-2]);
+    fe_mul(a, a, in[i-1]);
+  }
+  fe_copy(out[0], a);
+
+  return 0;
+}
+
 /* From fe_isnegative.c */
 
 /*
@@ -328,17 +382,6 @@ static int fe_isnegative(const fe f) {
   unsigned char s[32];
   fe_tobytes(s, f);
   return s[0] & 1;
-}
-
-/* From fe_isnonzero.c, modified */
-
-static int fe_isnonzero(const fe f) {
-  unsigned char s[32];
-  fe_tobytes(s, f);
-  return (((int) (s[0] | s[1] | s[2] | s[3] | s[4] | s[5] | s[6] | s[7] | s[8] |
-    s[9] | s[10] | s[11] | s[12] | s[13] | s[14] | s[15] | s[16] | s[17] |
-    s[18] | s[19] | s[20] | s[21] | s[22] | s[23] | s[24] | s[25] | s[26] |
-    s[27] | s[28] | s[29] | s[30] | s[31]) - 1) >> 8) + 1;
 }
 
 /* From fe_mul.c */
@@ -375,7 +418,7 @@ Can get away with 11 carries, but then data flow is much deeper.
 With tighter constraints on inputs can squeeze carries into int32.
 */
 
-static void fe_mul(fe h, const fe f, const fe g) {
+void fe_mul(fe h, const fe f, const fe g) {
   int32_t f0 = f[0];
   int32_t f1 = f[1];
   int32_t f2 = f[2];
@@ -605,7 +648,7 @@ Postconditions:
    |h| bounded by 1.1*2^25,1.1*2^24,1.1*2^25,1.1*2^24,etc.
 */
 
-static void fe_neg(fe h, const fe f) {
+void fe_neg(fe h, const fe f) {
   int32_t f0 = f[0];
   int32_t f1 = f[1];
   int32_t f2 = f[2];
@@ -655,7 +698,7 @@ Postconditions:
 See fe_mul.c for discussion of implementation strategy.
 */
 
-static void fe_sq(fe h, const fe f) {
+void fe_sq(fe h, const fe f) {
   int32_t f0 = f[0];
   int32_t f1 = f[1];
   int32_t f2 = f[2];
@@ -959,7 +1002,7 @@ Postconditions:
    |h| bounded by 1.1*2^26,1.1*2^25,1.1*2^26,1.1*2^25,etc.
 */
 
-static void fe_sub(fe h, const fe f, const fe g) {
+void fe_sub(fe h, const fe f, const fe g) {
   int32_t f0 = f[0];
   int32_t f1 = f[1];
   int32_t f2 = f[2];
@@ -1298,6 +1341,7 @@ void ge_double_scalarmult_base_vartime_p3(ge_p3 *r3, const unsigned char *a, con
   ge_dsm_precomp(Ai, A);
 
   ge_p2_0(&r);
+  ge_p3_0(r3);
 
   for (i = 255; i >= 0; --i) {
     if (aslide[i] || bslide[i]) break;
@@ -1329,16 +1373,9 @@ void ge_double_scalarmult_base_vartime_p3(ge_p3 *r3, const unsigned char *a, con
   }
 }
 
-/* From ge_frombytes.c, modified */
+/* From fe_frombytes.c */
 
-int ge_frombytes_vartime(ge_p3 *h, const unsigned char *s) {
-  fe u;
-  fe v;
-  fe vxx;
-  fe check;
-
-  /* From fe_frombytes.c */
-
+int fe_frombytes_vartime(fe y, const unsigned char *s) {
   int64_t h0 = load_4(s);
   int64_t h1 = load_3(s + 4) << 6;
   int64_t h2 = load_3(s + 7) << 5;
@@ -1379,18 +1416,31 @@ int ge_frombytes_vartime(ge_p3 *h, const unsigned char *s) {
   carry6 = (h6 + (int64_t) (1<<25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
   carry8 = (h8 + (int64_t) (1<<25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
 
-  h->Y[0] = h0;
-  h->Y[1] = h1;
-  h->Y[2] = h2;
-  h->Y[3] = h3;
-  h->Y[4] = h4;
-  h->Y[5] = h5;
-  h->Y[6] = h6;
-  h->Y[7] = h7;
-  h->Y[8] = h8;
-  h->Y[9] = h9;
+  y[0] = h0;
+  y[1] = h1;
+  y[2] = h2;
+  y[3] = h3;
+  y[4] = h4;
+  y[5] = h5;
+  y[6] = h6;
+  y[7] = h7;
+  y[8] = h8;
+  y[9] = h9;
 
-  /* End fe_frombytes.c */
+  return 0;
+}
+
+/* From ge_frombytes.c, modified */
+
+int ge_frombytes_vartime(ge_p3 *h, const unsigned char *s) {
+  fe u;
+  fe v;
+  fe vxx;
+  fe check;
+
+  if (fe_frombytes_vartime(h->Y, s) != 0) {
+    return -1;
+  }
 
   fe_1(h->Z);
   fe_sq(u, h->Y);
@@ -1530,7 +1580,7 @@ static void ge_p3_0(ge_p3 *h) {
 r = 2 * p
 */
 
-static void ge_p3_dbl(ge_p1p1 *r, const ge_p3 *p) {
+void ge_p3_dbl(ge_p1p1 *r, const ge_p3 *p) {
   ge_p2 q;
   ge_p3_to_p2(&q, p);
   ge_p2_dbl(r, &q);
@@ -2260,6 +2310,7 @@ void ge_double_scalarmult_precomp_vartime2_p3(ge_p3 *r3, const unsigned char *a,
   slide(bslide, b);
 
   ge_p2_0(&r);
+  ge_p3_0(r3);
 
   for (i = 255; i >= 0; --i) {
     if (aslide[i] || bslide[i]) break;
@@ -2305,6 +2356,17 @@ void ge_mul8(ge_p1p1 *r, const ge_p2 *t) {
   ge_p2_dbl(r, &u);
   ge_p1p1_to_p2(&u, r);
   ge_p2_dbl(r, &u);
+}
+
+void ge_clear_torsion_vartime(unsigned char *out, const ge_p3 *point) {
+  // mul by inv 8, then mul by 8
+  ge_p2 point_inv_8;
+  ge_scalarmult(&point_inv_8, sc_inv_eight, point);
+  ge_p1p1 point_inv_8_mul_8;
+  ge_mul8(&point_inv_8_mul_8, &point_inv_8);
+  ge_p3 torsion_cleared_point;
+  ge_p1p1_to_p3(&torsion_cleared_point, &point_inv_8_mul_8);
+  ge_p3_tobytes(out, &torsion_cleared_point);
 }
 
 void ge_fromfe_frombytes_vartime(ge_p2 *r, const unsigned char *s) {
@@ -2426,6 +2488,14 @@ setsign:
 void sc_0(unsigned char *s) {
   int i;
   for (i = 0; i < 32; i++) {
+    s[i] = 0;
+  }
+}
+
+void sc_1(unsigned char *s) {
+  int i;
+  s[0] = 1;
+  for (i = 1; i < 32; i++) {
     s[i] = 0;
   }
 }
@@ -3811,6 +3881,15 @@ static int64_t signum(int64_t a) {
   return a > 0 ? 1 : a < 0 ? -1 : 0;
 }
 
+//! @brief arithmetic left shift for signed operands
+static int64_t signed_lshift(const int64_t a, const int b) {
+#ifdef __GNUC__
+  return a << b; // well-defined in GCC
+#else
+  return a * ((int64_t)1 << b);
+#endif
+}
+
 int sc_check(const unsigned char *s) {
   int64_t s0 = load_4(s);
   int64_t s1 = load_4(s + 4);
@@ -3820,7 +3899,16 @@ int sc_check(const unsigned char *s) {
   int64_t s5 = load_4(s + 20);
   int64_t s6 = load_4(s + 24);
   int64_t s7 = load_4(s + 28);
-  return (signum(1559614444 - s0) + (signum(1477600026 - s1) << 1) + (signum(2734136534 - s2) << 2) + (signum(350157278 - s3) << 3) + (signum(-s4) << 4) + (signum(-s5) << 5) + (signum(-s6) << 6) + (signum(268435456 - s7) << 7)) >> 8;
+  return -(0 >
+    (                 signum(1559614444 - s0)
+      + signed_lshift(signum(1477600026 - s1), 1)
+      + signed_lshift(signum(2734136534 - s2), 2)
+      + signed_lshift(signum(350157278  - s3), 3)
+      + signed_lshift(signum(           - s4), 4)
+      + signed_lshift(signum(           - s5), 5)
+      + signed_lshift(signum(           - s6), 6)
+      + signed_lshift(signum(268435456  - s7), 7)
+    ));
 }
 
 int sc_isnonzero(const unsigned char *s) {
@@ -3830,15 +3918,139 @@ int sc_isnonzero(const unsigned char *s) {
     s[27] | s[28] | s[29] | s[30] | s[31]) - 1) >> 8) + 1;
 }
 
-int ge_p3_is_point_at_infinity(const ge_p3 *p) {
-  // X = 0 and Y == Z
-  int n;
-  for (n = 0; n < 10; ++n)
+static int edwardsYZ_to_x25519(unsigned char *xbytes, const fe Y, const fe Z) {
+  //! @see Section 4.1 of RFC 7748: https://www.rfc-editor.org/rfc/rfc7748.html#section-4.1
+  //
+  // y = Y/Z
+  // x_mont = (1 + y) / (1 - y)
+  //        = (1 + Y/Z) / (1 - Y/Z)
+  //        = (Z + Y) / (Z - Y)
+
+  fe tmp0;
+  fe tmp1;
+  int r;
+  fe_add(tmp0, Z, Y);       // Z + Y
+  fe_sub(tmp1, Z, Y);       // Z - Y
+  r = -!fe_isnonzero(tmp1); // succeed iff 0 != (Z - Y). AKA fail if identity point or some invalid reprs
+  fe_invert(tmp1, tmp1);    // 1/(Z - Y)
+  fe_mul(tmp0, tmp0, tmp1); // (Z + Y) / (Z - Y)
+  fe_tobytes(xbytes, tmp0); // tobytes((Z + Y) / (Z - Y))
+  return r;                 // 0 on success, otherwise -1
+}
+
+int ge_p3_to_x25519(unsigned char *xbytes, const ge_p3 *h) {
+  return edwardsYZ_to_x25519(xbytes, h->Y, h->Z);
+}
+
+int edwards_bytes_to_x25519_vartime(unsigned char *xbytes, const unsigned char *s) {
+  ge_p3 h;
+  const int r = ge_frombytes_vartime(&h, s);
+  if (0 != r)
+    return r;
+
+  return edwardsYZ_to_x25519(xbytes, h.Y, h.Z);
+}
+
+int ge_p3_is_point_at_infinity_vartime(const ge_p3 *p) {
+  // https://eprint.iacr.org/2008/522
+  // X == T == 0 and Y/Z == 1
+  // note: convert all pieces to canonical bytes in case rounding is required (i.e. an element is > q)
+  // note2: even though T = XY/Z is true for valid point representations (implying it isn't necessary to
+  //        test T == 0), the input to this function might NOT be valid, so we must test T == 0
+  char result_X_bytes[32];
+  fe_tobytes((unsigned char*)&result_X_bytes, p->X);
+
+  // X != 0
+  for (int i = 0; i < 32; ++i)
   {
-    if (p->X[n] | p->T[n])
-      return 0;
-    if (p->Y[n] != p->Z[n])
+    if (result_X_bytes[i])
       return 0;
   }
-  return 1;
+
+  char result_T_bytes[32];
+  fe_tobytes((unsigned char*)&result_T_bytes, p->T);
+
+  // T != 0
+  for (int i = 0; i < 32; ++i)
+  {
+    if (result_T_bytes[i])
+      return 0;
+  }
+
+  char result_Y_bytes[32];
+  char result_Z_bytes[32];
+  fe_tobytes((unsigned char*)&result_Y_bytes, p->Y);
+  fe_tobytes((unsigned char*)&result_Z_bytes, p->Z);
+
+  // Y != Z
+  for (int i = 0; i < 32; ++i)
+  {
+    if (result_Y_bytes[i] != result_Z_bytes[i])
+      return 0;
+  }
+
+  // is Y nonzero? then Y/Z == 1
+  for (int i = 0; i < 32; ++i)
+  {
+    if (result_Y_bytes[i] != 0)
+      return 1;
+  }
+
+  // Y/Z = 0/0
+  return 0;
+}
+
+/*
+Preconditions:
+  |h| bounded by 1.1*2^26,1.1*2^25,1.1*2^26,1.1*2^25,etc.
+
+Since fe_add and fe_sub enforce the following conditions:
+
+fe_add & fe_sub preconditions:
+   |f| bounded by 1.1*2^25,1.1*2^24,1.1*2^25,1.1*2^24,etc.
+   |g| bounded by 1.1*2^25,1.1*2^24,1.1*2^25,1.1*2^24,etc.
+
+fe_add & fe_sub postconditions:
+   |h| bounded by 1.1*2^26,1.1*2^25,1.1*2^26,1.1*2^25,etc.
+
+We sometimes need to "reduce" field elems when they are in the postcondition's
+larger domain to match the precondition domain. This way we can take the output
+of fe_add or fe_sub and use it as input to another call to fe_add or fe_sub.
+
+We reduce by converting the field elem to its byte repr, then re-deriving the
+field elem from the byte repr.
+*/
+int fe_reduce_vartime(fe reduced_f, const fe f)
+{
+  unsigned char f_bytes[32];
+  fe_tobytes(f_bytes, f);
+  return fe_frombytes_vartime(reduced_f, f_bytes);
+}
+
+// https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2
+static void fe_ed_derivatives_to_wei_x(unsigned char *wei_x, const fe inv_one_minus_y, const fe one_plus_y)
+{
+  // (1/(1-y))*(1+y)
+  fe inv_one_minus_y_mul_one_plus_y;
+  fe_mul(inv_one_minus_y_mul_one_plus_y, inv_one_minus_y, one_plus_y);
+
+  // wei x = (1/(1-y))*(1+y) + (A/3)
+  fe wei_x_fe;
+  fe_add(wei_x_fe, inv_one_minus_y_mul_one_plus_y, fe_a_inv_3);
+  fe_tobytes(wei_x, wei_x_fe);
+}
+
+// https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2
+void fe_ed_derivatives_to_wei_x_y(unsigned char *wei_x, unsigned char *wei_y, const fe inv_one_minus_y, const fe one_plus_y, const fe inv_one_minus_y_mul_x)
+{
+  fe_ed_derivatives_to_wei_x(wei_x, inv_one_minus_y, one_plus_y);
+
+  // c*(1+y)
+  fe fe_c_mul_one_plus_y;
+  fe_mul(fe_c_mul_one_plus_y, fe_c, one_plus_y);
+
+  // wei y = c * (1+y) * (1/((1-y)*x))
+  fe wei_y_fe;
+  fe_mul(wei_y_fe, fe_c_mul_one_plus_y, inv_one_minus_y_mul_x);
+  fe_tobytes(wei_y, wei_y_fe);
 }

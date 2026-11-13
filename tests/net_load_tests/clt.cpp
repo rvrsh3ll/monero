@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -50,7 +50,7 @@ using namespace net_load_tests;
 namespace
 {
   const size_t CONNECTION_COUNT = 100000;
-  const size_t CONNECTION_TIMEOUT = 10000;
+  constexpr const std::chrono::seconds CONNECTION_TIMEOUT{10};
   const size_t DEFAULT_OPERATION_TIMEOUT = 30000;
   const size_t RESERVED_CONN_CNT = 1;
 
@@ -110,7 +110,7 @@ namespace
     {
       if (!m_connections[id].is_nil())
       {
-        m_tcp_server.get_config_object().close(m_connections[id]);
+        m_tcp_server.get_config_object().close(m_connections[id], true);
         return true;
       }
       else
@@ -631,7 +631,6 @@ int main(int argc, char** argv)
 {
   TRY_ENTRY();
   tools::on_startup();
-  epee::debug::get_set_enable_assert(true, false);
   //set up logging options
   mlog_configure(mlog_get_default_log_path("net_load_tests_clt.log"), true);
 

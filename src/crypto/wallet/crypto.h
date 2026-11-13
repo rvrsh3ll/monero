@@ -1,4 +1,4 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2020-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include "crypto/wallet/ops.h"
+#include "crypto/crypto.h"
 
 namespace crypto {
   namespace wallet {

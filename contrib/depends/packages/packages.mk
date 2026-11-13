@@ -1,36 +1,29 @@
-packages:=boost openssl zeromq libiconv
+native_packages :=
+packages := boost openssl zeromq unbound sodium
 
-native_packages := native_ccache
+wallet_native_packages := native_protobuf
+wallet_packages = protobuf
 
-hardware_packages := hidapi protobuf libusb
-hardware_native_packages := native_protobuf
-
-android_native_packages = android_ndk
-android_packages = ncurses readline sodium
-
-darwin_native_packages = native_biplist native_ds_store native_mac_alias $(hardware_native_packages)
-darwin_packages = sodium ncurses readline $(hardware_packages)
-
-# not really native...
-freebsd_native_packages = freebsd_base
-freebsd_packages = ncurses readline sodium
-
-linux_packages = eudev ncurses readline sodium $(hardware_packages)
-linux_native_packages = $(hardware_native_packages)
-qt_packages = qt
-
-ifeq ($(build_tests),ON)
-packages += gtest
+ifneq ($(host_os),android)
+wallet_packages += libusb
 endif
 
-ifneq ($(host_arch),riscv64)
-linux_packages += unwind
+ifneq ($(host_os),freebsd)
+ifneq ($(host_os),android)
+wallet_packages += hidapi
+endif
 endif
 
-mingw32_packages = icu4c sodium $(hardware_packages)
-mingw32_native_packages = $(hardware_native_packages)
+linux_native_packages :=
+linux_packages :=
+
+freebsd_native_packages := freebsd_base
+freebsd_packages :=
 
 ifneq ($(build_os),darwin)
-darwin_native_packages += native_cctools native_cdrkit native_libdmg-hfsplus
+darwin_native_packages := darwin_sdk
 endif
+darwin_packages :=
 
+android_native_packages := android_ndk
+android_packages :=

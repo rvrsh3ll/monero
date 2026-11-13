@@ -27,7 +27,6 @@
 
 #pragma once
 
-#include <string>
 #include "int-util.h"
 
 // IP addresses are kept in network byte order
@@ -44,11 +43,15 @@ namespace epee
       ip = SWAP32LE(ip);
       /*
       local ip area
-      10.0.0.0 — 10.255.255.255 
-      172.16.0.0 — 172.31.255.255 
-      192.168.0.0 — 192.168.255.255 
+      10.0.0.0 ... 10.255.255.255
+      169.254.0.0 ... 169.254.255.255 (IPv4 link-local)
+      172.16.0.0 ... 172.31.255.255
+      192.168.0.0 ... 192.168.255.255
       */
       if( (ip | 0xffffff00) == 0xffffff0a)
+        return true;
+
+      if( (ip | 0xffff0000) == 0xfffffea9)
         return true;
 
       if( (ip | 0xffff0000) == 0xffffa8c0)
@@ -71,7 +74,7 @@ namespace epee
       //MAKE_IP
       /*
       loopback ip
-      127.0.0.0 — 127.255.255.255 
+      127.0.0.0 ... 127.255.255.255
       */
       return false;
     }

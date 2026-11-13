@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -40,9 +40,10 @@
 #include "blocks/blocks.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "serialization/binary_utils.h" // dump_binary(), parse_binary()
-#include "serialization/json_utils.h" // dump_json()
 #include "include_base_utils.h"
 #include "cryptonote_core/cryptonote_core.h"
+#include "cryptonote_core/tx_verification_utils.h"
+#include "cryptonote_protocol/block_entry_utils.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "bcutil"
@@ -101,11 +102,10 @@ int pop_blocks(cryptonote::core& core, int num_blocks)
 
   int quit = 0;
   block popped_block;
-  std::vector<transaction> popped_txs;
   for (int i=0; i < num_blocks; ++i)
   {
     // simple_core.m_storage.pop_block_from_blockchain() is private, so call directly through db
-    core.get_blockchain_storage().get_db().pop_block(popped_block, popped_txs);
+    core.get_blockchain_storage().get_db().pop_block(popped_block, /*txs=*/nullptr);
     quit = 1;
   }
 
@@ -146,7 +146,7 @@ int check_flush(cryptonote::core &core, std::vector<block_complete_entry> &block
     if (!parse_and_validate_block_from_blob(b.block, block))
     {
       MERROR("Failed to parse block: "
-          << epee::string_tools::pod_to_hex(get_blob_hash(b.block)));
+          << epee::string_tools::buff_to_hex_nodelimer(b.block));
       core.cleanup_handle_incoming_blocks();
       return 1;
     }
@@ -170,30 +170,40 @@ int check_flush(cryptonote::core &core, std::vector<block_complete_entry> &block
   size_t blockidx = 0;
   for(const block_complete_entry& block_entry: blocks)
   {
-    // process transactions
-    for(auto& tx_blob: block_entry.txs)
+    pool_supplement ps{};
+    bool success = false;
+    try
     {
-      tx_verification_context tvc = AUTO_VAL_INIT(tvc);
-      core.handle_incoming_tx(tx_blob, tvc, relay_method::block, true);
-      if(tvc.m_verifivation_failed)
-      {
-        MERROR("transaction verification failed, tx_id = "
-            << epee::string_tools::pod_to_hex(get_blob_hash(tx_blob.blob)));
-        core.cleanup_handle_incoming_blocks();
-        return 1;
-      }
+      success = make_full_pool_supplement_from_block_entry(block_entry, ps);
+    }
+    catch (const std::exception& e)
+    {
+      MERROR("Exception while making transaction pool supplement: " << e.what());
+    }
+    catch (...)
+    {
+      MERROR("Exception while making transaction pool supplement");
+    }
+    if (!success)
+    {
+      MERROR("Failed to make transaction pool supplement for block at height " << core.get_current_blockchain_height());
+      core.cleanup_handle_incoming_blocks();
+      return 1;
     }
 
     // process block
 
     block_verification_context bvc = {};
 
-    core.handle_incoming_block(block_entry.block, pblocks.empty() ? NULL : &pblocks[blockidx++], bvc, false); // <--- process block
+    core.handle_incoming_block(block_entry.block, pblocks.empty() ? NULL : &pblocks[blockidx++], bvc, ps, false); // <--- process block
 
     if(bvc.m_verifivation_failed)
     {
-      MERROR("Block verification failed, id = "
-          << epee::string_tools::pod_to_hex(get_blob_hash(block_entry.block)));
+      cryptonote::block block;
+      if (cryptonote::parse_and_validate_block_from_blob(block_entry.block, block))
+        MERROR("Block verification failed, id = " << cryptonote::get_block_hash(block));
+      else
+        MERROR("Block verification failed, block is unparsable");
       core.cleanup_handle_incoming_blocks();
       return 1;
     }
@@ -479,10 +489,13 @@ int import_from_file(cryptonote::core& core, const std::string& import_file_path
           cumulative_difficulty = bp.cumulative_difficulty;
           coins_generated = bp.coins_generated;
 
+          std::unordered_map<uint64_t, rct::key> transparent_amount_commitments;
+          collect_transparent_amount_commitments(b.miner_tx, txs, transparent_amount_commitments);
+
           try
           {
             uint64_t long_term_block_weight = core.get_blockchain_storage().get_next_long_term_block_weight(block_weight);
-            core.get_blockchain_storage().get_db().add_block(std::make_pair(b, block_to_blob(b)), block_weight, long_term_block_weight, cumulative_difficulty, coins_generated, txs);
+            core.get_blockchain_storage().get_db().add_block(std::make_pair(b, block_to_blob(b)), block_weight, long_term_block_weight, cumulative_difficulty, coins_generated, txs, transparent_amount_commitments);
           }
           catch (const std::exception& e)
           {
@@ -659,13 +672,6 @@ int main(int argc, char* argv[])
     }
   }
 
-  opt_testnet = command_line::get_arg(vm, cryptonote::arg_testnet_on);
-  opt_stagenet = command_line::get_arg(vm, cryptonote::arg_stagenet_on);
-  if (opt_testnet && opt_stagenet)
-  {
-    std::cerr << "Error: Can't specify more than one of --testnet and --stagenet" << ENDL;
-    return 1;
-  }
   m_config_folder = command_line::get_arg(vm, cryptonote::arg_data_dir);
 
   mlog_configure(mlog_get_default_log_path("monero-blockchain-import.log"), true);

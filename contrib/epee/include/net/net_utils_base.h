@@ -30,8 +30,12 @@
 #define _NET_UTILS_BASE_H_
 
 #include <boost/uuid/uuid.hpp>
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address_v6.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <stdexcept>
 #include <typeinfo>
 #include <type_traits>
 #include "byte_slice.h"
@@ -44,13 +48,15 @@
 #define MONERO_DEFAULT_LOG_CATEGORY "net"
 
 #ifndef MAKE_IP
-#define MAKE_IP( a1, a2, a3, a4 )	(a1|(a2<<8)|(a3<<16)|(((uint32_t)a4)<<24))
+#define MAKE_IP( a1, a2, a3, a4 )	((a1)|((a2)<<8)|((a3)<<16)|(((uint32_t)(a4))<<24))
 #endif
 
+/* Use the below function carefully. The executor and io_context are slightly
+  different concepts. */
 #if BOOST_VERSION >= 107000
-#define GET_IO_SERVICE(s) ((boost::asio::io_context&)(s).get_executor().context())
+  #define MONERO_GET_EXECUTOR(type) type . get_executor()
 #else
-#define GET_IO_SERVICE(s) ((s).get_io_service())
+  #define MONERO_GET_EXECUTOR(type) type . get_io_context()
 #endif
 
 namespace net
@@ -126,19 +132,23 @@ namespace net_utils
 
 	public:
 		constexpr ipv4_network_subnet() noexcept
-			: ipv4_network_subnet(0, 0)
+			: m_ip(0), m_mask(0)
 		{}
 
-		constexpr ipv4_network_subnet(uint32_t ip, uint8_t mask) noexcept
-			: m_ip(ip), m_mask(mask) {}
+		ipv4_network_subnet(uint32_t ip, uint8_t mask)
+			: m_ip(ip), m_mask(mask)
+		{
+			CHECK_AND_ASSERT_THROW_MES(mask <= 32, "invalid IPv4 subnet mask");
+		}
 
 		bool equal(const ipv4_network_subnet& other) const noexcept;
 		bool less(const ipv4_network_subnet& other) const noexcept;
-		constexpr bool is_same_host(const ipv4_network_subnet& other) const noexcept
+		bool is_same_host(const ipv4_network_subnet& other) const noexcept
 		{ return subnet() == other.subnet(); }
                 bool matches(const ipv4_network_address &address) const;
 
-		constexpr uint32_t subnet() const noexcept { return m_ip & ~(0xffffffffull << m_mask); }
+		uint8_t mask() const noexcept { return m_mask; }
+		uint32_t subnet() const noexcept;
 		std::string str() const;
 		std::string host_str() const;
 		bool is_loopback() const;
@@ -206,6 +216,9 @@ namespace net_utils
 		END_KV_SERIALIZE_MAP()
 	};
 
+	bool should_group_ipv6_by_prefix(const boost::asio::ip::address_v6& ip);
+	boost::asio::ip::address_v6 get_ipv6_subnet_address(const boost::asio::ip::address_v6& ip, const std::size_t prefix_bits);
+
 	inline bool operator==(const ipv6_network_address& lhs, const ipv6_network_address& rhs) noexcept
 	{ return lhs.equal(rhs); }
 	inline bool operator!=(const ipv6_network_address& lhs, const ipv6_network_address& rhs) noexcept
@@ -218,6 +231,8 @@ namespace net_utils
 	{ return rhs.less(lhs); }
 	inline bool operator>=(const ipv6_network_address& lhs, const ipv6_network_address& rhs) noexcept
 	{ return !lhs.less(rhs); }
+
+	boost::optional<ipv4_network_address> get_ipv4_mapped_address(const ipv6_network_address& address);
 
 	class network_address
 	{
@@ -236,6 +251,7 @@ namespace net_utils
 			virtual address_type get_type_id() const = 0;
 			virtual zone get_zone() const = 0;
 			virtual bool is_blockable() const = 0;
+			virtual std::uint16_t port() const = 0;
 		};
 
 		template<typename T>
@@ -266,6 +282,7 @@ namespace net_utils
 			virtual address_type get_type_id() const override { return value.get_type_id(); }
 			virtual zone get_zone() const override { return value.get_zone(); }
 			virtual bool is_blockable() const override { return value.is_blockable(); }
+			virtual std::uint16_t port() const override { return value.port(); }
 		};
 
 		std::shared_ptr<interface> self;
@@ -273,7 +290,7 @@ namespace net_utils
 		template<typename Type>
 		Type& as_mutable() const
 		{
-			// types `implmentation<Type>` and `implementation<const Type>` are unique
+			// types `implementation<Type>` and `implementation<const Type>` are unique
 			using Type_ = typename std::remove_const<Type>::type;
 			network_address::interface* const self_ = self.get(); // avoid clang warning in typeid
 			if (!self_ || typeid(implementation<Type_>) != typeid(*self_))
@@ -312,6 +329,7 @@ namespace net_utils
 		address_type get_type_id() const { return self ? self->get_type_id() : address_type::invalid; }
 		zone get_zone() const { return self ? self->get_zone() : zone::invalid; }
 		bool is_blockable() const { return self ? self->is_blockable() : false; }
+		std::uint16_t port() const { return self ? self->port() : 0; }
 		template<typename Type> const Type &as() const { return as_mutable<const Type>(); }
 
 		BEGIN_KV_SERIALIZE_MAP()
@@ -341,6 +359,8 @@ namespace net_utils
 			return false;
 		END_KV_SERIALIZE_MAP()
 	};
+
+	boost::optional<ipv4_network_address> get_ipv4_mapped_address(const network_address& address);
 
 	inline bool operator==(const network_address& lhs, const network_address& rhs)
 	{ return lhs.equal(rhs); }
@@ -436,16 +456,33 @@ namespace net_utils
 	struct i_service_endpoint
 	{
 		virtual bool do_send(byte_slice message)=0;
-    virtual bool close()=0;
+    virtual bool close(const bool wait_for_shutdown)=0;
     virtual bool send_done()=0;
     virtual bool call_run_once_service_io()=0;
     virtual bool request_callback()=0;
-    virtual boost::asio::io_service& get_io_service()=0;
-    //protect from deletion connection object(with protocol instance) during external call "invoke"
-    virtual bool add_ref()=0;
-    virtual bool release()=0;
+    virtual boost::asio::io_context& get_io_context()=0;
   protected:
     virtual ~i_service_endpoint() noexcept(false) {}
+	};
+
+	template<typename t_protocol_handler>
+	struct service_endpoint : i_service_endpoint
+	{
+		typedef typename t_protocol_handler::connection_context t_connection_context;
+
+		service_endpoint(typename t_protocol_handler::config_type& config)
+		  : i_service_endpoint(), context(), m_protocol_handler(this, config, context)
+		{}
+
+		t_connection_context context;
+
+		// TODO what do they mean about wait on destructor?? --rfree :
+		//this should be the last one, because it could be wait on destructor, while other activities possible on other threads
+		t_protocol_handler m_protocol_handler;
+
+	protected:
+		virtual ~service_endpoint() noexcept(false)
+		{}
 	};
 
 
@@ -466,18 +503,14 @@ inline MAKE_LOGGABLE(connection_context_base, ct, os)
 #define LOG_INFO_CC(ct, message) MINFO(ct << message)
 #define LOG_DEBUG_CC(ct, message) MDEBUG(ct << message)
 #define LOG_TRACE_CC(ct, message) MTRACE(ct << message)
-#define LOG_CC(level, ct, message) MLOG(level, ct << message)
 
 #define LOG_PRINT_CC_L0(ct, message) LOG_PRINT_L0(ct << message)
 #define LOG_PRINT_CC_L1(ct, message) LOG_PRINT_L1(ct << message)
 #define LOG_PRINT_CC_L2(ct, message) LOG_PRINT_L2(ct << message)
-#define LOG_PRINT_CC_L3(ct, message) LOG_PRINT_L3(ct << message)
-#define LOG_PRINT_CC_L4(ct, message) LOG_PRINT_L4(ct << message)
 
 #define LOG_PRINT_CCONTEXT_L0(message) LOG_PRINT_CC_L0(context, message)
 #define LOG_PRINT_CCONTEXT_L1(message) LOG_PRINT_CC_L1(context, message)
 #define LOG_PRINT_CCONTEXT_L2(message) LOG_PRINT_CC_L2(context, message)
-#define LOG_PRINT_CCONTEXT_L3(message) LOG_PRINT_CC_L3(context, message)
 #define LOG_ERROR_CCONTEXT(message)    LOG_ERROR_CC(context, message)
  
 #define CHECK_AND_ASSERT_MES_CC(condition, return_val, err_message) CHECK_AND_ASSERT_MES(condition, return_val, "[" << epee::net_utils::print_connection_context_short(context) << "]" << err_message)

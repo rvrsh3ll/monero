@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -57,33 +57,6 @@ namespace tools
       m_http_client.set_server(
         epee::string_tools::get_ip_string_from_int32(ip), std::to_string(port), std::move(user), std::move(ssl_options)
       );
-    }
-
-    template <typename T_req, typename T_res>
-    bool basic_json_rpc_request(
-        T_req & req
-      , T_res & res
-      , std::string const & method_name
-      )
-    {
-      t_http_connection connection(&m_http_client);
-
-      bool ok = connection.is_open();
-      if (!ok)
-      {
-        fail_msg_writer() << "Couldn't connect to daemon: " << m_http_client.get_host() << ":" << m_http_client.get_port();
-        return false;
-      }
-      ok = epee::net_utils::invoke_http_json_rpc("/json_rpc", method_name, req, res, m_http_client, t_http_connection::TIMEOUT());
-      if (!ok)
-      {
-        fail_msg_writer() << "basic_json_rpc_request: Daemon request failed";
-        return false;
-      }
-      else
-      {
-        return true;
-      }
     }
 
     template <typename T_req, typename T_res>

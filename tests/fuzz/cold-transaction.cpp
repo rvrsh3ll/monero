@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -32,6 +32,7 @@
 #include "cryptonote_basic/cryptonote_basic.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "wallet/wallet2.h"
+#include "wallet/wallet2_basic/wallet2_serialization.h"
 #include "fuzzer.h"
 
 static tools::wallet2 *wallet = NULL;
@@ -50,11 +51,8 @@ BEGIN_INIT_SIMPLE_FUZZER()
 END_INIT_SIMPLE_FUZZER()
 
 BEGIN_SIMPLE_FUZZER()
-  std::string s((const char*)buf, len);
   tools::wallet2::unsigned_tx_set exported_txs;
-  std::stringstream iss;
-  iss << s;
-  binary_archive<false> ar(iss);
+  binary_archive<false> ar{{buf, len}};
   ::serialization::serialize(ar, exported_txs);
   std::vector<tools::wallet2::pending_tx> ptx;
   bool success = wallet->sign_tx(exported_txs, "/tmp/cold-transaction-test-signed", ptx);

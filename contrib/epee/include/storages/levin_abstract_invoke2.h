@@ -29,7 +29,6 @@
 #include "portable_storage_template_helper.h"
 #include <boost/utility/string_ref.hpp>
 #include <boost/utility/value_init.hpp>
-#include <functional>
 #include "byte_slice.h"
 #include "span.h"
 #include "net/levin_base.h"
@@ -56,92 +55,17 @@ namespace epee
 {
   namespace net_utils
   {
-#if 0
-    template<class t_arg, class t_result, class t_transport>
-    bool invoke_remote_command2(int command, const t_arg& out_struct, t_result& result_struct, t_transport& transport)
-    {
-      if(!transport.is_connected())
-        return false;
-
-      serialization::portable_storage stg;
-      out_struct.store(stg);
-      std::string buff_to_send, buff_to_recv;
-      stg.store_to_binary(buff_to_send);
-
-      int res = transport.invoke(command, buff_to_send, buff_to_recv);
-      if( res <=0 )
-      {
-        MERROR("Failed to invoke command " << command << " return code " << res);
-        return false;
-      }
-      serialization::portable_storage stg_ret;
-      if(!stg_ret.load_from_binary(buff_to_recv, &default_levin_limits))
-      {
-        LOG_ERROR("Failed to load_from_binary on command " << command);
-        return false;
-      }
-      return result_struct.load(stg_ret);
-    }
-
-    template<class t_arg, class t_transport>
-    bool notify_remote_command2(int command, const t_arg& out_struct, t_transport& transport)
-    {
-      if(!transport.is_connected())
-        return false;
-
-      serialization::portable_storage stg;
-      out_struct.store(&stg);
-      std::string buff_to_send;
-      stg.store_to_binary(buff_to_send);
-
-      int res = transport.notify(command, buff_to_send);
-      if(res <=0 )
-      {
-        LOG_ERROR("Failed to notify command " << command << " return code " << res);
-        return false;
-      }
-      return true;
-    }
-#endif
-
-    template<class t_arg, class t_result, class t_transport>
-    bool invoke_remote_command2(const epee::net_utils::connection_context_base context, int command, const t_arg& out_struct, t_result& result_struct, t_transport& transport)
-    {
-      const boost::uuids::uuid &conn_id = context.m_connection_id;
-      typename serialization::portable_storage stg;
-      out_struct.store(stg);
-      levin::message_writer to_send{16 * 1024};
-      std::string buff_to_recv;
-      stg.store_to_binary(to_send.buffer);
-
-      int res = transport.invoke(command, std::move(to_send), buff_to_recv, conn_id);
-      if( res <=0 )
-      {
-        LOG_PRINT_L1("Failed to invoke command " << command << " return code " << res);
-        return false;
-      }
-      typename serialization::portable_storage stg_ret;
-      if(!stg_ret.load_from_binary(buff_to_recv, &default_levin_limits))
-      {
-        on_levin_traffic(context, true, false, true, buff_to_recv.size(), command);
-        LOG_ERROR("Failed to load_from_binary on command " << command);
-        return false;
-      }
-      on_levin_traffic(context, true, false, false, buff_to_recv.size(), command);
-      return result_struct.load(stg_ret);
-    }
-
     template<class t_result, class t_arg, class callback_t, class t_transport>
-    bool async_invoke_remote_command2(const epee::net_utils::connection_context_base &context, int command, const t_arg& out_struct, t_transport& transport, const callback_t &cb, size_t inv_timeout = LEVIN_DEFAULT_TIMEOUT_PRECONFIGURED)
+    bool async_invoke_remote_command2(const epee::net_utils::connection_context_base &context, int command, const t_arg& out_struct, t_transport& transport, callback_t &&cb, const std::chrono::milliseconds inv_timeout = levin::LEVIN_DEFAULT_TIMEOUT_PRECONFIGURED)
     {
       const boost::uuids::uuid &conn_id = context.m_connection_id;
       typename serialization::portable_storage stg;
       const_cast<t_arg&>(out_struct).store(stg);//TODO: add true const support to searilzation
       levin::message_writer to_send{16 * 1024};
       stg.store_to_binary(to_send.buffer);
-      int res = transport.invoke_async(command, std::move(to_send), conn_id, [cb, command](int code, const epee::span<const uint8_t> buff, typename t_transport::connection_context& context)->bool
+      int res = transport.invoke_async(command, std::move(to_send), conn_id, [cb = std::forward<callback_t>(cb), command](int code, const epee::span<const uint8_t> buff, typename t_transport::connection_context& context)->bool
       {
-        t_result result_struct = AUTO_VAL_INIT(result_struct);
+        t_result result_struct{};
         if( code <=0 )
         {
           if (!buff.empty())
@@ -186,15 +110,14 @@ namespace epee
       levin::message_writer to_send;
       stg.store_to_binary(to_send.buffer);
 
-      int res = transport.send(to_send.finalize_notify(command), conn_id);
-      if(res <=0 )
+      bool res = transport.send(to_send.finalize_notify(command), conn_id);
+      if(!res)
       {
-        MERROR("Failed to notify command " << command << " return code " << res);
+        MERROR("Failed to notify command " << command);
         return false;
       }
       return true;
     }
-    //----------------------------------------------------------------------------------------------------
     //----------------------------------------------------------------------------------------------------
     template<class t_owner, class t_in_type, class t_out_type, class t_context, class callback_t>
     int buff_to_t_adapter(int command, const epee::span<const uint8_t> in_buff, byte_stream& buff_out, callback_t cb, t_context& context )
@@ -264,64 +187,19 @@ namespace epee
     return handle_invoke_map(true, command, in_buff, fake_str, context, handled); \
   } 
 
-
-#define CHAIN_LEVIN_INVOKE_MAP() \
-  int invoke(int command, const epee::span<const uint8_t> in_buff, epee::byte_stream& buff_out, epee::net_utils::connection_context_base& context) \
-  { \
-  bool handled = false; \
-  return handle_invoke_map(false, command, in_buff, buff_out, context, handled); \
-  } 
-
-#define CHAIN_LEVIN_NOTIFY_MAP() \
-  int notify(int command, const epee::span<const uint8_t> in_buff, epee::net_utils::connection_context_base& context) \
-  { \
-  bool handled = false; std::string fake_str;\
-  return handle_invoke_map(true, command, in_buff, fake_str, context, handled); \
-  } 
-
-#define CHAIN_LEVIN_NOTIFY_STUB() \
-  int notify(int command, const epee::span<const uint8_t> in_buff, epee::net_utils::connection_context_base& context) \
-  { \
-  return -1; \
-  } 
-
 #define BEGIN_INVOKE_MAP2(owner_type) \
   template <class t_context> int handle_invoke_map(bool is_notify, int command, const epee::span<const uint8_t> in_buff, epee::byte_stream& buff_out, t_context& context, bool& handled) \
   { \
   try { \
   typedef owner_type internal_owner_type_name;
 
-#define HANDLE_INVOKE2(command_id, func, type_name_in, typename_out) \
-  if(!is_notify && command_id == command) \
-  {handled=true;return epee::net_utils::buff_to_t_adapter<internal_owner_type_name, type_name_in, typename_out>(this, command, in_buff, buff_out, std::bind(func, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), context);}
-
 #define HANDLE_INVOKE_T2(COMMAND, func) \
   if(!is_notify && COMMAND::ID == command) \
   {handled=true;return epee::net_utils::buff_to_t_adapter<internal_owner_type_name, typename COMMAND::request, typename COMMAND::response>(command, in_buff, buff_out, std::bind(func, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), context);}
 
-
-#define HANDLE_NOTIFY2(command_id, func, type_name_in) \
-  if(is_notify && command_id == command) \
-  {handled=true;return epee::net_utils::buff_to_t_adapter<internal_owner_type_name, type_name_in>(this, command, in_buff, std::bind(func, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3), context);}
-
 #define HANDLE_NOTIFY_T2(NOTIFY, func) \
   if(is_notify && NOTIFY::ID == command) \
   {handled=true;return epee::net_utils::buff_to_t_adapter<internal_owner_type_name, typename NOTIFY::request>(this, command, in_buff, std::bind(func, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3), context);}
-
-
-#define CHAIN_INVOKE_MAP2(func) \
-  { \
-  int res = func(is_notify, command, in_buff, buff_out, context, handled); \
-  if(handled) \
-  return res; \
-  }
-
-#define CHAIN_INVOKE_MAP_TO_OBJ2(obj) \
-  { \
-  int res = obj.handle_invoke_map(is_notify, command, in_buff, buff_out, context, handled); \
-  if(handled) \
-  return res; \
-  }
 
 #define CHAIN_INVOKE_MAP_TO_OBJ_FORCE_CONTEXT(obj, context_type) \
   { \
@@ -333,7 +211,7 @@ namespace epee
 #define END_INVOKE_MAP2() \
   LOG_ERROR("Unknown command:" << command); \
   on_levin_traffic(context, false, false, true, in_buff.size(), "invalid-command"); \
-  return LEVIN_ERROR_CONNECTION_HANDLER_NOT_DEFINED; \
+  return is_notify ? LEVIN_OK : LEVIN_ERROR_CONNECTION_HANDLER_NOT_DEFINED; \
   } \
   catch (const std::exception &e) { \
     MERROR("Error in handle_invoke_map: " << e.what()); \

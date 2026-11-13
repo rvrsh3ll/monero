@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -28,9 +28,6 @@
 // 
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
-#include <fstream>
-
-#include "include_base_utils.h"
 #include "account.h"
 #include "warnings.h"
 #include "crypto/crypto.h"
@@ -65,7 +62,7 @@ DISABLE_VS_WARNINGS(4244 4345)
   static void derive_key(const crypto::chacha_key &base_key, crypto::chacha_key &key)
   {
     static_assert(sizeof(base_key) == sizeof(crypto::hash), "chacha key and hash should be the same size");
-    epee::mlocked<tools::scrubbed_arr<char, sizeof(base_key)+1>> data;
+    epee::mlocked<tools::scrubbed<std::array<char, sizeof(base_key)+1>>> data;
     memcpy(data.data(), &base_key, sizeof(base_key));
     data[sizeof(base_key)] = config::HASH_KEY_MEMORY;
     crypto::generate_chacha_key(data.data(), sizeof(data), key, 1);
@@ -87,7 +84,7 @@ DISABLE_VS_WARNINGS(4244 4345)
   void account_keys::xor_with_key_stream(const crypto::chacha_key &key)
   {
     // encrypt a large enough byte stream with chacha20
-    epee::wipeable_string key_stream = get_key_stream(key, m_encryption_iv, sizeof(crypto::secret_key) * (2 + m_multisig_keys.size()));
+    epee::wipeable_string key_stream = get_key_stream(key, m_encryption_iv, sizeof(crypto::secret_key) * (3 + m_multisig_keys.size()) + m_monero_c_passphrase.buffer.size());
     const char *ptr = key_stream.data();
     for (size_t i = 0; i < sizeof(crypto::secret_key); ++i)
       m_spend_secret_key.data[i] ^= *ptr++;
@@ -98,6 +95,16 @@ DISABLE_VS_WARNINGS(4244 4345)
       for (size_t i = 0; i < sizeof(crypto::secret_key); ++i)
         k.data[i] ^= *ptr++;
     }
+
+    for (size_t i = 0; i < sizeof(crypto::secret_key); ++i)
+      m_polyseed.data[i] ^= *ptr++;
+    for (size_t i = 0; i < m_monero_c_passphrase.buffer.size(); ++i)
+      m_monero_c_passphrase.buffer.data()[i] ^= *ptr++;
+    // It's important that we xor these two new values AFTER the multisig keys. For an existing multisig wallet
+    // that was built before the introduction of Polyseed we must still xor the multisig keys with the same index
+    // values as before for things to work out correctly. For wallets written by the monero_c library we will
+    // xor these 2 NEW values still with the same indexes because those wallets are not multisig, and the
+    // empty multisig keys array does not increment the index.
   }
   //-----------------------------------------------------------------
   void account_keys::encrypt(const crypto::chacha_key &key)
@@ -150,6 +157,31 @@ DISABLE_VS_WARNINGS(4244 4345)
   {
     m_keys.m_spend_secret_key = crypto::secret_key();
     m_keys.m_multisig_keys.clear();
+    m_keys.m_polyseed = crypto::secret_key();
+  }
+  //-----------------------------------------------------------------
+  void account_base::forget_monero_c_passphrase()
+  {
+    auto &passphrase = m_keys.m_monero_c_passphrase.buffer;
+    if (!passphrase.empty())
+      memwipe(passphrase.data(), passphrase.size());
+    passphrase.clear();
+  }
+  //-----------------------------------------------------------------
+  void account_base::set_spend_key(const crypto::secret_key& spend_secret_key)
+  {
+    // make sure derived spend public key matches saved public spend key
+    crypto::public_key spend_public_key;
+    crypto::secret_key_to_public_key(spend_secret_key, spend_public_key);
+    CHECK_AND_ASSERT_THROW_MES(m_keys.m_account_address.m_spend_public_key == spend_public_key,
+        "Unexpected derived public spend key");
+
+    m_keys.m_spend_secret_key = spend_secret_key;
+  }
+  //-----------------------------------------------------------------
+  void account_base::set_polyseed(const crypto::secret_key& polyseed)
+  {
+    m_keys.m_polyseed = polyseed;
   }
   //-----------------------------------------------------------------
   crypto::secret_key account_base::generate(const crypto::secret_key& recovery_key, bool recover, bool two_random)
@@ -244,6 +276,18 @@ DISABLE_VS_WARNINGS(4244 4345)
     create_from_keys(address, fake, viewkey);
   }
   //-----------------------------------------------------------------
+  void account_base::create_from_polyseed(const crypto::secret_key& spend_secret_key, const crypto::secret_key &polyseed, uint64_t polyseed_birthday)
+  {
+    generate(spend_secret_key, true, false);
+    set_createtime(polyseed_birthday);
+    // By always using the Polyseed birthday we will never get the EXACT creation time into
+    // 'm_creation_timestamp', but on the other hand we will not set it to 2014 like
+    // restore with a legacy seed does because we don't have a clue about the original
+    // creation time in that case.
+
+    m_keys.m_polyseed = polyseed;
+  }
+  //-----------------------------------------------------------------
   bool account_base::make_multisig(const crypto::secret_key &view_secret_key, const crypto::secret_key &spend_secret_key, const crypto::public_key &spend_public_key, const std::vector<crypto::secret_key> &multisig_keys)
   {
     m_keys.m_account_address.m_spend_public_key = spend_public_key;
@@ -253,11 +297,6 @@ DISABLE_VS_WARNINGS(4244 4345)
     return crypto::secret_key_to_public_key(view_secret_key, m_keys.m_account_address.m_view_public_key);
   }
   //-----------------------------------------------------------------
-  void account_base::finalize_multisig(const crypto::public_key &spend_public_key)
-  {
-    m_keys.m_account_address.m_spend_public_key = spend_public_key;
-  }
-  //-----------------------------------------------------------------
   const account_keys& account_base::get_keys() const
   {
     return m_keys;
@@ -265,13 +304,11 @@ DISABLE_VS_WARNINGS(4244 4345)
   //-----------------------------------------------------------------
   std::string account_base::get_public_address_str(network_type nettype) const
   {
-    //TODO: change this code into base 58
     return get_account_address_as_str(nettype, false, m_keys.m_account_address);
   }
   //-----------------------------------------------------------------
   std::string account_base::get_public_integrated_address_str(const crypto::hash8 &payment_id, network_type nettype) const
   {
-    //TODO: change this code into base 58
     return get_account_integrated_address_as_str(nettype, m_keys.m_account_address, payment_id);
   }
   //-----------------------------------------------------------------

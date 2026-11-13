@@ -1,4 +1,5 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
+
 // 
 // All rights reserved.
 // 
@@ -28,18 +29,32 @@
 
 #include <string.h>
 #include <thread>
+#include <boost/asio/ip/address_v6.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/cerrno.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/asio/strand.hpp>
+#include <condition_variable>
 #include <boost/lambda/lambda.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <openssl/ssl.h>
 #include <openssl/pem.h>
 #include "misc_log_ex.h"
-#include "net/net_helper.h"
 #include "net/net_ssl.h"
+#include "net/net_utils_base.h"
+#include "file_io_utils.h" // to validate .crt and .key paths
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net.ssl"
+
+
+#if BOOST_VERSION >= 107300
+  #define MONERO_HOSTNAME_VERIFY boost::asio::ssl::host_name_verification
+#else
+  #define MONERO_HOSTNAME_VERIFY boost::asio::ssl::rfc2818_verification
+#endif
 
 // openssl genrsa -out /tmp/KEY 4096
 // openssl req -new -key /tmp/KEY -out /tmp/REQ
@@ -51,14 +66,7 @@ static void add_windows_root_certs(SSL_CTX *ctx) noexcept;
 
 namespace
 {
-  struct openssl_bio_free
-  {
-    void operator()(BIO* ptr) const noexcept
-    {
-      BIO_free(ptr);
-    }
-  };
-  using openssl_bio = std::unique_ptr<BIO, openssl_bio_free>;
+  static constexpr unsigned int rsa_bits = 4096;
 
   struct openssl_pkey_free
   {
@@ -68,42 +76,6 @@ namespace
     }
   };
   using openssl_pkey = std::unique_ptr<EVP_PKEY, openssl_pkey_free>;
-
-  struct openssl_rsa_free
-  {
-    void operator()(RSA* ptr) const noexcept
-    {
-      RSA_free(ptr);
-    }
-  };
-  using openssl_rsa = std::unique_ptr<RSA, openssl_rsa_free>;
-
-  struct openssl_bignum_free
-  {
-    void operator()(BIGNUM* ptr) const noexcept
-    {
-      BN_free(ptr);
-    }
-  };
-  using openssl_bignum = std::unique_ptr<BIGNUM, openssl_bignum_free>;
-
-  struct openssl_ec_key_free
-  {
-    void operator()(EC_KEY* ptr) const noexcept
-    {
-      EC_KEY_free(ptr);
-    }
-  };
-  using openssl_ec_key = std::unique_ptr<EC_KEY, openssl_ec_key_free>;
-
-  struct openssl_group_free
-  {
-    void operator()(EC_GROUP* ptr) const noexcept
-    {
-      EC_GROUP_free(ptr);
-    }
-  };
-  using openssl_group = std::unique_ptr<EC_GROUP, openssl_group_free>;
 
   boost::system::error_code load_ca_file(boost::asio::ssl::context& ctx, const std::string& path)
   {
@@ -119,6 +91,55 @@ namespace
     }
     return boost::system::error_code{};
   }
+
+  /**
+   * @brief Generate a new RSA private key. For OpenSSL >= 3.0, same as EVP_RSA_gen(rsa_bits)
+   */
+  openssl_pkey gen_rsa_pkey_compat()
+  {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    return openssl_pkey{EVP_RSA_gen(rsa_bits)};
+#else
+    openssl_pkey pkey{EVP_PKEY_new()};
+    if (!pkey) {
+      MERROR("Error allocating EVP private key");
+      return NULL;
+    }
+
+    std::unique_ptr<RSA, decltype(&RSA_free)> rsa(RSA_new(), &RSA_free);
+    if (!rsa)
+    {
+      MERROR("Error allocating RSA private key");
+      return NULL;
+    }
+
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> exponent(BN_new(), &BN_free);
+    if (!exponent)
+    {
+      MERROR("Error allocating exponent");
+      return NULL;
+    }
+
+    BN_set_word(exponent.get(), RSA_F4);
+
+    if (RSA_generate_key_ex(rsa.get(), rsa_bits, exponent.get(), nullptr) != 1)
+    {
+      MERROR("Error generating RSA private key");
+      return NULL;
+    }
+
+    if (EVP_PKEY_assign_RSA(pkey.get(), rsa.get()) <= 0)
+    {
+      MERROR("Error assigning RSA private key");
+      return NULL;
+    }
+
+    // the RSA key is now managed by the EVP_PKEY structure
+    (void)rsa.release();
+
+    return pkey;
+#endif
+  }
 }
 
 namespace epee
@@ -131,44 +152,13 @@ namespace net_utils
 bool create_rsa_ssl_certificate(EVP_PKEY *&pkey, X509 *&cert)
 {
   MINFO("Generating SSL certificate");
-  pkey = EVP_PKEY_new();
+  openssl_pkey pkey_deleter = gen_rsa_pkey_compat();
+  pkey = pkey_deleter.get();
   if (!pkey)
   {
-    MERROR("Failed to create new private key");
+    MERROR("Failed to create new private key with gen_rsa_pkey_compat()");
     return false;
   }
-
-  openssl_pkey pkey_deleter{pkey};
-  openssl_rsa rsa{RSA_new()};
-  if (!rsa)
-  {
-    MERROR("Error allocating RSA private key");
-    return false;
-  }
-
-  openssl_bignum exponent{BN_new()};
-  if (!exponent)
-  {
-    MERROR("Error allocating exponent");
-    return false;
-  }
-
-  BN_set_word(exponent.get(), RSA_F4);
-
-  if (RSA_generate_key_ex(rsa.get(), 4096, exponent.get(), nullptr) != 1)
-  {
-    MERROR("Error generating RSA private key");
-    return false;
-  }
-
-  if (EVP_PKEY_assign_RSA(pkey, rsa.get()) <= 0)
-  {
-    MERROR("Error assigning RSA private key");
-    return false;
-  }
-
-  // the RSA key is now managed by the EVP_PKEY structure
-  (void)rsa.release();
 
   cert = X509_new();
   if (!cert)
@@ -185,89 +175,7 @@ bool create_rsa_ssl_certificate(EVP_PKEY *&pkey, X509 *&cert)
     X509_free(cert);
     return false;
   }
-  X509_NAME *name = X509_get_subject_name(cert);
-  X509_set_issuer_name(cert, name);
-
-  if (X509_sign(cert, pkey, EVP_sha256()) == 0)
-  {
-    MERROR("Error signing certificate");
-    X509_free(cert);
-    return false;
-  }
-  (void)pkey_deleter.release();
-  return true;
-}
-
-bool create_ec_ssl_certificate(EVP_PKEY *&pkey, X509 *&cert, int type)
-{
-  MINFO("Generating SSL certificate");
-  pkey = EVP_PKEY_new();
-  if (!pkey)
-  {
-    MERROR("Failed to create new private key");
-    return false;
-  }
-
-  openssl_pkey pkey_deleter{pkey};
-  openssl_ec_key ec_key{EC_KEY_new()};
-  if (!ec_key)
-  {
-    MERROR("Error allocating EC private key");
-    return false;
-  }
-
-  EC_GROUP *group = EC_GROUP_new_by_curve_name(type);
-  if (!group)
-  {
-    MERROR("Error getting EC group " << type);
-    return false;
-  }
-  openssl_group group_deleter{group};
-
-  EC_GROUP_set_asn1_flag(group, OPENSSL_EC_NAMED_CURVE); 
-  EC_GROUP_set_point_conversion_form(group, POINT_CONVERSION_UNCOMPRESSED);
-
-  if (!EC_GROUP_check(group, NULL))
-  {
-    MERROR("Group failed check: " << ERR_reason_error_string(ERR_get_error()));
-    return false;
-  }
-  if (EC_KEY_set_group(ec_key.get(), group) != 1)
-  {
-    MERROR("Error setting EC group");
-    return false;
-  }
-  if (EC_KEY_generate_key(ec_key.get()) != 1)
-  {
-    MERROR("Error generating EC private key");
-    return false;
-  }
-  if (EVP_PKEY_assign_EC_KEY(pkey, ec_key.get()) <= 0)
-  {
-    MERROR("Error assigning EC private key");
-    return false;
-  }
-
-  // the key is now managed by the EVP_PKEY structure
-  (void)ec_key.release();
-
-  cert = X509_new();
-  if (!cert)
-  {
-    MERROR("Failed to create new X509 certificate");
-    return false;
-  }
-  ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
-  X509_gmtime_adj(X509_get_notBefore(cert), 0);
-  X509_gmtime_adj(X509_get_notAfter(cert), 3600 * 24 * 182); // half a year
-  if (!X509_set_pubkey(cert, pkey))
-  {
-    MERROR("Error setting pubkey on certificate");
-    X509_free(cert);
-    return false;
-  }
-  X509_NAME *name = X509_get_subject_name(cert);
-  X509_set_issuer_name(cert, name);
+  X509_set_issuer_name(cert, X509_get_subject_name(cert));
 
   if (X509_sign(cert, pkey, EVP_sha256()) == 0)
   {
@@ -341,7 +249,7 @@ boost::asio::ssl::context ssl_options_t::create_context() const
       break;
     case ssl_verification_t::user_certificates:
       ssl_context.set_verify_depth(0);
-      /* fallthrough */
+      [[fallthrough]];
     case ssl_verification_t::user_ca:
       if (!ca_path.empty())
       {
@@ -355,22 +263,20 @@ boost::asio::ssl::context ssl_options_t::create_context() const
   }
 
   CHECK_AND_ASSERT_THROW_MES(auth.private_key_path.empty() == auth.certificate_path.empty(), "private key and certificate must be either both given or both empty");
+
+  const bool private_key_exists = epee::file_io_utils::is_file_exist(auth.private_key_path);
+  const bool certificate_exists = epee::file_io_utils::is_file_exist(auth.certificate_path);
+  if (private_key_exists && !certificate_exists) {
+    ASSERT_MES_AND_THROW("private key is present, but certificate file '" << auth.certificate_path << "' is missing");
+  } else if (!private_key_exists && certificate_exists) {
+    ASSERT_MES_AND_THROW("certificate is present, but private key file '" << auth.private_key_path << "' is missing");
+  }
+
   if (auth.private_key_path.empty())
   {
     EVP_PKEY *pkey;
     X509 *cert;
     bool ok = false;
-
-#ifdef USE_EXTRA_EC_CERT
-    CHECK_AND_ASSERT_THROW_MES(create_ec_ssl_certificate(pkey, cert, NID_secp256k1), "Failed to create certificate");
-    CHECK_AND_ASSERT_THROW_MES(SSL_CTX_use_certificate(ctx, cert), "Failed to use generated certificate");
-    if (!SSL_CTX_use_PrivateKey(ctx, pkey))
-      MERROR("Failed to use generated EC private key for " << NID_secp256k1);
-    else
-      ok = true;
-    X509_free(cert);
-    EVP_PKEY_free(pkey);
-#endif
 
     CHECK_AND_ASSERT_THROW_MES(create_rsa_ssl_certificate(pkey, cert), "Failed to create certificate");
     CHECK_AND_ASSERT_THROW_MES(SSL_CTX_use_certificate(ctx, cert), "Failed to use generated certificate");
@@ -391,7 +297,12 @@ boost::asio::ssl::context ssl_options_t::create_context() const
 
 void ssl_authentication_t::use_ssl_certificate(boost::asio::ssl::context &ssl_context) const
 {
-  ssl_context.use_private_key_file(private_key_path, boost::asio::ssl::context::pem);
+  try {
+    ssl_context.use_private_key_file(private_key_path, boost::asio::ssl::context::pem);
+  } catch (const boost::system::system_error&) {
+    MERROR("Failed to load private key file '" << private_key_path << "' into SSL context");
+    throw;
+  }
   ssl_context.use_certificate_chain_file(certificate_path);
 }
 
@@ -419,7 +330,9 @@ bool ssl_options_t::has_strong_verification(boost::string_ref host) const noexce
 {
   // onion and i2p addresses contain information about the server cert
   // which both authenticates and encrypts
-  if (host.ends_with(".onion") || host.ends_with(".i2p"))
+  // an IPv6 scope ID is removed before the address is sent to the proxy
+  if (host.find('%') == boost::string_ref::npos &&
+      (host.ends_with(".onion") || host.ends_with(".i2p")))
     return true;
   switch (verification)
   {
@@ -472,14 +385,19 @@ bool ssl_options_t::has_fingerprint(boost::asio::ssl::verify_context &ctx) const
   return false;
 }
 
-bool ssl_options_t::handshake(
+void ssl_options_t::configure(
   boost::asio::ssl::stream<boost::asio::ip::tcp::socket> &socket,
   boost::asio::ssl::stream_base::handshake_type type,
-  boost::asio::const_buffer buffer,
-  const std::string& host,
-  std::chrono::milliseconds timeout) const
+  const std::string& host) const
 {
   socket.next_layer().set_option(boost::asio::ip::tcp::no_delay(true));
+  {
+    // in case server is doing "virtual" domains, set hostname
+    SSL* const ssl_ctx = socket.native_handle();
+    if (type == boost::asio::ssl::stream_base::client && !host.empty() && ssl_ctx)
+      SSL_set_tlsext_host_name(ssl_ctx, host.c_str());
+  }
+
 
   /* Using system-wide CA store for client verification is funky - there is
      no expected hostname for server to verify against. If server doesn't have
@@ -497,17 +415,22 @@ bool ssl_options_t::handshake(
   {
     socket.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);
 
-    // in case server is doing "virtual" domains, set hostname
-    SSL* const ssl_ctx = socket.native_handle();
-    if (type == boost::asio::ssl::stream_base::client && !host.empty() && ssl_ctx)
-      SSL_set_tlsext_host_name(ssl_ctx, host.c_str());
+    std::string verification_host = host;
+    boost::system::error_code ec;
+    auto address = boost::asio::ip::make_address_v6(host, ec);
+    if (!ec)
+    {
+      // IPv6 scope identifiers select an interface, not a certificate identity.
+      address.scope_id(0);
+      verification_host = address.to_string();
+    }
 
-    socket.set_verify_callback([&](const bool preverified, boost::asio::ssl::verify_context &ctx)
+    socket.set_verify_callback([this, verification_host](const bool preverified, boost::asio::ssl::verify_context &ctx)
     {
       // preverified means it passed system or user CA check. System CA is never loaded
       // when fingerprints are whitelisted.
       const bool verified = preverified &&
-        (verification != ssl_verification_t::system_ca || host.empty() || boost::asio::ssl::rfc2818_verification(host)(preverified, ctx));
+        (verification_host.empty() || MONERO_HOSTNAME_VERIFY(verification_host)(preverified, ctx));
 
       if (!verified && !has_fingerprint(ctx))
       {
@@ -522,30 +445,126 @@ bool ssl_options_t::handshake(
       return true;
     });
   }
+}
 
-  auto& io_service = GET_IO_SERVICE(socket);
-  boost::asio::steady_timer deadline(io_service, timeout);
-  deadline.async_wait([&socket](const boost::system::error_code& error) {
-    if (error != boost::asio::error::operation_aborted)
+bool ssl_options_t::handshake(
+  boost::asio::io_context& io_context,
+  boost::asio::ssl::stream<boost::asio::ip::tcp::socket> &socket,
+  boost::asio::ssl::stream_base::handshake_type type,
+  boost::asio::const_buffer buffer,
+  const std::string& host,
+  std::chrono::milliseconds timeout,
+  const std::function<bool()>& abort_requested) const
+{
+  configure(socket, type, host);
+
+  auto start_handshake = [&]{
+    using ec_t = boost::system::error_code;
+    using timer_t = boost::asio::steady_timer;
+    using strand_t = boost::asio::io_context::strand;
+    using socket_t = boost::asio::ip::tcp::socket;
+
+    if (io_context.stopped())
+      io_context.restart();
+    strand_t strand(io_context);
+    timer_t deadline(io_context, timeout);
+
+    struct state_t {
+      std::mutex lock;
+      std::condition_variable_any condition;
+      ec_t result;
+      bool wait_timer;
+      bool wait_handshake;
+      bool cancel_timer;
+      bool cancel_handshake;
+    };
+    state_t state{};
+
+    state.wait_timer = true;
+    auto on_timer = [&](const ec_t &ec){
+      std::lock_guard<std::mutex> guard(state.lock);
+      state.wait_timer = false;
+      state.condition.notify_all();
+      if (!state.cancel_timer) {
+        state.cancel_handshake = true;
+        ec_t ec;
+        socket.next_layer().cancel(ec);
+      }
+    };
+
+    state.wait_handshake = true;
+    auto on_handshake = [&](const ec_t &ec, size_t bytes_transferred){
+      std::lock_guard<std::mutex> guard(state.lock);
+      state.wait_handshake = false;
+      state.condition.notify_all();
+      state.result = ec;
+      if (!state.cancel_handshake) {
+        state.cancel_timer = true;
+        deadline.cancel();
+      }
+    };
+
+    deadline.async_wait(on_timer);
+    boost::asio::post(
+      strand,
+      [&]{
+        std::lock_guard<std::mutex> guard(state.lock);
+        if (state.cancel_handshake) {
+          // cancelled before the socket operation could start: finish here so
+          // the cancelling side cannot leave a handshake running unattended
+          state.wait_handshake = false;
+          state.result = boost::asio::error::operation_aborted;
+          state.condition.notify_all();
+          return;
+        }
+        socket.async_handshake(
+          type,
+          boost::asio::buffer(buffer),
+          boost::asio::bind_executor(strand, on_handshake)
+        );
+      }
+    );
+
+    bool aborted = false;
+    while (!io_context.stopped())
     {
-      socket.next_layer().close();
+      io_context.poll_one();
+      std::lock_guard<std::mutex> guard(state.lock);
+      if (!aborted && abort_requested && abort_requested())
+      {
+        // abort from another thread: close the socket so the handshake cannot
+        // stall again, then keep pumping until both handlers have finished
+        aborted = true;
+        if (state.wait_handshake && !state.cancel_handshake)
+        {
+          state.cancel_handshake = true;
+          ec_t ec;
+          socket.next_layer().close(ec);
+        }
+        if (state.wait_timer && !state.cancel_timer)
+        {
+          state.cancel_timer = true;
+          deadline.cancel();
+        }
+      }
+      state.condition.wait_for(
+        state.lock,
+        std::chrono::milliseconds(30),
+        [&]{
+          return !state.wait_timer && !state.wait_handshake;
+        }
+      );
+      if (!state.wait_timer && !state.wait_handshake)
+        break;
     }
-  });
-
-  boost::system::error_code ec = boost::asio::error::would_block;
-  socket.async_handshake(type, boost::asio::buffer(buffer), boost::lambda::var(ec) = boost::lambda::_1);
-  if (io_service.stopped())
-  {
-    io_service.reset();
-  }
-  while (ec == boost::asio::error::would_block && !io_service.stopped())
-  {
-    // should poll_one(), can't run_one() because it can block if there is
-    // another worker thread executing io_service's tasks
-    // TODO: once we get Boost 1.66+, replace with run_one_for/run_until
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    io_service.poll_one();
-  }
+    if (state.result.value()) {
+      ec_t ec;
+      socket.next_layer().shutdown(socket_t::shutdown_both, ec);
+      socket.next_layer().close(ec);
+    }
+    return state.result;
+  };
+  const auto ec = start_handshake();
 
   if (ec)
   {
@@ -554,6 +573,57 @@ bool ssl_options_t::handshake(
   }
   MDEBUG("SSL handshake success");
   return true;
+}
+
+std::string get_hr_ssl_fingerprint(const X509 *cert, const EVP_MD *fdig)
+{
+  unsigned int j;
+  unsigned int n;
+  unsigned char md[EVP_MAX_MD_SIZE];
+  std::string fingerprint;
+
+  CHECK_AND_ASSERT_THROW_MES(cert && fdig, "Pointer args to get_hr_ssl_fingerprint cannot be null");
+
+  if (!X509_digest(cert, fdig, md, &n))
+  {
+    const unsigned long ssl_err_val = static_cast<int>(ERR_get_error());
+    const boost::system::error_code ssl_err_code = boost::asio::error::ssl_errors(static_cast<int>(ssl_err_val));
+    MERROR("Failed to create SSL fingerprint: " << ERR_reason_error_string(ssl_err_val));
+    throw boost::system::system_error(ssl_err_code, ERR_reason_error_string(ssl_err_val));
+  }
+  fingerprint.resize(n * 3 - 1);
+  char *out = &fingerprint[0];
+  for (j = 0; j < n; ++j)
+  {
+    snprintf(out, 3 + (j + 1 < n), "%02X%s", md[j], (j + 1 == n) ? "" : ":");
+    out += 3;
+  }
+  return fingerprint;
+}
+
+std::string get_hr_ssl_fingerprint_from_file(const std::string& cert_path, const EVP_MD *fdig) {
+  // Open file for reading
+  FILE* fp = fopen(cert_path.c_str(), "r");
+  if (!fp)
+  {
+    const boost::system::error_code err_code(errno, boost::system::system_category());
+    throw boost::system::system_error(err_code, "Failed to open certificate file '" + cert_path + "'");
+  }
+  auto _fclose = [](FILE* f){ if (f) fclose(f); };
+  std::unique_ptr<FILE, decltype(_fclose)> file(fp, _fclose);
+
+  // Extract certificate structure from file
+  X509* ssl_cert_handle = PEM_read_X509(file.get(), NULL, NULL, NULL);
+  if (!ssl_cert_handle) {
+    const unsigned long ssl_err_val = static_cast<int>(ERR_get_error());
+    const boost::system::error_code ssl_err_code = boost::asio::error::ssl_errors(static_cast<int>(ssl_err_val));
+    MERROR("OpenSSL error occurred while loading certificate at '" + cert_path + "'");
+    throw boost::system::system_error(ssl_err_code, ERR_reason_error_string(ssl_err_val));
+  }
+  std::unique_ptr<X509, decltype(&X509_free)> ssl_cert(ssl_cert_handle, &X509_free);
+
+  // Get the fingerprint from X509 structure
+  return get_hr_ssl_fingerprint(ssl_cert.get(), fdig);
 }
 
 bool ssl_support_from_string(ssl_support_t &ssl, boost::string_ref s)
@@ -576,7 +646,8 @@ boost::system::error_code store_ssl_keys(boost::asio::ssl::context& ssl, const b
   const auto ctx = ssl.native_handle();
   CHECK_AND_ASSERT_MES(ctx, boost::system::error_code(EINVAL, boost::system::system_category()), "Context is null");
   CHECK_AND_ASSERT_MES(base.has_filename(), boost::system::error_code(EINVAL, boost::system::system_category()), "Need filename");
-  if (!(ssl_key = SSL_CTX_get0_privatekey(ctx)) || !(ssl_cert = SSL_CTX_get0_certificate(ctx)))
+  std::unique_ptr<SSL, decltype(&SSL_free)> dflt_SSL(SSL_new(ctx), SSL_free);
+  if (!dflt_SSL || !(ssl_key = SSL_get_privatekey(dflt_SSL.get())) || !(ssl_cert = SSL_get_certificate(dflt_SSL.get())))
     return {EINVAL, boost::system::system_category()};
 
   using file_closer = int(std::FILE*);
@@ -588,7 +659,15 @@ boost::system::error_code store_ssl_keys(boost::asio::ssl::context& ssl, const b
     const boost::filesystem::path key_file{base.string() + ".key"};
     file.reset(std::fopen(key_file.string().c_str(), "wb"));
     if (!file)
+    {
+      if (epee::file_io_utils::is_file_exist(key_file.string())) {
+        MERROR("Permission denied to overwrite SSL private key file: '" << key_file.string() << "'");
+      } else {
+        MERROR("Could not open SSL private key file for writing: '" << key_file.string() << "'");
+      }
+
       return {errno, boost::system::system_category()};
+    }
     boost::filesystem::permissions(key_file, boost::filesystem::owner_read, error);
     if (error)
       return error;
@@ -611,6 +690,29 @@ boost::system::error_code store_ssl_keys(boost::asio::ssl::context& ssl, const b
     return boost::asio::error::ssl_errors(ERR_get_error());
   if (std::fclose(file.release()) != 0)
     return {errno, boost::system::system_category()};
+
+  // write SHA-256 fingerprint file
+  const boost::filesystem::path fp_file{base.string() + ".fingerprint"};
+  file.reset(std::fopen(fp_file.string().c_str(), "w"));
+  if (!file)
+    return {errno, boost::system::system_category()};
+  const auto fp_perms = (boost::filesystem::owner_read | boost::filesystem::group_read | boost::filesystem::others_read);
+  boost::filesystem::permissions(fp_file, fp_perms, error);
+  if (error)
+    return error;
+  try
+  {
+    const std::string fingerprint = get_hr_ssl_fingerprint(ssl_cert);
+    if (fingerprint.length() != fwrite(fingerprint.c_str(), sizeof(char), fingerprint.length(), file.get()))
+      return {errno, boost::system::system_category()};
+  }
+  catch (const boost::system::system_error& fperr)
+  {
+    return fperr.code();
+  }
+  if (std::fclose(file.release()) != 0)
+    return {errno, boost::system::system_category()};
+
   return error;
 }
 

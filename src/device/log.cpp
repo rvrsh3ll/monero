@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -38,7 +38,7 @@ namespace hw {
   void buffer_to_str(char *to_buff,  size_t to_len, const char *buff, size_t len) {
     CHECK_AND_ASSERT_THROW_MES(to_len > (len*2), "destination buffer too short. At least" << (len*2+1) << " bytes required");
     for (size_t i=0; i<len; i++) {
-      sprintf(to_buff+2*i, "%.02x", (unsigned char)buff[i]);
+      snprintf(to_buff + 2 * i, to_len - 2 * i, "%.02x", (unsigned char)buff[i]);
     }
   }
 
@@ -164,6 +164,10 @@ namespace hw {
 
     void check8(const std::string &msg, const std::string &info, const char *h, const char *d, bool crypted) {
       check(msg, info, h, d, 8, crypted);
+    }
+
+    void check1(const std::string &msg, const std::string &info, const char *h, const char *d, bool crypted) {
+      check(msg, info, h, d, 1, crypted);
     }
     #endif
 

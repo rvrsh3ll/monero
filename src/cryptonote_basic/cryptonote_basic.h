@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -46,14 +46,18 @@
 #include "cryptonote_config.h"
 #include "crypto/crypto.h"
 #include "crypto/hash.h"
-#include "misc_language.h"
 #include "ringct/rctTypes.h"
 #include "device/device.hpp"
+#include "cryptonote_basic/fwd.h"
 
 namespace cryptonote
 {
-  typedef std::vector<crypto::signature> ring_signature;
-
+  // These are guaranteed ceilings for the entire chain. Some fork rules may limit some further.
+  constexpr size_t COINBASE_VIN_COUNT          = 1;
+  constexpr size_t MAX_VIN_COUNT               = CRYPTONOTE_MAX_TX_SIZE / sizeof(crypto::key_image);
+  constexpr size_t MAX_NON_COINBASE_VOUT_COUNT = CRYPTONOTE_MAX_TX_SIZE / sizeof(crypto::public_key);
+  constexpr size_t MAX_COINBASE_VOUT_COUNT     = /*LEVIN_DEFAULT_MAX_PACKET_SIZE=*/100000000 / sizeof(crypto::public_key);
+  constexpr size_t MAX_TOTAL_KEY_OFFSETS       = CRYPTONOTE_MAX_TX_SIZE / sizeof(crypto::public_key);
 
   /* outputs */
 
@@ -68,18 +72,45 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
-  struct txout_to_scripthash
+  struct txout_to_carrot_v1
   {
-    crypto::hash hash;
+    crypto::public_key key;                                  // K_o
+    // TODO: the rest of Carrot
+    // carrot::view_tag_t view_tag;                             // vt
+    // carrot::encrypted_janus_anchor_t encrypted_janus_anchor; // anchor_enc
+
+    // // Encrypted amount a_enc and amount commitment C_a are stored in rct::rctSigBase
+    // // This allows for reuse of this output type between coinbase and non-coinbase txs
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(key)
+      // TODO: the rest of Carrot
+      // FIELD(view_tag)
+      // FIELD(encrypted_janus_anchor)
+    END_SERIALIZE()
   };
 
+  // outputs <= HF_VERSION_VIEW_TAGS
   struct txout_to_key
   {
-    txout_to_key() { }
+    txout_to_key(): key() { }
     txout_to_key(const crypto::public_key &_key) : key(_key) { }
     crypto::public_key key;
   };
 
+  // outputs >= HF_VERSION_VIEW_TAGS
+  struct txout_to_tagged_key
+  {
+    txout_to_tagged_key(): key(), view_tag() { }
+    txout_to_tagged_key(const crypto::public_key &_key, const crypto::view_tag &_view_tag) : key(_key), view_tag(_view_tag) { }
+    crypto::public_key key;
+    crypto::view_tag view_tag; // optimization to reduce scanning time
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(key)
+      FIELD(view_tag)
+    END_SERIALIZE()
+  };
 
   /* inputs */
 
@@ -128,7 +159,7 @@ namespace cryptonote
 
     BEGIN_SERIALIZE_OBJECT()
       VARINT_FIELD(amount)
-      FIELD(key_offsets)
+      CONTAINER_FIELD_CAPPED(key_offsets, MAX_TOTAL_KEY_OFFSETS)
       FIELD(k_image)
     END_SERIALIZE()
   };
@@ -136,9 +167,8 @@ namespace cryptonote
 
   typedef boost::variant<txin_gen, txin_to_script, txin_to_scripthash, txin_to_key> txin_v;
 
-  typedef boost::variant<txout_to_script, txout_to_scripthash, txout_to_key> txout_target_v;
+  typedef boost::variant<txout_to_script, txout_to_carrot_v1, txout_to_key, txout_to_tagged_key> txout_target_v;
 
-  //typedef std::pair<uint64_t, txout> out_t;
   struct tx_out
   {
     uint64_t amount;
@@ -152,9 +182,21 @@ namespace cryptonote
 
   };
 
-  template<typename T> static inline unsigned int getpos(T &ar) { return 0; }
-  template<> inline unsigned int getpos(binary_archive<true> &ar) { return ar.stream().tellp(); }
-  template<> inline unsigned int getpos(binary_archive<false> &ar) { return ar.stream().tellg(); }
+  inline const crypto::public_key &output_pubkey_cref(const txout_target_v &tx_out)
+  {
+    struct tx_out_visitor
+    {
+      const crypto::public_key &operator()(const cryptonote::txout_to_script&) const
+      { throw std::runtime_error("Unexpected usage of txout to script"); }
+      const crypto::public_key &operator()(const cryptonote::txout_to_carrot_v1 &out) const
+      { return out.key; }
+      const crypto::public_key &operator()(const cryptonote::txout_to_tagged_key &out) const
+      { return out.key; }
+      const crypto::public_key &operator()(const cryptonote::txout_to_key &out) const
+      { return out.key; }
+    };
+    return boost::apply_visitor(tx_out_visitor{}, tx_out);
+  }
 
   class transaction_prefix
   {
@@ -171,12 +213,103 @@ namespace cryptonote
 
     BEGIN_SERIALIZE()
       VARINT_FIELD(version)
-      if(version == 0 || CURRENT_TRANSACTION_VERSION < version) return false;
+      if((version == 0 || CURRENT_TRANSACTION_VERSION < version)) return false;
       VARINT_FIELD(unlock_time)
-      FIELD(vin)
-      FIELD(vout)
+      if constexpr (W)
+      {
+        // Serializing...
+        FIELD(vin)
+        FIELD(vout)
+      }
+      else
+      {
+        // De-serializing...
+        // vin
+        if (!this->deserialize_vin(ar))
+        {
+          ar.set_fail();
+          return false;
+        }
+
+        // vout
+        const size_t MAX_VOUT_COUNT = (this->is_coinbase() || vin.empty()) ? MAX_COINBASE_VOUT_COUNT : MAX_NON_COINBASE_VOUT_COUNT;
+        CONTAINER_FIELD_CAPPED(vout, MAX_VOUT_COUNT)
+      }
       FIELD(extra)
     END_SERIALIZE()
+
+    //-----------------------------------------------------------------------
+    bool is_coinbase() const
+    {
+      if (vin.size() != COINBASE_VIN_COUNT)
+        return false;
+
+      if (vin.at(0).type() != typeid(txin_gen))
+        return false;
+
+      return true;
+    }
+    //-----------------------------------------------------------------------
+  private:
+    // Do some validation on vin before doing allocations and reading the archive:
+    // 1. Can't exceed MAX_VIN_COUNT.
+    // 2. If coinbase, only 1 txin_gen.
+    // 3. If not coinbase: type txin_to_key (see check_inputs_types_supported).
+    // 4. If not coinbase: key offsets don't exceed max allowed for whole tx.
+    // Note: can't enforce non-empty because wallets may store empty vin.
+    template<template <bool> class Archive>
+    bool deserialize_vin(Archive<false> &ar)
+    {
+      auto &v = vin;
+      size_t cnt = 0;
+      ar.begin_array(cnt);
+      if (!ar.good())
+        return false;
+      v.clear();
+
+      if (ar.remaining_bytes() < cnt)
+        return false;
+
+      // 1. Can't exceed MAX_VIN_COUNT.
+      if (cnt > MAX_VIN_COUNT)
+        return false;
+
+      ::serialization::detail::do_reserve(v, cnt, ar.remaining_bytes());
+
+      size_t total_key_offsets = 0;
+      for (size_t i = 0; i < cnt; ++i) {
+        if (i > 0)
+          ar.delimit_array();
+        if (!::serialization::detail::serialize_container_element(ar, v.emplace_back()))
+          return false;
+        if (!ar.good())
+          return false;
+
+        // 2. If coinbase, only 1 txin_gen.
+        const auto &in = v.back();
+        const bool coinbase = i == 0 && in.type() == typeid(txin_gen);
+        if (coinbase && cnt > COINBASE_VIN_COUNT)
+          return false;
+        if (coinbase)
+          break;
+
+        // 3. If not coinbase: type txin_to_key (see check_inputs_types_supported).
+        if (in.type() != typeid(txin_to_key))
+          return false;
+
+        // 4. If not coinbase: key offsets don't exceed max allowed for whole tx.
+        const std::size_t next_toal_key_offsets = total_key_offsets + boost::get<cryptonote::txin_to_key>(in).key_offsets.size();
+        if (next_toal_key_offsets < total_key_offsets)
+          return false; // overflow
+        if (next_toal_key_offsets >= MAX_TOTAL_KEY_OFFSETS)
+          return false;
+        total_key_offsets = next_toal_key_offsets;
+      }
+      ar.end_array();
+      v.shrink_to_fit();
+
+      return ar.good();
+    }
 
   public:
     transaction_prefix(){ set_null(); }
@@ -214,8 +347,10 @@ namespace cryptonote
 
     transaction();
     transaction(const transaction &t);
+    transaction(transaction &&t);
     transaction &operator=(const transaction &t);
-    virtual ~transaction();
+    transaction &operator=(transaction &&t);
+    ~transaction() = default;
     void set_null();
     void invalidate_hashes();
     bool is_hash_valid() const { return hash_valid.load(std::memory_order_acquire); }
@@ -236,21 +371,21 @@ namespace cryptonote
         set_blob_size_valid(false);
       }
 
-      const unsigned int start_pos = getpos(ar);
+      const auto start_pos = ar.getpos();
 
       FIELDS(*static_cast<transaction_prefix *>(this))
 
       if (std::is_same<Archive<W>, binary_archive<W>>())
-        prefix_size = getpos(ar) - start_pos;
+        prefix_size = ar.getpos() - start_pos;
 
       if (version == 1)
       {
         if (std::is_same<Archive<W>, binary_archive<W>>())
-          unprunable_size = getpos(ar) - start_pos;
+          unprunable_size = ar.getpos() - start_pos;
 
         ar.tag("signatures");
         ar.begin_array();
-        PREPARE_CUSTOM_VECTOR_SERIALIZATION(vin.size(), signatures);
+        PREPARE_CUSTOM_VECTOR_SERIALIZATION(vin.size(), signatures, 0);
         bool signatures_not_expected = signatures.empty();
         if (!signatures_not_expected && vin.size() != signatures.size())
           return false;
@@ -266,7 +401,7 @@ namespace cryptonote
               return false;
           }
 
-          PREPARE_CUSTOM_VECTOR_SERIALIZATION(signature_size, signatures[i]);
+          PREPARE_CUSTOM_VECTOR_SERIALIZATION(signature_size, signatures[i], sizeof(crypto::signature));
           if (signature_size != signatures[i].size())
             return false;
 
@@ -284,11 +419,11 @@ namespace cryptonote
         {
           ar.begin_object();
           bool r = rct_signatures.serialize_rctsig_base(ar, vin.size(), vout.size());
-          if (!r || !ar.stream().good()) return false;
+          if (!r || !ar.good()) return false;
           ar.end_object();
 
           if (std::is_same<Archive<W>, binary_archive<W>>())
-            unprunable_size = getpos(ar) - start_pos;
+            unprunable_size = ar.getpos() - start_pos;
 
           if (!pruned && rct_signatures.type != rct::RCTTypeNull)
           {
@@ -296,7 +431,7 @@ namespace cryptonote
             ar.begin_object();
             r = rct_signatures.p.serialize_rctsig_prunable(ar, rct_signatures.type, vin.size(), vout.size(),
                 vin.size() > 0 && vin[0].type() == typeid(txin_to_key) ? boost::get<txin_to_key>(vin[0]).key_offsets.size() - 1 : 0);
-            if (!r || !ar.stream().good()) return false;
+            if (!r || !ar.good()) return false;
             ar.end_object();
           }
         }
@@ -320,13 +455,13 @@ namespace cryptonote
         {
           ar.begin_object();
           bool r = rct_signatures.serialize_rctsig_base(ar, vin.size(), vout.size());
-          if (!r || !ar.stream().good()) return false;
+          if (!r || !ar.good()) return false;
           ar.end_object();
         }
       }
       if (!typename Archive<W>::is_saving())
         pruned = true;
-      return ar.stream().good();
+      return ar.good();
     }
 
   private:
@@ -335,71 +470,96 @@ namespace cryptonote
 
   inline transaction::transaction(const transaction &t):
     transaction_prefix(t),
-    hash_valid(false),
-    prunable_hash_valid(false),
-    blob_size_valid(false),
+    hash_valid(t.is_hash_valid()),
+    prunable_hash_valid(t.is_prunable_hash_valid()),
+    blob_size_valid(t.is_blob_size_valid()),
     signatures(t.signatures),
     rct_signatures(t.rct_signatures),
+    hash(t.hash),
+    prunable_hash(t.prunable_hash),
+    blob_size(t.blob_size),
+    pruned(t.pruned),
+    unprunable_size(t.unprunable_size.load()),
+    prefix_size(t.prefix_size.load())
+  {}
+
+  inline transaction::transaction(transaction &&t):
+    transaction_prefix(std::move(t)),
+    hash_valid(t.is_hash_valid()),
+    prunable_hash_valid(t.is_prunable_hash_valid()),
+    blob_size_valid(t.is_blob_size_valid()),
+    signatures(std::move(t.signatures)),
+    rct_signatures(std::move(t.rct_signatures)),
+    hash(std::move(t.hash)),
+    prunable_hash(std::move(t.prunable_hash)),
+    blob_size(std::move(t.blob_size)),
     pruned(t.pruned),
     unprunable_size(t.unprunable_size.load()),
     prefix_size(t.prefix_size.load())
   {
-    if (t.is_hash_valid())
-    {
-      hash = t.hash;
-      set_hash_valid(true);
-    }
-    if (t.is_blob_size_valid())
-    {
-      blob_size = t.blob_size;
-      set_blob_size_valid(true);
-    }
-    if (t.is_prunable_hash_valid())
-    {
-      prunable_hash = t.prunable_hash;
-      set_prunable_hash_valid(true);
-    }
+    t.set_null();
   }
 
   inline transaction &transaction::operator=(const transaction &t)
   {
+    if (this == std::addressof(t))
+      return *this;
+
     transaction_prefix::operator=(t);
 
-    set_hash_valid(false);
-    set_prunable_hash_valid(false);
-    set_blob_size_valid(false);
+    set_hash_valid(t.is_hash_valid());
+    set_prunable_hash_valid(t.is_prunable_hash_valid());
+    set_blob_size_valid(t.is_blob_size_valid());
     signatures = t.signatures;
     rct_signatures = t.rct_signatures;
-    if (t.is_hash_valid())
-    {
-      hash = t.hash;
-      set_hash_valid(true);
-    }
-    if (t.is_prunable_hash_valid())
-    {
-      prunable_hash = t.prunable_hash;
-      set_prunable_hash_valid(true);
-    }
-    if (t.is_blob_size_valid())
-    {
-      blob_size = t.blob_size;
-      set_blob_size_valid(true);
-    }
+    hash = t.hash;
+    prunable_hash = t.prunable_hash;
+    blob_size = t.blob_size;
     pruned = t.pruned;
     unprunable_size = t.unprunable_size.load();
     prefix_size = t.prefix_size.load();
     return *this;
   }
 
-  inline
-  transaction::transaction()
+  inline transaction &transaction::operator=(transaction &&t)
   {
-    set_null();
+    if (this == std::addressof(t))
+      return *this;
+
+    transaction_prefix::operator=(std::move(t));
+
+    set_hash_valid(t.is_hash_valid());
+    set_prunable_hash_valid(t.is_prunable_hash_valid());
+    set_blob_size_valid(t.is_blob_size_valid());
+    signatures = std::move(t.signatures);
+    rct_signatures = std::move(t.rct_signatures);
+    hash = std::move(t.hash);
+    prunable_hash = std::move(t.prunable_hash);
+    blob_size = std::move(t.blob_size);
+    pruned = std::move(t.pruned);
+    unprunable_size = t.unprunable_size.load();
+    prefix_size = t.prefix_size.load();
+
+    t.set_null();
+    return *this;
   }
 
   inline
-  transaction::~transaction()
+  transaction::transaction():
+    transaction_prefix(),
+    hash_valid(false),
+    prunable_hash_valid(false),
+    blob_size_valid(false),
+    signatures(),
+    rct_signatures{},
+    hash{},
+    prunable_hash{},
+    blob_size(0),
+    pruned(false),
+    unprunable_size(0),
+    prefix_size(0)
   {
+    // set_null() incurs atomic fence penalties
   }
 
   inline
@@ -407,7 +567,7 @@ namespace cryptonote
   {
     transaction_prefix::set_null();
     signatures.clear();
-    rct_signatures.type = rct::RCTTypeNull;
+    rct_signatures = rct::rctSig{};
     set_hash_valid(false);
     set_prunable_hash_valid(false);
     set_blob_size_valid(false);
@@ -468,8 +628,50 @@ namespace cryptonote
 
   public:
     block(): block_header(), hash_valid(false) {}
-    block(const block &b): block_header(b), hash_valid(false), miner_tx(b.miner_tx), tx_hashes(b.tx_hashes) { if (b.is_hash_valid()) { hash = b.hash; set_hash_valid(true); } }
-    block &operator=(const block &b) { block_header::operator=(b); hash_valid = false; miner_tx = b.miner_tx; tx_hashes = b.tx_hashes; if (b.is_hash_valid()) { hash = b.hash; set_hash_valid(true); } return *this; }
+
+    block(const block &b):
+      block_header(b),
+      hash_valid(b.is_hash_valid()),
+      miner_tx(b.miner_tx),
+      tx_hashes(b.tx_hashes),
+      hash(b.hash)
+    {}
+    block(block &&b):
+      block_header(std::move(b)),
+      hash_valid(b.is_hash_valid()),
+      miner_tx(std::move(b.miner_tx)),
+      tx_hashes(std::move(b.tx_hashes)),
+      hash(std::move(b.hash))
+    {
+      b.miner_tx.set_null();
+      b.tx_hashes.clear();
+    }
+    block &operator=(const block &b)
+    {
+      if(this != std::addressof(b))
+      {
+        block_header::operator=(b);
+        hash_valid = b.is_hash_valid();
+        miner_tx = b.miner_tx;
+        tx_hashes = b.tx_hashes;
+        hash = b.hash;
+      }
+      return *this;
+    }
+    block &operator=(block &&b)
+    {
+      if (this != std::addressof(b))
+      {
+        block_header::operator=(std::move(b));
+        hash_valid = b.is_hash_valid();
+        miner_tx = std::move(b.miner_tx);
+        tx_hashes = std::move(b.tx_hashes);
+        hash = std::move(b.hash);
+        b.miner_tx.set_null();
+        b.tx_hashes.clear();
+      }
+      return *this;
+    }
     void invalidate_hashes() { set_hash_valid(false); }
     bool is_hash_valid() const { return hash_valid.load(std::memory_order_acquire); }
     void set_hash_valid(bool v) const { hash_valid.store(v,std::memory_order_release); }
@@ -556,15 +758,15 @@ namespace std {
 }
 
 BLOB_SERIALIZER(cryptonote::txout_to_key);
-BLOB_SERIALIZER(cryptonote::txout_to_scripthash);
 
 VARIANT_TAG(binary_archive, cryptonote::txin_gen, 0xff);
 VARIANT_TAG(binary_archive, cryptonote::txin_to_script, 0x0);
 VARIANT_TAG(binary_archive, cryptonote::txin_to_scripthash, 0x1);
 VARIANT_TAG(binary_archive, cryptonote::txin_to_key, 0x2);
 VARIANT_TAG(binary_archive, cryptonote::txout_to_script, 0x0);
-VARIANT_TAG(binary_archive, cryptonote::txout_to_scripthash, 0x1);
+VARIANT_TAG(binary_archive, cryptonote::txout_to_carrot_v1, 0x1);
 VARIANT_TAG(binary_archive, cryptonote::txout_to_key, 0x2);
+VARIANT_TAG(binary_archive, cryptonote::txout_to_tagged_key, 0x3);
 VARIANT_TAG(binary_archive, cryptonote::transaction, 0xcc);
 VARIANT_TAG(binary_archive, cryptonote::block, 0xbb);
 
@@ -573,8 +775,9 @@ VARIANT_TAG(json_archive, cryptonote::txin_to_script, "script");
 VARIANT_TAG(json_archive, cryptonote::txin_to_scripthash, "scripthash");
 VARIANT_TAG(json_archive, cryptonote::txin_to_key, "key");
 VARIANT_TAG(json_archive, cryptonote::txout_to_script, "script");
-VARIANT_TAG(json_archive, cryptonote::txout_to_scripthash, "scripthash");
+VARIANT_TAG(json_archive, cryptonote::txout_to_carrot_v1, "carrot_v1");
 VARIANT_TAG(json_archive, cryptonote::txout_to_key, "key");
+VARIANT_TAG(json_archive, cryptonote::txout_to_tagged_key, "tagged_key");
 VARIANT_TAG(json_archive, cryptonote::transaction, "tx");
 VARIANT_TAG(json_archive, cryptonote::block, "block");
 
@@ -583,7 +786,8 @@ VARIANT_TAG(debug_archive, cryptonote::txin_to_script, "script");
 VARIANT_TAG(debug_archive, cryptonote::txin_to_scripthash, "scripthash");
 VARIANT_TAG(debug_archive, cryptonote::txin_to_key, "key");
 VARIANT_TAG(debug_archive, cryptonote::txout_to_script, "script");
-VARIANT_TAG(debug_archive, cryptonote::txout_to_scripthash, "scripthash");
+VARIANT_TAG(debug_archive, cryptonote::txout_to_carrot_v1, "carrot_v1");
 VARIANT_TAG(debug_archive, cryptonote::txout_to_key, "key");
+VARIANT_TAG(debug_archive, cryptonote::txout_to_tagged_key, "tagged_key");
 VARIANT_TAG(debug_archive, cryptonote::transaction, "tx");
 VARIANT_TAG(debug_archive, cryptonote::block, "block");

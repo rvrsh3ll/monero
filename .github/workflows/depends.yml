@@ -1,85 +1,154 @@
 name: ci/gh-actions/depends
 
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - 'docs/**'
+      - '**/README.md'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/README.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  APT_SET_CONF: |
+    tee -a /etc/apt/apt.conf.d/80-custom << EOF
+    Acquire::Retries "3";
+    Acquire::http::Timeout "120";
+    Acquire::ftp::Timeout "120";
+    EOF
+  CCACHE_SETTINGS: |
+        ccache --max-size=150M
+  USE_DEVICE_TREZOR_MANDATORY: ON
 
 jobs:
-  build-macos:
-    runs-on: ubuntu-18.04
-    env:
-      CCACHE_COMPRESS: 1
-      CCACHE_TEMPDIR: /tmp/.ccache-temp
+  build-cross:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.toolchain.container || 'ubuntu:22.04' }}
+      env:
+        DEBIAN_FRONTEND: noninteractive
     strategy:
       fail-fast: false
       matrix:
         toolchain:
           - name: "RISCV 64bit"
             host: "riscv64-linux-gnu"
-            packages: "python3 gperf g++-riscv64-linux-gnu"
-          - name: "ARM v7"
-            host: "arm-linux-gnueabihf"
-            packages: "python3 gperf g++-arm-linux-gnueabihf"
+            rust_host: "riscv64gc-unknown-linux-gnu"
+            packages: "g++-riscv64-linux-gnu"
+            container: "ubuntu:26.04" # RandomX v2 requires GCC 14 or above for riscv64
           - name: "ARM v8"
             host: "aarch64-linux-gnu"
-            packages: "python3 gperf g++-aarch64-linux-gnu"
-          - name: "i686 Win"
-            host: "i686-w64-mingw32"
-            packages: "python3 g++-mingw-w64-i686 qttools5-dev-tools"
+            rust_host: "aarch64-unknown-linux-gnu"
+            packages: "g++-aarch64-linux-gnu"
           - name: "i686 Linux"
             host: "i686-pc-linux-gnu"
-            packages: "gperf cmake g++-multilib python3-zmq"
+            rust_host: "i686-unknown-linux-gnu"
+            packages: "g++-multilib"
           - name: "Win64"
             host: "x86_64-w64-mingw32"
-            packages: "cmake python3 g++-mingw-w64-x86-64 qttools5-dev-tools"
+            rust_host: "x86_64-pc-windows-gnu"
+            packages: "g++-mingw-w64-x86-64"
+            container: "ubuntu:24.04" # Rust >= 1.70 requires binutils >= 2.40
           - name: "x86_64 Linux"
             host: "x86_64-unknown-linux-gnu"
-            packages: "gperf cmake python3-zmq libdbus-1-dev libharfbuzz-dev"
-          - name: "Cross-Mac"
-            host: "x86_64-apple-darwin11"
-            packages: "cmake imagemagick libcap-dev librsvg2-bin libz-dev libbz2-dev libtiff-tools python-dev python3-setuptools-git"
-            osx_sdk: "10.11"
+            rust_host: "x86_64-unknown-linux-gnu"
+          - name: "Cross-Mac x86_64"
+            host: "x86_64-apple-darwin"
+            rust_host: "x86_64-apple-darwin"
+            packages: "clang-19 lld-19"
+          - name: "Cross-Mac aarch64"
+            host: "arm64-apple-darwin"
+            rust_host: "aarch64-apple-darwin"
+            packages: "clang-19 lld-19"
           - name: "x86_64 Freebsd"
             host: "x86_64-unknown-freebsd"
-            packages: "clang-8 gperf cmake python3-zmq libdbus-1-dev libharfbuzz-dev"
+            rust_host: "x86_64-unknown-freebsd"
+            packages: "clang"
+          - name: "ARMv7 Android"
+            host: "arm-linux-android"
+            rust_host: "armv7-linux-androideabi"
+            packages: "unzip"
+          - name: "ARMv8 Android"
+            host: "aarch64-linux-android"
+            rust_host: "aarch64-linux-android"
+            packages: "unzip"
     name: ${{ matrix.toolchain.name }}
     steps:
-    - uses: actions/checkout@v1
+    - name: set apt conf
+      run: ${{env.APT_SET_CONF}}
+    - name: install packages
+      run: apt update; apt -y install ca-certificates curl
+    - name: prepare apple-darwin
+      if: ${{ matrix.toolchain.host == 'x86_64-apple-darwin' || matrix.toolchain.host == 'arm64-apple-darwin' }}
+      run: |
+          cat << EOF >> /etc/apt/sources.list
+          deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main
+          deb-src http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main
+          EOF
+          curl https://apt.llvm.org/llvm-snapshot.gpg.key > /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "/usr/lib/llvm-19/bin/" >> $GITHUB_PATH
+    - name: install dependencies
+      run: apt update; apt -y install build-essential cmake pkg-config git ccache ${{ matrix.toolchain.packages }}
+    - name: install rust
+      run: |
+          curl -O https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init
+          echo "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10 rustup-init" | sha256sum -c
+          chmod +x rustup-init
+          ./rustup-init -y --default-toolchain 1.93 --target ${{ matrix.toolchain.rust_host }}
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: configure git
+      run: git config --global --add safe.directory '*'
+    - uses: actions/checkout@v5
       with:
+        fetch-depth: 0
         submodules: recursive
-    - name: ccache
-      uses: actions/cache@v2
+# Most volatile cache
+    - name: restore ccache
+      uses: actions/cache/restore@v5
+      id: ccache-restore
       with:
-        path: |
-            ~/.ccache
-            contrib/depends/built
-            contrib/depends/sdk-sources
+        path: ~/.cache/ccache
         key: ccache-${{ matrix.toolchain.host }}-${{ github.sha }}
         restore-keys: ccache-${{ matrix.toolchain.host }}-
-    - name: set apt conf
-      run: |
-        echo "Acquire::Retries \"3\";" | sudo tee -a /etc/apt/apt.conf.d/80-custom
-        echo "Acquire::http::Timeout \"120\";" | sudo tee -a /etc/apt/apt.conf.d/80-custom
-        echo "Acquire::ftp::Timeout \"120\";" | sudo tee -a /etc/apt/apt.conf.d/80-custom
-    - name: install dependencies
-      run: sudo apt update; sudo apt -y install build-essential libtool cmake autotools-dev automake pkg-config bsdmainutils curl git ca-certificates ccache ${{ matrix.toolchain.packages }}
-    - name: prepare apple-darwin11
-      if: ${{ matrix.toolchain.host == 'x86_64-apple-darwin11' }}
-      run: |
-        mkdir -p contrib/depends/SDKs contrib/depends/sdk-sources
-        if [ ! -f contrib/depends/sdk-sources/MacOSX${{ matrix.toolchain.osx_sdk }}.sdk.tar.gz ]; then curl --location --fail https://bitcoincore.org/depends-sources/sdks/MacOSX${{ matrix.toolchain.osx_sdk }}.sdk.tar.gz -o contrib/depends/sdk-sources/MacOSX${{ matrix.toolchain.osx_sdk }}.sdk.tar.gz; fi
-        if [ -f contrib/depends/sdk-sources/MacOSX${{ matrix.toolchain.osx_sdk }}.sdk.tar.gz ]; then tar -C contrib/depends/SDKs -xf contrib/depends/sdk-sources/MacOSX${{ matrix.toolchain.osx_sdk }}.sdk.tar.gz; fi
+# Less volatile cache
+    - name: restore depends cache
+      uses: actions/cache/restore@v5
+      id: depends-restore
+      with:
+        path: contrib/depends/built
+        key: depends-${{ matrix.toolchain.host }}-${{ hashFiles('contrib/depends/packages/*') }}
+        restore-keys: depends-${{ matrix.toolchain.host }}-
     - name: prepare w64-mingw32
-      if: ${{ matrix.toolchain.host == 'x86_64-w64-mingw32' || matrix.toolchain.host == 'i686-w64-mingw32' }}
+      if: ${{ matrix.toolchain.host == 'x86_64-w64-mingw32' }}
       run: |
-        sudo update-alternatives --set ${{ matrix.toolchain.host }}-g++ $(which ${{ matrix.toolchain.host }}-g++-posix)
-        sudo update-alternatives --set ${{ matrix.toolchain.host }}-gcc $(which ${{ matrix.toolchain.host }}-gcc-posix)
+        update-alternatives --set ${{ matrix.toolchain.host }}-g++ $(which ${{ matrix.toolchain.host }}-g++-posix)
+        update-alternatives --set ${{ matrix.toolchain.host }}-gcc $(which ${{ matrix.toolchain.host }}-gcc-posix)
+    - uses: ./.github/actions/set-make-job-count
     - name: build
       run: |
-        ccache --max-size=150M
-        make depends target=${{ matrix.toolchain.host }} -j2
-    - uses: actions/upload-artifact@v2
-      if: ${{ matrix.toolchain.host == 'x86_64-w64-mingw32' || matrix.toolchain.host == 'x86_64-apple-darwin11' || matrix.toolchain.host == 'x86_64-unknown-linux-gnu' }}
+        ${{env.CCACHE_SETTINGS}}
+        make depends target=${{ matrix.toolchain.host }} -j${{env.MAKE_JOB_COUNT}}
+    - name: save ccache
+      uses: actions/cache/save@v5
+      if: github.event_name != 'pull_request' && steps.ccache-restore.outputs.cache-hit != 'true'
+      with:
+        path: ~/.cache/ccache
+        key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+    - name: save depends cache
+      uses: actions/cache/save@v5
+      if: github.event_name != 'pull_request' && steps.depends-restore.outputs.cache-hit != 'true'
+      with:
+        path: contrib/depends/built
+        key: ${{ steps.depends-restore.outputs.cache-primary-key }}
+    - uses: actions/upload-artifact@v7
+      if: ${{ matrix.toolchain.host == 'x86_64-w64-mingw32' || matrix.toolchain.host == 'x86_64-apple-darwin' || matrix.toolchain.host == 'arm64-apple-darwin' || matrix.toolchain.host == 'x86_64-unknown-linux-gnu' }}
       with:
         name: ${{ matrix.toolchain.name }}
         path: |
-          /home/runner/work/monero/monero/build/${{ matrix.toolchain.host }}/release/bin/monero-wallet-cli*
-          /home/runner/work/monero/monero/build/${{ matrix.toolchain.host }}/release/bin/monerod*
+          build/${{ matrix.toolchain.host }}/release/bin/monero-wallet-cli*
+          build/${{ matrix.toolchain.host }}/release/bin/monerod*

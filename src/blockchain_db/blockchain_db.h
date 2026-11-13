@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -40,6 +40,8 @@
 #include "cryptonote_basic/difficulty.h"
 #include "cryptonote_basic/hardfork.h"
 #include "cryptonote_protocol/enums.h"
+#include "fcmp_pp/curve_trees.h"
+#include "fcmp_pp/fcmp_pp_types.h"
 
 /** \file
  * Cryptonote Blockchain Database Interface
@@ -170,9 +172,17 @@ struct txpool_tx_meta_t
   uint8_t is_local: 1;
   uint8_t dandelionpp_stem : 1;
   uint8_t is_forwarding: 1;
-  uint8_t bf_padding: 3;
+  uint8_t prunable_hash_valid: 1;
+  uint8_t bf_padding: 2;
 
-  uint8_t padding[76]; // till 192 bytes
+  crypto::hash prunable_hash;
+
+  uint8_t padding[12]; // til 160 bytes
+
+  // If non-null, this verification ID is set for this tx only when some mixring passed ver_input_proofs_rings()
+  crypto::hash valid_input_verification_id;
+
+  // 192 bytes total
 
   void set_relay_method(relay_method method) noexcept;
   relay_method get_relay_method() const noexcept;
@@ -186,7 +196,8 @@ struct txpool_tx_meta_t
     return matches_category(get_relay_method(), category);
   }
 };
-
+static_assert(sizeof(txpool_tx_meta_t) == 192, "possible DB migration needed for changes to txpool_tx_meta_t");
+static_assert(offsetof(txpool_tx_meta_t, valid_input_verification_id) == 160, "verif ID wrong alignment");
 
 #define DBF_SAFE       1
 #define DBF_FAST       2
@@ -436,11 +447,12 @@ private:
    *
    * @param blk_hash the hash of the block containing the transaction
    * @param tx the transaction to be added
+   * @param blob for `tx`
    * @param tx_hash the hash of the transaction
    * @param tx_prunable_hash the hash of the prunable part of the transaction
    * @return the transaction ID
    */
-  virtual uint64_t add_transaction_data(const crypto::hash& blk_hash, const std::pair<transaction, blobdata_ref>& tx, const crypto::hash& tx_hash, const crypto::hash& tx_prunable_hash) = 0;
+  virtual uint64_t add_transaction_data(const crypto::hash& blk_hash, const transaction& tx, epee::span<const std::uint8_t> blob, const crypto::hash& tx_hash, const crypto::hash& tx_prunable_hash) = 0;
 
   /**
    * @brief remove data about a transaction
@@ -527,19 +539,118 @@ private:
    */
   virtual void remove_spent_key(const crypto::key_image& k_image) = 0;
 
+  /**
+   * @brief grow the tree with provided compressed tree extension
+   *
+   * @param tree_extension tree extension containing compressed points
+   *
+   * @return the new tree edge
+   */
+  virtual std::vector<crypto::ec_point> grow_with_tree_extension(const fcmp_pp::CompressedTreeExtension &tree_extension) = 0;
+
+  /**
+   * @brief trim the leaves from the tree to the new number of leaf tuples
+   *
+   * @param new_n_leaf_tuples the expected number of leaf tuples in the tree after trimming
+   * @param trim_block_idx the block idx being trimmed
+   *
+   * @return the old number of leaf tuples
+   */
+  virtual uint64_t trim_leaves(const uint64_t new_n_leaf_tuples, const uint64_t trim_block_idx) = 0;
+
+  /**
+   * @brief trim the layers from the tree using given parameters
+   *
+   * @param new_n_leaf_tuples the expected number of leaf tuples in the tree after trimming
+   * @param new_n_elems_per_layer the expected number of elemenets in every layer of the tree after trimming
+   * @param new_tree_edge the expected new tree edge in the tree after trimming
+   * @param new_root_layer_idx the expected layer idx of the new root after trimming
+   */
+  virtual void trim_layers(const uint64_t new_n_leaf_tuples,
+    const std::vector<uint64_t> &new_n_elems_per_layer,
+    const std::vector<crypto::ec_point> &new_tree_edge,
+    const uint64_t new_root_layer_idx) = 0;
+
+    /**
+   * @brief add outs to locked outputs tables, staging them for insertion to the tree
+   *
+   * If any of this cannot be done, the subclass should throw the corresponding
+   * subclass of DB_EXCEPTION
+   *
+   * @param outs_by_last_locked_block outs grouped by last locked block
+   * @param timelocked_outputs custom timelocked outputs
+   */
+  virtual void add_locked_outs(const fcmp_pp::OutsByLastLockedBlock& outs_by_last_locked_block, const std::unordered_map<uint64_t/*unified_id*/, uint64_t/*last locked block_id*/>& timelocked_outputs) = 0;
+
+  /**
+   * @brief get the outputs that are staged for insertion to the tree with last locked block provided
+   * Note: outputs are deleted from this table after they are inserted into the tree. Default locked
+   * outputs may or may not be included in this table too.
+   *
+   * @param block_id the block idx
+   */
+  virtual std::vector<fcmp_pp::UnifiedOutput> get_outs_at_last_locked_block_idx(uint64_t block_id) const = 0;
+
+  /**
+   * @brief delete the locked outputs that were staged for insertion to the tree for a given last locked block
+   *
+   * @param block_id the outputs' last locked block idx
+   */
+  virtual void del_locked_outs_at_block_idx(uint64_t block_idx) = 0;
+
+  /**
+   * @brief get the total number of leaf tuples in the tree
+   *
+   * @return the total number of leaf tuples in the tree
+   */
+  virtual uint64_t get_n_leaf_tuples() const = 0;
+
+  /**
+   * @brief get the total number of leaf tuples in the tree when the given block idx was tip of the chain
+   *
+   * @param block_idx assumed tip of the chain
+   *
+   * @return total number of leaf tuples in the tree when given block idx was chain tip
+   */
+  virtual uint64_t get_block_n_leaf_tuples(const uint64_t block_idx) const = 0;
+
+    /**
+   * @brief get the block idx corresponding to the last block used to update the tree
+   *
+   * @return the last block used to update the tree
+   */
+  virtual uint64_t get_tree_block_idx() const = 0;
+
+  /**
+   * @brief get the most recently updated edge of the tree (the last element of every layer)
+   * when the provided block is the tip of the chain
+   *
+   * @param block_id the block idx
+   *
+   * @return the last element of every layer
+   */
+  virtual std::vector<crypto::ec_point> get_tree_edge(uint64_t block_id) const = 0;
+
+  /**
+   * @brief save the tree's metadata at the time the provided block is the tip of the chain
+   *
+   * @param block_idx the provided block idx (should be the tip)
+   * @param n_leaf_tuples the number of leaf tuples in the tree
+   * @param tree_edge the last element of every layer in the tree
+   */
+  virtual void save_tree_meta(const uint64_t block_idx, const uint64_t n_leaf_tuples, const std::vector<crypto::ec_point> &tree_edge) = 0;
+
+  /**
+   * @brief delete the tree's metadata saved for a corresponding tip block idx
+   *
+   * @param block_id the block idx
+   */
+  virtual void del_tree_meta(const uint64_t block_idx) = 0;
 
   /*********************************************************************
    * private concrete members
    *********************************************************************/
-  /**
-   * @brief private version of pop_block, for undoing if an add_block fails
-   *
-   * This function simply calls pop_block(block& blk, std::vector<transaction>& txs)
-   * with dummy parameters, as the returns-by-reference can be discarded.
-   */
-  void pop_block();
 
-  // helper function to remove transaction from blockchain
   /**
    * @brief helper function to remove transaction from the blockchain
    *
@@ -549,10 +660,43 @@ private:
    */
   void remove_transaction(const crypto::hash& tx_hash);
 
+  /**
+   * @brief handle the FCMP++ curve tree as the provided block_idx enters the chain. This handles
+   * saving staged locked outputs to the db, and advancing the FCMP++ tree.
+   *
+   * @param block_idx the block being entering the chain
+   * @param first_unified_id the first unified id of the first new default locked output from the block entering the chain
+   * @param miner_tx the block's miner transaction
+   * @param txs the block's non-miner transactions
+   * @param transparent_amount_commitments pre-calculated transparent amount commitments
+   */
+  void handle_fcmp_tree(const uint64_t block_idx,
+    const uint64_t first_unified_id,
+    const transaction &miner_tx,
+    const std::vector<std::pair<transaction, blobdata>> &txs,
+    const std::unordered_map<uint64_t, rct::key> &transparent_amount_commitments);
+
+  /**
+   * @brief use the provided outputs to grow the FCMP++ curve tree and save all relevant data in the db
+   *
+   * @param block_idx the block being entering the chain
+   * @param new_outputs all new outputs to grow the tree with
+   */
+  void grow_tree(const uint64_t block_idx, std::vector<fcmp_pp::UnifiedOutput> &&new_outputs);
+
+  /**
+   * @brief trim the tree to the new number of leaf tuples
+   *
+   * @param new_n_leaf_tuples the expected number of leaf tuples in the tree after trimming
+   * @param trim_block_idx the block idx being trimmed
+   */
+  void trim_tree(const uint64_t new_n_leaf_tuples, const uint64_t trim_block_idx);
+
   uint64_t num_calls = 0;  //!< a performance metric
   uint64_t time_blk_hash = 0;  //!< a performance metric
   uint64_t time_add_block1 = 0;  //!< a performance metric
   uint64_t time_add_transaction = 0;  //!< a performance metric
+  uint64_t time_grow_tree = 0;  //!< a performance metric
 
 
 protected:
@@ -565,10 +709,26 @@ protected:
    *
    * @param blk_hash hash of the block which has the transaction
    * @param tx the transaction to add
+   * @param blob for `tx`
+   * @param transparent_amount_commitments pre-calculated transparent amount commitments
    * @param tx_hash_ptr the hash of the transaction, if already calculated
    * @param tx_prunable_hash_ptr the hash of the prunable part of the transaction, if already calculated
    */
-  void add_transaction(const crypto::hash& blk_hash, const std::pair<transaction, blobdata_ref>& tx, const crypto::hash* tx_hash_ptr = NULL, const crypto::hash* tx_prunable_hash_ptr = NULL);
+  void add_transaction(const crypto::hash& blk_hash, const transaction& tx, epee::span<const std::uint8_t> blob, const std::unordered_map<uint64_t, rct::key> &transparent_amount_commitments, const crypto::hash* tx_hash_ptr = NULL, const crypto::hash* tx_prunable_hash_ptr = NULL);
+
+  /**
+   * @brief advance the FCMP++ curve tree as the provided block_idx enters the chain. This handles
+   * reading the db for any outputs staged for insertion not already provided.
+   *
+   * @param block_idx the block being entering the chain
+   * @param known_new_outputs the default locked new outputs to grow the tree with
+   */
+  void advance_tree(const uint64_t block_idx, const std::vector<fcmp_pp::UnifiedOutput> &known_new_outputs);
+
+  /**
+   * @brief trim a block's worth of data from the tree, placing locked outputs back in the db
+   */
+  void trim_block();
 
   mutable uint64_t time_tx_exists = 0;  //!< a performance metric
   uint64_t time_commit1 = 0;  //!< a performance metric
@@ -576,12 +736,14 @@ protected:
 
   HardFork* m_hardfork;
 
+  std::shared_ptr<fcmp_pp::curve_trees::CurveTreesV1> m_curve_trees;
+
 public:
 
   /**
    * @brief An empty constructor.
    */
-  BlockchainDB(): m_hardfork(NULL), m_open(false) { }
+  BlockchainDB(): m_hardfork(NULL), m_open(false), m_curve_trees() { }
 
   /**
    * @brief An empty destructor.
@@ -703,11 +865,10 @@ public:
    *
    * @param folder    The path of the folder containing the database file(s) which must not end with slash '/'.
    *
-   * @return          true if the operation is succesfull
+   * @return          true if the operation is successful
    */
   virtual bool remove_data_file(const std::string& folder) const = 0;
 
-  // return the name of the folder the db's file(s) should reside in
   /**
    * @brief gets the name of the folder the BlockchainDB's file(s) should be in
    *
@@ -717,41 +878,6 @@ public:
    * @return the name of the folder with the BlockchainDB's files, if any.
    */
   virtual std::string get_db_name() const = 0;
-
-
-  // FIXME: these are just for functionality mocking, need to implement
-  // RAII-friendly and multi-read one-write friendly locking mechanism
-  //
-  // acquire db lock
-  /**
-   * @brief acquires the BlockchainDB lock
-   *
-   * This function is a stub until such a time as locking is implemented at
-   * this level.
-   *
-   * The subclass implementation should return true unless implementing a
-   * locking scheme of some sort, in which case it should return true upon
-   * acquisition of the lock and block until then.
-   *
-   * If any of this cannot be done, the subclass should throw the corresponding
-   * subclass of DB_EXCEPTION
-   *
-   * @return true, unless at a future time false makes sense (timeout, etc)
-   */
-  virtual bool lock() = 0;
-
-  // release db lock
-  /**
-   * @brief This function releases the BlockchainDB lock
-   *
-   * The subclass, should it have implemented lock(), will release any lock
-   * held by the calling thread.  In the case of recursive locking, it should
-   * release one instance of a lock.
-   *
-   * If any of this cannot be done, the subclass should throw the corresponding
-   * subclass of DB_EXCEPTION
-   */
-  virtual void unlock() = 0;
 
   /**
    * @brief tells the BlockchainDB to start a new "batch" of blocks
@@ -830,7 +956,6 @@ public:
 
   virtual void set_hard_fork(HardFork* hf);
 
-  // adds a block with the given metadata to the top of the blockchain, returns the new height
   /**
    * @brief handles the addition of a new block to BlockchainDB
    *
@@ -849,6 +974,7 @@ public:
    * @param cumulative_difficulty the accumulated difficulty after this block
    * @param coins_generated the number of coins generated total after this block
    * @param txs the transactions in the block
+   * @param transparent_amount_commitments pre-calculated transparent amount commitments
    *
    * @return the height of the chain post-addition
    */
@@ -858,6 +984,7 @@ public:
                             , const difficulty_type& cumulative_difficulty
                             , const uint64_t& coins_generated
                             , const std::vector<std::pair<transaction, blobdata>>& txs
+                            , const std::unordered_map<uint64_t, rct::key> &transparent_amount_commitments
                             );
 
   /**
@@ -966,7 +1093,7 @@ public:
   /**
    * @brief fetch a block's cumulative number of rct outputs
    *
-   * The subclass should return the numer of rct outputs in the blockchain
+   * The subclass should return the number of rct outputs in the blockchain
    * up to the block with the given height (inclusive).
    *
    * If the block does not exist, the subclass should throw BLOCK_DNE
@@ -1053,7 +1180,7 @@ public:
    * @brief fetch a block's already generated coins
    *
    * The subclass should return the total coins generated as of the block
-   * with the given height.
+   * with the given height, capped to a maximum value of MONEY_SUPPLY.
    *
    * If the block does not exist, the subclass should throw BLOCK_DNE
    *
@@ -1178,13 +1305,12 @@ public:
    * implements remove_* functions.
    *
    * The subclass should return by reference the popped block and
-   * its associated transactions
+   * its associated transactions, if applicable to that overload
    *
-   * @param blk return-by-reference the block which was popped
-   * @param txs return-by-reference the transactions from the popped block
+   * @param[out] blk the block which was popped
+   * @param[out] txs the non-coinbase transactions from the popped block (optional)
    */
-  virtual void pop_block(block& blk, std::vector<transaction>& txs);
-
+  virtual void pop_block(block& blk, std::vector<transaction>* txs);
 
   /**
    * @brief check if a transaction with a given hash exists
@@ -1200,7 +1326,6 @@ public:
   virtual bool tx_exists(const crypto::hash& h) const = 0;
   virtual bool tx_exists(const crypto::hash& h, uint64_t& tx_id) const = 0;
 
-  // return unlock time of tx with hash <h>
   /**
    * @brief fetch a transaction's unlock time/height
    *
@@ -1215,8 +1340,6 @@ public:
    */
   virtual uint64_t get_tx_unlock_time(const crypto::hash& h) const = 0;
 
-  // return tx with hash <h>
-  // throw if no such tx exists
   /**
    * @brief fetches the transaction with the given hash
    *
@@ -1306,6 +1429,25 @@ public:
   virtual bool get_pruned_tx_blobs_from(const crypto::hash& h, size_t count, std::vector<cryptonote::blobdata> &bd) const = 0;
 
   /**
+   * @brief Get all txids in the database (chain and pool) that match a certain nbits txid template
+   *
+   * To be more specific, for all `dbtxid` txids in the database, return `dbtxid` if
+   * `0 == cryptonote::compare_hash32_reversed_nbits(txid_template, dbtxid, nbits)`.
+   *
+   * @param txid_template the transaction id template
+   * @param nbits number of bits to compare against in the template
+   * @param category tx relay category for which to filter txs in the mempool
+   * @param max_num_txs The maximum number of txids to match, if we hit this limit, throw early
+   * @return std::vector<crypto::hash> the list of all matching txids
+   *
+   * @throw TX_EXISTS if the number of txids that match exceed `max_num_txs`
+   */
+  virtual std::vector<crypto::hash> get_txids_loose(const crypto::hash& txid_template,
+    std::uint32_t nbits,
+    relay_category category,
+    uint64_t max_num_txs = 0) = 0;
+
+  /**
    * @brief fetches a variable number of blocks and transactions from the given height, in canonical blockchain order
    *
    * The subclass should return the blocks and transactions stored from the one with the given
@@ -1318,14 +1460,13 @@ public:
    * @param max_size the maximum size of block/transaction data to return (will be exceeded by one blocks's worth at most, if min_count is met)
    * @param blocks the returned block/transaction data
    * @param pruned whether to return full or pruned tx data
-   * @param skip_coinbase whether to return or skip coinbase transactions (they're in blocks regardless)
    * @param get_miner_tx_hash whether to calculate and return the miner (coinbase) tx hash
    *
    * The call will return at least min_block_count if possible, even if this contravenes max_tx_count
    *
    * @return true iff the blocks and transactions were found
    */
-  virtual bool get_blocks_from(uint64_t start_height, size_t min_block_count, size_t max_block_count, size_t max_tx_count, size_t max_size, std::vector<std::pair<std::pair<cryptonote::blobdata, crypto::hash>, std::vector<std::pair<crypto::hash, cryptonote::blobdata>>>>& blocks, bool pruned, bool skip_coinbase, bool get_miner_tx_hash) const = 0;
+  virtual bool get_blocks_from(uint64_t start_height, size_t min_block_count, size_t max_block_count, size_t max_tx_count, size_t max_size, std::vector<std::pair<std::pair<cryptonote::blobdata, crypto::hash>, std::vector<std::tuple<crypto::hash, crypto::hash, cryptonote::blobdata>>>>& blocks, bool pruned, bool get_miner_tx_hash) const = 0;
 
   /**
    * @brief fetches the prunable transaction blob with the given hash
@@ -1382,7 +1523,6 @@ public:
    */
   virtual std::vector<transaction> get_tx_list(const std::vector<crypto::hash>& hlist) const = 0;
 
-  // returns height of block that contains transaction with hash <h>
   /**
    * @brief fetches the height of a transaction's block
    *
@@ -1397,7 +1537,15 @@ public:
    */
   virtual uint64_t get_tx_block_height(const crypto::hash& h) const = 0;
 
-  // returns the total number of outputs of amount <amount>
+  /**
+   * @brief fetches the number of outputs in the chain
+   *
+   * The subclass should return a count of outputs, or zero if there are none.
+   *
+   * @return the total number of outputs in the chain (of all amounts)
+   */
+  virtual uint64_t total_outputs() const = 0;
+
   /**
    * @brief fetches the number of outputs of a given amount
    *
@@ -1442,13 +1590,13 @@ public:
    * @brief gets an output's tx hash and index
    *
    * The subclass should return the hash of the transaction which created the
-   * output with the global index given, as well as its index in that transaction.
+   * output with the unified index given, as well as its index in that transaction.
    *
-   * @param index an output's global index
+   * @param index an output's unified index
    *
    * @return the tx hash and output index
    */
-  virtual tx_out_index get_output_tx_and_index_from_global(const uint64_t& index) const = 0;
+  virtual tx_out_index get_output_tx_and_index_from_unified(const uint64_t& index) const = 0;
 
   /**
    * @brief gets an output's tx hash and index
@@ -1523,6 +1671,15 @@ public:
   virtual bool has_key_image(const crypto::key_image& img) const = 0;
 
   /**
+   * @brief check if key images are stored as spent
+   *
+   * @param img the key images to check for
+   *
+   * @return true at element `i` if the `img[i]` is present, otherwise false
+   */
+  virtual std::vector<bool> has_key_images(const epee::span<const crypto::key_image> img) const;
+
+  /**
    * @brief add a txpool transaction
    *
    * @param details the details of the transaction to add
@@ -1550,14 +1707,14 @@ public:
   /**
    * @brief remove a txpool transaction
    *
-   * @param txid the transaction id of the transation to remove
+   * @param txid the transaction id of the transaction to remove
    */
   virtual void remove_txpool_tx(const crypto::hash& txid) = 0;
 
   /**
    * @brief get a txpool transaction's metadata
    *
-   * @param txid the transaction id of the transation to lookup
+   * @param txid the transaction id of the transaction to lookup
    * @param meta the metadata to return
    *
    * @return true if the tx meta was found, false otherwise
@@ -1567,7 +1724,7 @@ public:
   /**
    * @brief get a txpool transaction's blob
    *
-   * @param txid the transaction id of the transation to lookup
+   * @param txid the transaction id of the transaction to lookup
    * @param bd the blob to return
    * @param tx_category for filtering out hidden/private txes
    *
@@ -1578,7 +1735,7 @@ public:
   /**
    * @brief get a txpool transaction's blob
    *
-   * @param txid the transaction id of the transation to lookup
+   * @param txid the transaction id of the transaction to lookup
    *
    * @return the blob for that transaction
    */
@@ -1625,20 +1782,6 @@ public:
    * @return success iff true
    */
   virtual bool check_pruning() = 0;
-
-  /**
-   * @brief get the max block size
-   */
-  virtual uint64_t get_max_block_size() = 0;
-
-  /**
-   * @brief add a new max block size
-   *
-   * The max block size will be the maximum of sz and the current block size
-   *
-   * @param: sz the block size
-   */
-  virtual void add_max_block_size(uint64_t sz) = 0;
 
   /**
    * @brief add a new alternative block
@@ -1728,6 +1871,32 @@ public:
   virtual bool for_blocks_range(const uint64_t& h1, const uint64_t& h2, std::function<bool(uint64_t, const crypto::hash&, const cryptonote::block&)>) const = 0;
 
   /**
+   * @brief runs a function over all block info in height range in order
+   *
+   * The subclass should run the passed function for each block in the
+   * specified range, passing (height, block ID, block weight) as its parameters.
+   *
+   * If any call to the function returns false, the subclass should return
+   * false. Otherwise, the subclass returns true.
+   *
+   * The subclass should throw DB_ERROR if any of the expected values are
+   * not found.
+   *
+   * @param start_height start height, inclusive
+   * @param stop_height stop height, inclusive
+   * @param f the function to run
+   *
+   * @return false if the function returns false for any block, otherwise true
+   */
+  virtual bool for_all_block_info(uint64_t start_height
+    , uint64_t stop_height
+    , const std::function<bool(/*height*/ uint64_t
+      , /*block ID*/ const crypto::hash&
+      , /*block weight*/ uint64_t
+      )> &f
+  ) const = 0;
+
+  /**
    * @brief runs a function over all transactions stored
    *
    * The subclass should run the passed function for each transaction it has
@@ -1784,6 +1953,33 @@ public:
    */
   virtual bool for_all_alt_blocks(std::function<bool(const crypto::hash &blkid, const alt_block_data_t &data, const cryptonote::blobdata_ref *blob)> f, bool include_blob = false) const = 0;
 
+  /**
+   * @brief return tree's root and n_tree_layers at a specific block idx
+   *
+   * Gets the tree root and n_tree_layers composed of all valid spendable
+   * outputs when blk_idx is the tip of the chain.
+   *
+   * If the chain tip is block index n, and `blk_idx == n`, then this will
+   * return the tree root and n layers in a tree composed of all valid
+   * spendable outputs in the chain at that time.
+   *
+   * If the chain tip is block index n, and `blk_idx == n-1`, then this will
+   * return the tree root and n layers in a tree composed of all valid
+   * spendable outputs in the chain *when the chain tip was block index n - 1*.
+   *
+   * Note that the tree stored in the database may not match up with the tree
+   * root returned here, since the tree stored in the db may have grown past
+   * the chain tip's tree, with outputs that will unlock in future blocks.
+   *
+   * This function throws if the db does not have a tree root stored for the
+   * given blk_idx.
+   *
+   * @param blk_idx the state of the tree as of this block index
+   * @param tree_root_out return-by-reference tree root
+   *
+   * @return n tree layers when blk_idx was chain tip
+   */
+  virtual uint8_t get_tree_root_at_blk_idx(const uint64_t blk_idx, crypto::ec_point &tree_root_out) const = 0;
 
   //
   // Hard fork related storage
@@ -1883,16 +2079,18 @@ public:
   }
   virtual ~db_txn_guard()
   {
-    if (active)
-      stop();
+    stop();
   }
   void stop()
   {
-    if (readonly)
-      db->block_rtxn_stop();
-    else
-      db->block_wtxn_stop();
-    active = false;
+    if (active)
+    {
+      if (readonly)
+        db->block_rtxn_stop();
+      else
+        db->block_wtxn_stop();
+      active = false;
+    }
   }
   void abort()
   {

@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -32,6 +32,7 @@
 #include "common/command_line.h"
 #include "cryptonote_config.h"
 #include "daemonizer/daemonizer.h"
+#include "cryptonote_core/cryptonote_core.h"
 
 namespace daemon_args
 {
@@ -79,16 +80,12 @@ namespace daemon_args
   };
   const command_line::arg_descriptor<std::string> arg_log_level = {
     "log-level"
-  , ""
+  , "0-4 or categories"
   , ""
   };
   const command_line::arg_descriptor<std::vector<std::string>> arg_command = {
     "daemon_command"
   , "Hidden"
-  };
-  const command_line::arg_descriptor<bool> arg_os_version = {
-    "os-version"
-  , "OS for which this executable was compiled"
   };
   const command_line::arg_descriptor<unsigned> arg_max_concurrency = {
     "max-concurrency"
@@ -96,6 +93,16 @@ namespace daemon_args
   , 0
   };
 
+  const command_line::arg_descriptor<std::string> arg_proxy = {
+    "proxy",
+    "Network communication through proxy: [socks5://[user:pass@]]<socks-ip:port> i.e. \"127.0.0.1:9050\"",
+    "",
+  };
+  const command_line::arg_descriptor<bool> arg_proxy_allow_dns_leaks = {
+    "proxy-allow-dns-leaks",
+    "Allow DNS leaks outside of proxy",
+    false,
+  };
   const command_line::arg_descriptor<bool> arg_public_node = {
     "public-node"
   , "Allow other users to use the node as a remote (restricted RPC mode, view-only commands) and advertise it over P2P"
@@ -124,6 +131,18 @@ namespace daemon_args
   const command_line::arg_descriptor<std::vector<std::string>> arg_zmq_pub = {
     "zmq-pub"
   , "Address for ZMQ pub - tcp://ip:port or ipc://path"
+  };
+
+  const command_line::arg_descriptor<bool> arg_restricted_zmq_rpc = {
+    "restricted-zmq-rpc"
+  , "Restrict ZMQ RPC by disabling some sensitive methods; does not guarantee filtering of sensitive data"
+  , false
+  };
+
+  const command_line::arg_descriptor<bool> arg_confirm_zmq_rpc_external_bind = {
+    "confirm-zmq-rpc-external-bind"
+  , "Confirm zmq-rpc-bind-ip value is NOT a loopback (local) IP"
+  , false
   };
 
   const command_line::arg_descriptor<bool> arg_zmq_rpc_disabled = {

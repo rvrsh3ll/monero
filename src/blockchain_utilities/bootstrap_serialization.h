@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "cryptonote_basic/cryptonote_boost_serialization.h"
+#include "cryptonote_basic/cryptonote_basic.h"
 #include "serialization/difficulty_type.h"
 
 

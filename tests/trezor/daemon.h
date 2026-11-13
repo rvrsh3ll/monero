@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2018, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -60,7 +60,7 @@ public:
   BEGIN_URI_MAP2()
     MAP_URI_AUTO_JON2("/send_raw_transaction", on_send_raw_tx_2, cryptonote::COMMAND_RPC_SEND_RAW_TX)
     MAP_URI_AUTO_JON2("/sendrawtransaction", on_send_raw_tx_2, cryptonote::COMMAND_RPC_SEND_RAW_TX)
-    else {  // Default to parent for non-overriden callbacks
+    else {  // Default to parent for non-overridden callbacks
       return cryptonote::core_rpc_server::handle_http_request_map(query_info, response_info, m_conn_context);
     }
   END_URI_MAP2()
@@ -139,7 +139,7 @@ public:
   void stop_and_deinit();
   void try_init_and_run(boost::optional<unsigned> initial_port=boost::none);
 
-  void mine_blocks(size_t num_blocks, const std::string &miner_address);
+  void mine_blocks(size_t num_blocks, const std::string &miner_address, std::chrono::seconds timeout = std::chrono::seconds(360));
   void start_mining(const std::string &miner_address, uint64_t threads_count=1, bool do_background_mining=false, bool ignore_battery=true);
   void stop_mining();
   uint64_t get_height();

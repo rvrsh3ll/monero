@@ -30,14 +30,17 @@
 #define _NET_SSL_H
 
 #include <chrono>
+#include <functional>
 #include <stdint.h>
 #include <string>
 #include <vector>
 #include <boost/utility/string_ref.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/system/error_code.hpp>
+#include <openssl/evp.h>
 
 #define SSL_FINGERPRINT_SIZE 32
 
@@ -70,7 +73,7 @@ namespace net_utils
 
   /*!
     \note `verification != disabled && support == disabled` is currently
-      "allowed" via public interface but obviously invalid configuation.
+      "allowed" via public interface but obviously invalid configuration.
    */
   class ssl_options_t
   {
@@ -104,12 +107,17 @@ namespace net_utils
     //! \return False iff ssl is disabled, otherwise true.
     explicit operator bool() const noexcept { return support != ssl_support_t::e_ssl_support_disabled; }
 
-    //! \retrurn True if `host` can be verified using `this` configuration WITHOUT system "root" CAs.
+    //! \return True if `host` can be verified using `this` configuration WITHOUT system "root" CAs.
     bool has_strong_verification(boost::string_ref host) const noexcept;
 
     //! Search against internal fingerprints. Always false if `behavior() != user_certificate_check`.
     bool has_fingerprint(boost::asio::ssl::verify_context &ctx) const;
 
+    //! configure ssl_stream handshake verification
+    void configure(
+      boost::asio::ssl::stream<boost::asio::ip::tcp::socket> &socket,
+      boost::asio::ssl::stream_base::handshake_type type,
+      const std::string& host = {}) const;
     boost::asio::ssl::context create_context() const;
 
     /*! \note If `this->support == autodetect && this->verification != none`,
@@ -117,25 +125,32 @@ namespace net_utils
           assumption is that a re-connect will be attempted, so a warning is
           logged instead of failure.
 
-        \note It is strongly encouraged that clients using `system_ca`
-          verification provide a non-empty `host` for rfc2818 verification.
+        \note It is strongly encouraged that clients using system or user CA
+          verification provide a non-empty `host` for hostname verification.
 
+        \param io_context associated with `socket`.
         \param socket Used in SSL handshake and verification
         \param type Client or server
-        \param host This parameter is only used when
-          `type == client && !host.empty()`. The value is sent to the server for
-          situations where multiple hostnames are being handled by a server. If
-          `verification == system_ca` the client also does a rfc2818 check to
-          ensure that the server certificate is to the provided hostname.
+        \param host Expected server hostname or IP address for certificate
+          verification. Clients also send a non-empty value to the server for
+          situations where multiple hostnames are being handled by a server.
+          System and user CA verification check the certificate against a
+          non-empty `host`. A matching whitelisted fingerprint is accepted even
+          if hostname verification fails. Servers should leave this empty when
+          verifying client certificates.
+        \param abort_requested Polled while waiting; when it returns true the
+          handshake is cancelled and fails instead of running to `timeout`.
 
         \return True if the SSL handshake completes with peer verification
           settings. */
     bool handshake(
+      boost::asio::io_context& io_context,
       boost::asio::ssl::stream<boost::asio::ip::tcp::socket> &socket,
       boost::asio::ssl::stream_base::handshake_type type,
       boost::asio::const_buffer buffer = {},
       const std::string& host = {},
-      std::chrono::milliseconds timeout = std::chrono::seconds(15)) const;
+      std::chrono::milliseconds timeout = std::chrono::seconds(15),
+      const std::function<bool()>& abort_requested = nullptr) const;
   };
 
         // https://security.stackexchange.com/questions/34780/checking-client-hello-for-https-classification
@@ -143,8 +158,34 @@ namespace net_utils
 	bool is_ssl(const unsigned char *data, size_t len);
 	bool ssl_support_from_string(ssl_support_t &ssl, boost::string_ref s);
 
-	bool create_ec_ssl_certificate(EVP_PKEY *&pkey, X509 *&cert);
 	bool create_rsa_ssl_certificate(EVP_PKEY *&pkey, X509 *&cert);
+
+  /**
+   * @brief Create a human-readable X509 certificate fingerprint
+   *
+   * Example output: "12:A3:92:19:87:D2:A2:A5:77:94:82:29:B9:5A:91:01:AB:5F:75:16:9A:BA:CD:3D:D3:69:3D:6A:87:DC:E8:0E"
+   *
+   * @param[in] cert The certificate which will be used to create the fingerprint
+   * @param[in] fdig The digest algorithm to use, defaults to SHA-256 b/c that is what ssl_options_t uses
+   * @return The human-readable fingerprint string
+   *
+   * @throw boost::system_error if there is an OpenSSL error
+   */
+  std::string get_hr_ssl_fingerprint(const X509 *cert, const EVP_MD *fdig = EVP_sha256());
+
+  /**
+   * @brief Create a human-readable fingerprint from the contents of an X509 certificate
+   *
+   * Should be equivalent to the command `openssl x509 -in <cert file> -fingerprint -sha256 -noout`
+   * Example output: "12:A3:92:19:87:D2:A2:A5:77:94:82:29:B9:5A:91:01:AB:5F:75:16:9A:BA:CD:3D:D3:69:3D:6A:87:DC:E8:0E"
+   *
+   * @param[in] cert_path The path to an X509 certificate which will be used to create the fingerprint
+   * @param[in] fdig The digest algorithm to use, defaults to SHA-256 b/c that is what ssl_options_t uses
+   * @return The human-readable fingerprint string
+   *
+   * @throw boost::system_error if there is an OpenSSL error or file I/O error
+   */
+  std::string get_hr_ssl_fingerprint_from_file(const std::string& cert_path, const EVP_MD *fdig = EVP_sha256());
 
   //! Store private key for `ssl` at `base + ".key"` unencrypted and certificate for `ssl` at `base + ".crt"`.
   boost::system::error_code store_ssl_keys(boost::asio::ssl::context& ssl, const boost::filesystem::path& base);

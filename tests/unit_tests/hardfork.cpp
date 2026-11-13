@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -47,6 +47,7 @@ namespace
 class TestDB: public cryptonote::BaseTestDB {
 public:
   virtual uint64_t height() const override { return blocks.size(); }
+  using cryptonote::BaseTestDB::add_block;
   virtual void add_block( const block& blk
                         , size_t block_weight
                         , uint64_t long_term_block_weight
@@ -375,7 +376,7 @@ TEST(voting, threshold)
       db.add_block(mkblock(hf, h, v), 0, 0, 0, 0, 0, crypto::hash());
       bool ret = hf.add(db.get_block_from_height(h), h);
       if (h >= 8 && threshold == 87) {
-        // for threshold 87, we reach the treshold at height 7, so from height 8, hard fork to version 2, but 8 tries to add 1
+        // for threshold 87, we reach the threshold at height 7, so from height 8, hard fork to version 2, but 8 tries to add 1
         ASSERT_FALSE(ret);
       }
       else {

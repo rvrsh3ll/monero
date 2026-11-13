@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -28,10 +28,15 @@
 //
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include <boost/filesystem.hpp>
 #include "gtest/gtest.h"
 #include "file_io_utils.h"
 #include "misc_log_ex.h"
+#include "common/scoped_message_writer.h"
 
 static std::string log_filename;
 
@@ -120,6 +125,25 @@ TEST(logging, default)
   cleanup();
 }
 
+TEST(logging, unlogged_message_writer)
+{
+  init();
+  mlog_set_categories("msgwriter:INFO");
+
+  testing::internal::CaptureStdout();
+  tools::success_msg_writer(false) << "ordinary message marker";
+  tools::unlogged_success_msg_writer(false) << "unlogged message marker";
+  const std::string output = testing::internal::GetCapturedStdout();
+
+  std::string str;
+  ASSERT_TRUE(load_log_to_string(log_filename, str));
+  EXPECT_NE(std::string::npos, output.find("ordinary message marker"));
+  EXPECT_NE(std::string::npos, output.find("unlogged message marker"));
+  EXPECT_NE(std::string::npos, str.find("ordinary message marker"));
+  EXPECT_EQ(std::string::npos, str.find("unlogged message marker"));
+  cleanup();
+}
+
 TEST(logging, all)
 {
   init();
@@ -132,6 +156,10 @@ TEST(logging, all)
   ASSERT_TRUE(str.find("error") != std::string::npos);
   ASSERT_TRUE(str.find("debug") != std::string::npos);
   ASSERT_TRUE(str.find("trace") != std::string::npos);
+
+  MINFO("after active log read");
+  ASSERT_TRUE(load_log_to_string(log_filename, str));
+  ASSERT_TRUE(str.find("after active log read") != std::string::npos);
   cleanup();
 }
 
@@ -166,7 +194,7 @@ TEST(logging, glob_prefix)
 TEST(logging, last_precedence)
 {
   init();
-  mlog_set_categories("gobal:FATAL,glo*:DEBUG");
+  mlog_set_categories("global:FATAL,glo*:DEBUG");
   log();
   std::string str;
   ASSERT_TRUE(load_log_to_string(log_filename, str));
@@ -195,3 +223,143 @@ TEST(logging, multiline)
   cleanup();
 }
 
+#ifndef _WIN32
+TEST(logging, reopen_after_external_rotation)
+{
+  init();
+  mlog_set_categories("global:INFO");
+  MGINFO("before rotation");
+
+  const std::string rotated = log_filename + ".1";
+  boost::filesystem::rename(log_filename, rotated);
+  ASSERT_TRUE(boost::filesystem::create_directory(log_filename));
+  ASSERT_FALSE(mlog_reopen());
+  MGINFO("after failed reopen");
+
+  ASSERT_TRUE(boost::filesystem::remove(log_filename));
+  ASSERT_TRUE(mlog_reopen());
+  MGINFO("after successful reopen");
+
+  std::string old_log, new_log;
+  ASSERT_TRUE(load_log_to_string(rotated, old_log));
+  ASSERT_TRUE(load_log_to_string(log_filename, new_log));
+  EXPECT_NE(std::string::npos, old_log.find("before rotation"));
+  EXPECT_NE(std::string::npos, old_log.find("after failed reopen"));
+  EXPECT_EQ(std::string::npos, old_log.find("after successful reopen"));
+  EXPECT_EQ(std::string::npos, new_log.find("before rotation"));
+  EXPECT_EQ(std::string::npos, new_log.find("after failed reopen"));
+  EXPECT_NE(std::string::npos, new_log.find("after successful reopen"));
+
+  boost::filesystem::remove(rotated);
+  cleanup();
+}
+#endif
+
+class LoggingTermSupportsColorSuite : public testing::TestWithParam<std::tuple<std::string, bool>> {};
+
+TEST_P(LoggingTermSupportsColorSuite, Detection)
+{
+  std::tuple<std::string, bool> param = GetParam();
+  auto term = std::get<0>(param);
+  auto is_color = std::get<1>(param);
+  ASSERT_EQ(el::base::utils::OS::termSupportsColor(term), is_color) << term;
+}
+INSTANTIATE_TEST_SUITE_P(
+    TerminalStrings,
+    LoggingTermSupportsColorSuite,
+    testing::Values(
+        std::make_tuple("", false),
+        // unrecognized terminals
+        std::make_tuple("basic", false),
+        std::make_tuple("vt100", false),
+        // known color terminals
+        std::make_tuple("xterm", true),
+        std::make_tuple("screen", true),
+        std::make_tuple("linux", true),
+        std::make_tuple("cygwin", true),
+        std::make_tuple("xterm-color", true),
+        std::make_tuple("xterm-256color", true),
+        std::make_tuple("screen-256color", true),
+        std::make_tuple("screen.xterm-256color", true),
+        // generic color terminal detection by suffix
+        std::make_tuple("unrecognized-color", true),
+        std::make_tuple("unrecognized-256color", true),
+        std::make_tuple("basic-nocolor", false),
+        std::make_tuple("basic-no256color", false),
+        std::make_tuple("basic-color-unsupported", false),
+        std::make_tuple("basic-256color-unsupported", false)
+    ));
+
+// These operations might segfault
+TEST(logging, copy_ctor_segfault)
+{
+    const el::Logger log1("id1", nullptr);
+    const el::Logger log2(log1);
+}
+
+TEST(logging, operator_equals_segfault)
+{
+    const el::Logger log1("id1", nullptr);
+    el::Logger log2("id2", nullptr);
+    log2 = log1;
+}
+
+TEST(logging, empty_configuration)
+{
+    el::Logger log1("id1", nullptr);
+    const el::Configurations cfg;
+    EXPECT_NO_THROW(log1.configure(cfg));
+    EXPECT_EQ(log1.typedConfigurations()->filename(el::Level::Info), "");
+}
+
+TEST(logging, deadlock)
+{
+  std::mutex inner_mutex;
+
+  // 1. Thread 1 starts logger
+  // 2. Thread 2 grabs inner mutex shared across threads
+  // 3. Thread 2 logs
+  // 4. Thread 1 grabs inner mutex shared across threads
+  // 5. Thread 1 finishes logging
+  std::condition_variable cv1, cv2;
+  std::mutex mutex1, mutex2;
+  std::unique_lock<std::mutex> lock_until_t1_starts_logger(mutex1);
+  std::unique_lock<std::mutex> lock_until_t2_finishes_logging(mutex2);
+  bool t1_started_logger = false;
+  bool t2_finished_logging = false;
+
+  const auto thread1_func = [&]
+  {
+    const auto thread1_inner_func = [&]() -> std::string
+    {
+      t1_started_logger = true;
+      lock_until_t1_starts_logger.unlock();
+      cv1.notify_one();
+      cv2.wait(lock_until_t2_finishes_logging, [&]{return t2_finished_logging;});
+
+      std::lock_guard<std::mutex> guard(inner_mutex);
+      return "world!";
+    };
+    MGINFO("Hello, " << thread1_inner_func() << " - Sincerely, thread 1");
+  };
+
+  const auto thread2_func = [&]
+  {
+    cv1.wait(lock_until_t1_starts_logger, [&]{return t1_started_logger;});
+
+    {
+      std::lock_guard<std::mutex> guard(inner_mutex);
+      MGINFO("Hello, world! - Sincerely, thread 2");
+    }
+
+    t2_finished_logging = true;
+    lock_until_t2_finishes_logging.unlock();
+    cv2.notify_one();
+  };
+
+  std::thread t1(thread1_func);
+  std::thread t2(thread2_func);
+
+  t1.join();
+  t2.join();
+}

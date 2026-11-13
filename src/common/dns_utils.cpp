@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -27,17 +27,22 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "common/dns_utils.h"
-// check local first (in the event of static or in-source compilation of libunbound)
-#include "unbound.h"
-
-#include <stdlib.h>
-#include "include_base_utils.h"
 #include "common/threadpool.h"
 #include "crypto/crypto.h"
+// check local first (in the event of static or in-source compilation of libunbound)
+#include "misc_log_ex.h"
+#include "scope_guard.h"
+#include "unbound.h"
+
+#include <deque>
+#include <set>
+#include <stdlib.h>
+#include <cstring>
 #include <boost/thread/mutex.hpp>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/optional.hpp>
 #include <boost/utility/string_ref.hpp>
+#include <boost/asio/ip/address.hpp>
 using namespace epee;
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -45,11 +50,11 @@ using namespace epee;
 
 static const char *DEFAULT_DNS_PUBLIC_ADDR[] =
 {
+  "9.9.9.10",           // Quad9 unfiltered (Switzerland)
+  "149.112.112.10",     // Quad9 secondary (Switzerland)
+  "185.222.222.222",    // DNS.SB (Germany)
+  "45.11.45.11",        // DNS.SB secondary (Germany)
   "194.150.168.168",    // CCC (Germany)
-  "80.67.169.40",       // FDN (France)
-  "89.233.43.71",       // http://censurfridns.dk (Denmark)
-  "109.69.8.51",        // punCAT (Spain)
-  "193.58.251.251",     // SkyDNS (Russia)
 };
 
 static boost::mutex instance_lock;
@@ -102,8 +107,8 @@ get_builtin_ds(void)
 {
   static const char * const ds[] =
   {
-    ". IN DS 19036 8 2 49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5\n",
     ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n",
+    ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16\n",
     NULL
   };
   return ds;
@@ -130,55 +135,32 @@ static const char *get_record_name(int record_type)
   }
 }
 
-// fuck it, I'm tired of dealing with getnameinfo()/inet_ntop/etc
-boost::optional<std::string> ipv4_to_string(const char* src, size_t len)
+static boost::optional<std::string> ipv4_to_string(const char* src, size_t len)
 {
   if (len < 4)
   {
-    MERROR("Invalid IPv4 address: " << std::string(src, len));
+    MERROR("Invalid IPv4 address with length " << len);
     return boost::none;
   }
 
-  std::stringstream ss;
-  unsigned int bytes[4];
-  for (int i = 0; i < 4; i++)
-  {
-    unsigned char a = src[i];
-    bytes[i] = a;
-  }
-  ss << bytes[0] << "."
-     << bytes[1] << "."
-     << bytes[2] << "."
-     << bytes[3];
-  return ss.str();
+  boost::asio::ip::address_v4::bytes_type bytes;
+  std::memcpy(bytes.data(), src, 4);
+  boost::asio::ip::address_v4 addr(bytes);
+  return addr.to_string();
 }
 
-// this obviously will need to change, but is here to reflect the above
-// stop-gap measure and to make the tests pass at least...
-boost::optional<std::string> ipv6_to_string(const char* src, size_t len)
+static boost::optional<std::string> ipv6_to_string(const char* src, size_t len)
 {
-  if (len < 8)
+  if (len < 16)
   {
-    MERROR("Invalid IPv4 address: " << std::string(src, len));
+    MERROR("Invalid IPv6 address with length " << len);
     return boost::none;
   }
 
-  std::stringstream ss;
-  unsigned int bytes[8];
-  for (int i = 0; i < 8; i++)
-  {
-    unsigned char a = src[i];
-    bytes[i] = a;
-  }
-  ss << bytes[0] << ":"
-     << bytes[1] << ":"
-     << bytes[2] << ":"
-     << bytes[3] << ":"
-     << bytes[4] << ":"
-     << bytes[5] << ":"
-     << bytes[6] << ":"
-     << bytes[7];
-  return ss.str();
+  boost::asio::ip::address_v6::bytes_type bytes;
+  std::memcpy(bytes.data(), src, 16);
+  boost::asio::ip::address_v6 addr(bytes);
+  return addr.to_string();
 }
 
 boost::optional<std::string> txt_to_string(const char* src, size_t len)
@@ -194,50 +176,10 @@ boost::optional<std::string> tlsa_to_string(const char* src, size_t len)
     return boost::none;
   return std::string(src, len);
 }
-
-// custom smart pointer.
-// TODO: see if std::auto_ptr and the like support custom destructors
-template<typename type, void (*freefunc)(type*)>
-class scoped_ptr
-{
-public:
-  scoped_ptr():
-    ptr(nullptr)
-  {
-  }
-  scoped_ptr(type *p):
-    ptr(p)
-  {
-  }
-  ~scoped_ptr()
-  {
-    freefunc(ptr);
-  }
-  operator type *() { return ptr; }
-  type **operator &() { return &ptr; }
-  type *operator->() { return ptr; }
-  operator const type*() const { return &ptr; }
-
-private:
-  type* ptr;
-};
-
-typedef class scoped_ptr<ub_result,ub_resolve_free> ub_result_ptr;
-
+  
 struct DNSResolverData
 {
   ub_ctx* m_ub_context;
-};
-
-// work around for bug https://www.nlnetlabs.nl/bugs-script/show_bug.cgi?id=515 needed for it to compile on e.g. Debian 7
-class string_copy {
-public:
-    string_copy(const char *s): str(strdup(s)) {}
-    ~string_copy() { free(str); }
-    operator char*() { return str; }
-
-public:
-    char *str;
 };
 
 static void add_anchors(ub_ctx *ctx)
@@ -246,7 +188,7 @@ static void add_anchors(ub_ctx *ctx)
   while (*ds)
   {
     MINFO("adding trust anchor: " << *ds);
-    ub_ctx_add_ta(ctx, string_copy(*ds++));
+    ub_ctx_add_ta(ctx, *ds++);
   }
 }
 
@@ -275,9 +217,9 @@ DNSResolver::DNSResolver() : m_data(new DNSResolverData())
   if (use_dns_public)
   {
     for (const auto &ip: dns_public_addr)
-      ub_ctx_set_fwd(m_data->m_ub_context, string_copy(ip.c_str()));
-    ub_ctx_set_option(m_data->m_ub_context, string_copy("do-udp:"), string_copy("no"));
-    ub_ctx_set_option(m_data->m_ub_context, string_copy("do-tcp:"), string_copy("yes"));
+      ub_ctx_set_fwd(m_data->m_ub_context, ip.c_str());
+    ub_ctx_set_option(m_data->m_ub_context, "do-udp:", "no");
+    ub_ctx_set_option(m_data->m_ub_context, "do-tcp:", "yes");
   }
   else {
     // look for "/etc/resolv.conf" and "/etc/hosts" or platform equivalent
@@ -302,9 +244,9 @@ DNSResolver::DNSResolver() : m_data(new DNSResolverData())
       m_data->m_ub_context = ub_ctx_create();
       add_anchors(m_data->m_ub_context);
       for (const auto &ip: DEFAULT_DNS_PUBLIC_ADDR)
-        ub_ctx_set_fwd(m_data->m_ub_context, string_copy(ip));
-      ub_ctx_set_option(m_data->m_ub_context, string_copy("do-udp:"), string_copy("no"));
-      ub_ctx_set_option(m_data->m_ub_context, string_copy("do-tcp:"), string_copy("yes"));
+        ub_ctx_set_fwd(m_data->m_ub_context, ip);
+      ub_ctx_set_option(m_data->m_ub_context, "do-udp:", "no");
+      ub_ctx_set_option(m_data->m_ub_context, "do-tcp:", "yes");
     }
   }
 }
@@ -326,24 +268,25 @@ std::vector<std::string> DNSResolver::get_record(const std::string& url, int rec
   std::vector<std::string> addresses;
   dnssec_available = false;
   dnssec_valid = false;
-
-  if (!check_address_syntax(url.c_str()))
-  {
-    return addresses;
-  }
-
-  // destructor takes care of cleanup
-  ub_result_ptr result;
-
+  
+  ub_result *result = NULL;
+  // Make sure we are cleaning after result.
+  const epee::scope_guard scope_exit_handler([&](){
+    ub_resolve_free(result);
+  });
+  
   MDEBUG("Performing DNSSEC " << get_record_name(record_type) << " record query for " << url);
 
   // call DNS resolver, blocking.  if return value not zero, something went wrong
-  if (!ub_resolve(m_data->m_ub_context, string_copy(url.c_str()), record_type, DNS_CLASS_IN, &result))
+  if (!ub_resolve(m_data->m_ub_context, url.c_str(), record_type, DNS_CLASS_IN, &result))
   {
     dnssec_available = (result->secure || result->bogus);
     dnssec_valid = result->secure && !result->bogus;
     if (dnssec_available && !dnssec_valid)
+    {
       MWARNING("Invalid DNSSEC " << get_record_name(record_type) << " record signature for " << url << ": " << result->why_bogus);
+      MWARNING("Possibly your DNS service is problematic. You can have monerod use an alternate via env variable DNS_PUBLIC. Example: DNS_PUBLIC=tcp://9.9.9.9");
+    }
     if (result->havedata)
     {
       for (size_t i=0; result->data[i] != NULL; i++)
@@ -414,21 +357,10 @@ DNSResolver DNSResolver::create()
   return DNSResolver();
 }
 
-bool DNSResolver::check_address_syntax(const char *addr) const
-{
-  // if string doesn't contain a dot, we won't consider it a url for now.
-  if (strchr(addr,'.') == NULL)
-  {
-    return false;
-  }
-  return true;
-}
-
 namespace dns_utils
 {
 
 //-----------------------------------------------------------------------
-// TODO: parse the string in a less stupid way, probably with regex
 std::string address_from_txt_record(const std::string& s)
 {
   // make sure the txt record has "oa1:xmr" and find it
@@ -461,16 +393,16 @@ std::string address_from_txt_record(const std::string& s)
  *
  * gets the monero address from the TXT record of the DNS entry associated
  * with <url>.  If this lookup fails, or the TXT record does not contain an
- * XMR address in the correct format, returns an empty string.  <dnssec_valid>
- * will be set true or false according to whether or not the DNS query passes
- * DNSSEC validation.
+ * XMR address in the correct format, returns an empty string.  <dnssec>
+ * will be set to a dnssec_status value reflecting whether DNSSEC was
+ * available and whether the query passed DNSSEC validation.
  *
  * @param url the url to look up
- * @param dnssec_valid return-by-reference for DNSSEC status of query
+ * @param dnssec return-by-reference for DNSSEC status of query
  *
  * @return a monero address (as a string) or an empty string
  */
-std::vector<std::string> addresses_from_url(const std::string& url, bool& dnssec_valid)
+std::vector<std::string> addresses_from_url(const std::string& url, dnssec_status& dnssec)
 {
   std::vector<std::string> addresses;
   // get txt records
@@ -478,12 +410,18 @@ std::vector<std::string> addresses_from_url(const std::string& url, bool& dnssec
   std::string oa_addr = DNSResolver::instance().get_dns_format_from_oa_address(url);
   auto records = DNSResolver::instance().get_txt_record(oa_addr, dnssec_available, dnssec_isvalid);
 
-  // TODO: update this to allow for conveying that dnssec was not available
-  if (dnssec_available && dnssec_isvalid)
+  if (!dnssec_available)
   {
-    dnssec_valid = true;
+    dnssec = dnssec_status::unavailable;
   }
-  else dnssec_valid = false;
+  else if (dnssec_isvalid)
+  {
+    dnssec = dnssec_status::valid;
+  }
+  else
+  {
+    dnssec = dnssec_status::invalid;
+  }
 
   // for each txt record, try to find a monero address in it.
   for (auto& rec : records)
@@ -497,16 +435,16 @@ std::vector<std::string> addresses_from_url(const std::string& url, bool& dnssec
   return addresses;
 }
 
-std::string get_account_address_as_str_from_url(const std::string& url, bool& dnssec_valid, std::function<std::string(const std::string&, const std::vector<std::string>&, bool)> dns_confirm)
+std::string get_account_address_as_str_from_url(const std::string& url, dnssec_status& dnssec, std::function<std::string(const std::string&, const std::vector<std::string>&, dnssec_status)> dns_confirm)
 {
   // attempt to get address from dns query
-  auto addresses = addresses_from_url(url, dnssec_valid);
+  auto addresses = addresses_from_url(url, dnssec);
   if (addresses.empty())
   {
     LOG_ERROR("wrong address: " << url);
     return {};
   }
-  return dns_confirm(url, addresses, dnssec_valid);
+  return dns_confirm(url, addresses, dnssec);
 }
 
 bool load_txt_records_from_dns(std::vector<std::string> &good_records, const std::vector<std::string> &dns_urls)
@@ -521,7 +459,7 @@ bool load_txt_records_from_dns(std::vector<std::string> &good_records, const std
 
   // send all requests in parallel
   std::deque<bool> avail(dns_urls.size(), false), valid(dns_urls.size(), false);
-  tools::threadpool& tpool = tools::threadpool::getInstance();
+  tools::threadpool& tpool = tools::threadpool::getInstanceForIO();
   tools::threadpool::waiter waiter(tpool);
   for (size_t n = 0; n < dns_urls.size(); ++n)
   {

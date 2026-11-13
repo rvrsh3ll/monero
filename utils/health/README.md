@@ -11,12 +11,13 @@ Unless it's stated differently, these scripts should be called from a given sour
 ## ClangBuildAnalyzer
 
 `utils/health/clang-build-time-analyzer-run.sh`
-The CBA helps in finding culprints of slow compilation.
+The CBA helps in finding culprits of slow compilation.
 On the first run, the script will complain about the missing ClangBuildAnalyzer binary and will point you to another script, which is able to clone and build the required binary.
 
 ## clang-tidy
 
-`utils/health/clang-tidy-run.sh`
+`utils/health/clang-tidy-run-cc.sh`
+`utils/health/clang-tidy-run-cpp.sh`
 Performs Lint checks on the source code and stores the result in the build directory. More information on the [home page](https://clang.llvm.org/extra/clang-tidy/).
 
 ## include-what-you-use

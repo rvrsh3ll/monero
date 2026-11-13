@@ -1,4 +1,5 @@
-# Copyright (c) 2018 The Monero Project
+# Copyright (c) 2018-2024, The Monero Project
+
 # 
 # All rights reserved.
 # 
@@ -32,18 +33,28 @@ from .rpc import JSONRPC
 
 class Wallet(object):
 
-    def __init__(self, protocol='http', host='127.0.0.1', port=0, idx=0):
+    def __init__(self, protocol='http', host='127.0.0.1', port=0, idx=0, username=None, password=None):
         self.host = host
         self.port = port
-        self.rpc = JSONRPC('{protocol}://{host}:{port}'.format(protocol=protocol, host=host, port=port if port else 18090+idx))
+        self.rpc = JSONRPC('{protocol}://{host}:{port}'.format(protocol=protocol, host=host,
+            port=port if port else 18090+idx), username, password)
 
-    def transfer(self, destinations, account_index = 0, subaddr_indices = [], priority = 0, ring_size = 0, unlock_time = 0, payment_id = '', get_tx_key = True, do_not_relay = False, get_tx_hex = False, get_tx_metadata = False):
+    def get_wallet_info(self):
+        get_wallet_info = {
+            'method': 'get_wallet_info',
+            'jsonrpc': '2.0',
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(get_wallet_info)
+
+    def transfer(self, destinations, account_index = 0, subaddr_indices = [], priority = 0, ring_size = 0, unlock_time = 0, payment_id = '', get_tx_key = True, do_not_relay = False, get_tx_hex = False, get_tx_metadata = False, subtract_fee_from_outputs = []):
         transfer = {
             'method': 'transfer',
             'params': {
                 'destinations': destinations,
                 'account_index': account_index,
                 'subaddr_indices': subaddr_indices,
+                'subtract_fee_from_outputs': subtract_fee_from_outputs,
                 'priority': priority,
                 'ring_size' : ring_size,
                 'unlock_time' : unlock_time,
@@ -79,12 +90,13 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(transfer)   
 
-    def get_transfer_by_txid(self, txid, account_index = 0):
+    def get_transfer_by_txid(self, txid, account_index = 0, all_accounts = False):
         get_transfer_by_txid = {
             'method': 'get_transfer_by_txid',
             'params': {
                 'txid': txid,
                 'account_index': account_index,
+                'all_accounts': all_accounts,
             },
             'jsonrpc': '2.0', 
             'id': '0'
@@ -213,16 +225,18 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(sweep_single)
 
-    def get_address(self, account_index = 0, subaddresses = []):
+    def get_address(self, account_index = 0, subaddresses = [], all_accounts = False):
         get_address = {
             'method': 'get_address',
             'params' : {
                 'account_index' : account_index,
-                'address_index': subaddresses
+                'address_index': subaddresses,
             },
             'jsonrpc': '2.0', 
             'id': '0'
         }
+        if all_accounts:
+            get_address['params']['all_accounts'] = True
         return self.rpc.send_json_rpc_request(get_address)
     getaddress = get_address
 
@@ -296,7 +310,7 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(query_key)
 
-    def restore_deterministic_wallet(self, seed = '', seed_offset = '', filename = '', restore_height = 0, password = '', language = '', autosave_current = True):
+    def restore_deterministic_wallet(self, seed = '', seed_offset = '', filename = '', restore_height = 0, password = '', language = '', autosave_current = True, enable_multisig_experimental = False):
         restore_deterministic_wallet = {
             'method': 'restore_deterministic_wallet',
             'params' : {
@@ -307,13 +321,14 @@ class Wallet(object):
                 'password': password,
                 'language': language,
                 'autosave_current': autosave_current,
+                'enable_multisig_experimental': enable_multisig_experimental
             },
             'jsonrpc': '2.0', 
             'id': '0'
         }
         return self.rpc.send_json_rpc_request(restore_deterministic_wallet)
 
-    def generate_from_keys(self, restore_height = 0, filename = "", password = "", address = "", spendkey = "", viewkey = "", autosave_current = True):
+    def generate_from_keys(self, restore_height = 0, filename = "", password = "", address = "", spendkey = "", viewkey = "", autosave_current = True, language = ""):
         generate_from_keys = {
             'method': 'generate_from_keys',
             'params' : {
@@ -324,11 +339,25 @@ class Wallet(object):
                 'viewkey': viewkey,
                 'password': password,
                 'autosave_current': autosave_current,
+                'language': language,
             },
             'jsonrpc': '2.0', 
             'id': '0'
         }
         return self.rpc.send_json_rpc_request(generate_from_keys)
+
+    def set_subaddress_lookahead(self, major_idx: int, minor_idx: int, password = ""):
+        lookahead = {
+            'method': 'set_subaddress_lookahead',
+            'jsonrpc': '2.0',
+            'params' : {
+                'password': password,
+                'major_idx': major_idx,
+                'minor_idx': minor_idx
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(lookahead)
 
     def open_wallet(self, filename, password='', autosave_current = True):
         open_wallet = {
@@ -342,6 +371,17 @@ class Wallet(object):
             'id': '0'
         }
         return self.rpc.send_json_rpc_request(open_wallet)
+
+    def wallet_exists(self, filename):
+        wallet_exists = {
+            'method': 'wallet_exists',
+            'params' : {
+                'filename': filename,
+            },
+            'jsonrpc': '2.0',
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(wallet_exists)
 
     def close_wallet(self, autosave_current = True):
         close_wallet = {
@@ -392,7 +432,7 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(refresh)
 
-    def incoming_transfers(self, transfer_type='all', account_index = 0, subaddr_indices = []):
+    def incoming_transfers(self, transfer_type='all', account_index = 0, subaddr_indices = [], all_accounts = False):
         incoming_transfers = {
             'method': 'incoming_transfers',
             'params' : {
@@ -403,9 +443,11 @@ class Wallet(object):
             'jsonrpc': '2.0', 
             'id': '0'
         }
+        if all_accounts:
+            incoming_transfers['params']['all_accounts'] = True
         return self.rpc.send_json_rpc_request(incoming_transfers)
 
-    def get_transfers(self, in_ = True, out = True, pending = True, failed = True, pool = True, min_height = None, max_height = None, account_index = 0, subaddr_indices = [], all_accounts = False):
+    def get_transfers(self, in_ = True, out = True, pending = True, failed = True, pool = True, min_height = None, max_height = None, account_index = 0, subaddr_indices = [], all_accounts = False, refresh_pool = True):
         get_transfers = {
             'method': 'get_transfers',
             'params' : {
@@ -424,6 +466,8 @@ class Wallet(object):
             'jsonrpc': '2.0', 
             'id': '0'
         }
+        if not refresh_pool:
+            get_transfers['params']['refresh_pool'] = False
         return self.rpc.send_json_rpc_request(get_transfers)
 
     def make_integrated_address(self, standard_address = '', payment_id = ''):
@@ -461,7 +505,7 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(auto_refresh)
 
-    def set_daemon(self, address, trusted = False, ssl_support = "autodetect", ssl_private_key_path = "", ssl_certificate_path = "", ssl_allowed_certificates = [], ssl_allowed_fingerprints = [], ssl_allow_any_cert = False):
+    def set_daemon(self, address, trusted = False, ssl_support = "autodetect", ssl_private_key_path = "", ssl_certificate_path = "", ssl_allowed_certificates = [], ssl_allowed_fingerprints = [], ssl_allow_any_cert = False, proxy = ""):
         set_daemon = {
             'method': 'set_daemon',
             'params' : {
@@ -473,6 +517,7 @@ class Wallet(object):
                 'ssl_allowed_certificates': ssl_allowed_certificates,
                 'ssl_allowed_fingerprints': ssl_allowed_fingerprints,
                 'ssl_allow_any_cert': ssl_allow_any_cert,
+                'proxy': proxy,
             },
             'jsonrpc': '2.0', 
             'id': '0'
@@ -489,10 +534,11 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(is_multisig)
 
-    def prepare_multisig(self):
+    def prepare_multisig(self, enable_multisig_experimental = False):
         prepare_multisig = {
             'method': 'prepare_multisig',
             'params' : {
+                'enable_multisig_experimental': enable_multisig_experimental,
             },
             'jsonrpc': '2.0', 
             'id': '0'
@@ -512,29 +558,32 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(make_multisig)
 
-    def finalize_multisig(self, multisig_info, password = ''):
-        finalize_multisig = {
-            'method': 'finalize_multisig',
-            'params' : {
-                'multisig_info': multisig_info,
-                'password': password,
-            },
-            'jsonrpc': '2.0',
-            'id': '0'
-        }
-        return self.rpc.send_json_rpc_request(finalize_multisig)
-
-    def exchange_multisig_keys(self, multisig_info, password = ''):
+    def exchange_multisig_keys(self, multisig_info, password = '', force_update_use_with_caution = False):
         exchange_multisig_keys = {
             'method': 'exchange_multisig_keys',
             'params' : {
                 'multisig_info': multisig_info,
                 'password': password,
+                'force_update_use_with_caution': force_update_use_with_caution,
             },
             'jsonrpc': '2.0', 
             'id': '0'
         }
         return self.rpc.send_json_rpc_request(exchange_multisig_keys)
+
+    def get_multisig_key_exchange_booster(self, multisig_info, threshold, num_signers, password = ''):
+        exchange_multisig_keys = {
+            'method': 'get_multisig_key_exchange_booster',
+            'params' : {
+                'multisig_info': multisig_info,
+                'threshold': threshold,
+                'num_signers': num_signers,
+                'password': password,
+            },
+            'jsonrpc': '2.0', 
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(get_multisig_key_exchange_booster)
 
     def export_multisig_info(self):
         export_multisig_info = {
@@ -753,20 +802,24 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(relay_tx)
 
-    def get_languages(self):
+    def get_languages(self, polyseed = True):
         get_languages = {
             'method': 'get_languages',
             'params': {
+                'polyseed': polyseed,
             },
             'jsonrpc': '2.0', 
             'id': '0'
         }
         return self.rpc.send_json_rpc_request(get_languages)
 
-    def export_outputs(self):
+    def export_outputs(self, all = False, start = 0, count = 0xffffffff):
         export_outputs = {
             'method': 'export_outputs',
             'params': {
+                'all': all,
+                'start': start,
+                'count': count,
             },
             'jsonrpc': '2.0', 
             'id': '0'
@@ -1081,6 +1134,16 @@ class Wallet(object):
         }
         return self.rpc.send_json_rpc_request(estimate_tx_size_and_weight)
 
+    def get_default_fee_priority(self):
+        get_default_fee_priority = {
+            'method': 'get_default_fee_priority',
+            'jsonrpc': '2.0',
+            'params': {
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(get_default_fee_priority)
+
     def get_version(self):
         get_version = {
             'method': 'get_version',
@@ -1099,3 +1162,78 @@ class Wallet(object):
             'id': '0'
         }
         return self.rpc.send_json_rpc_request(scan_tx)
+
+    def freeze(self, key_image):
+        freeze = {
+            'method': 'freeze',
+            'jsonrpc': '2.0',
+            'params' : {
+                'key_image': key_image,
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(freeze)
+
+    def thaw(self, key_image):
+        thaw = {
+            'method': 'thaw',
+            'jsonrpc': '2.0',
+            'params' : {
+                'key_image': key_image,
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(thaw)
+
+    def frozen(self, key_image):
+        frozen = {
+            'method': 'frozen',
+            'jsonrpc': '2.0',
+            'params' : {
+                'key_image': key_image,
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(frozen)
+
+    class BackgroundSyncOptions(object):
+        def __init__(self):
+            self.off = 'off'
+            self.reuse_password = 'reuse-wallet-password'
+            self.custom_password = 'custom-background-password'
+    background_sync_options = BackgroundSyncOptions()
+
+    def setup_background_sync(self, background_sync_type = background_sync_options.off, wallet_password = '', background_cache_password = ''):
+        setup_background_sync = {
+            'method': 'setup_background_sync',
+            'jsonrpc': '2.0',
+            'params' : {
+                'background_sync_type': background_sync_type,
+                'wallet_password': wallet_password,
+                'background_cache_password': background_cache_password,
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(setup_background_sync)
+
+    def start_background_sync(self):
+        start_background_sync = {
+            'method': 'start_background_sync',
+            'jsonrpc': '2.0',
+            'params' : {},
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(start_background_sync)
+
+    def stop_background_sync(self, wallet_password = '', seed = '', seed_offset = ''):
+        stop_background_sync = {
+            'method': 'stop_background_sync',
+            'jsonrpc': '2.0',
+            'params' : {
+                'wallet_password': wallet_password,
+                'seed': seed,
+                'seed_offset': seed_offset,
+            },
+            'id': '0'
+        }
+        return self.rpc.send_json_rpc_request(stop_background_sync)

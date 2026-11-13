@@ -2,7 +2,7 @@
 /// @author rfree (current maintainer in monero.cc project)
 /// @brief interface for throttling of connection (count and rate-limit speed etc)
 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -37,38 +37,22 @@
 #ifndef INCLUDED_network_throttle_hpp
 #define INCLUDED_network_throttle_hpp
 
-#include <boost/asio.hpp>
 #include <string>
-#include <vector>
 #include <boost/noncopyable.hpp>
 #include <boost/shared_ptr.hpp>
-#include <atomic>
 
 #include <boost/array.hpp>
 #include <boost/enable_shared_from_this.hpp>
-#include <boost/interprocess/detail/atomic.hpp>
 #include <boost/thread/thread.hpp>
 
-#include "syncobj.h"
 
-#include "net/net_utils_base.h" 
-#include "misc_log_ex.h" 
 #include <boost/lambda/bind.hpp>
 #include <boost/lambda/lambda.hpp>
 #include <boost/uuid/random_generator.hpp>
 #include <boost/chrono.hpp>
 #include <boost/utility/value_init.hpp>
-#include <boost/asio/deadline_timer.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
-#include "misc_language.h"
-#include "pragma_comp_defs.h"
-#include <sstream>
-#include <iomanip>
-#include <algorithm>
 
-#include <memory>
-#include <mutex>
-#include <fstream>
 
 namespace epee
 {
@@ -79,7 +63,6 @@ namespace net_utils
 typedef double network_speed_kbps;   // externally, for parameters and return values, all defined in kilobytes per second
 typedef double network_speed_bps;    // throttle-internally, bytes per second
 typedef double network_time_seconds;
-typedef double network_MB;
 
 class i_network_throttle;
 
@@ -96,7 +79,7 @@ typedef calculate_times_struct calculate_times_struct;
 
 
 /*** 
-@brief Access to simple throttles, with singlton to access global network limits
+@brief Access to simple throttles, with singleton to access global network limits
 */
 class network_throttle_manager {
 	// provides global (singleton) in/inreq/out throttle access
@@ -127,6 +110,7 @@ class network_throttle_manager {
 */
 class i_network_throttle {
 	public:
+		virtual ~i_network_throttle() = default;
 		virtual void set_name(const std::string &name)=0;
 		virtual void set_target_speed( network_speed_kbps target )=0;
 		virtual network_speed_kbps get_target_speed()=0;
@@ -138,7 +122,7 @@ class i_network_throttle {
 		// time calculations:
 		
 		virtual void calculate_times(size_t packet_size, calculate_times_struct &cts, bool dbg, double force_window) const =0; // assuming sending new package (or 0), calculate:
-		// Average, Window, Delay, Recommended data size ; also gets dbg=debug flag, and forced widnow size if >0 or -1 for not forcing window size 
+		// Average, Window, Delay, Recommended data size ; also gets dbg=debug flag, and forced window size if >0 or -1 for not forcing window size
 
 		// Average speed, Window size, recommended Delay to sleep now, Recommended size of data to send now
 

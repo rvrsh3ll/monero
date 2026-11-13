@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -36,7 +36,7 @@ namespace wallet_args
 {
   command_line::arg_descriptor<std::string> arg_generate_from_json();
   command_line::arg_descriptor<std::string> arg_wallet_file();
-  command_line::arg_descriptor<std::string> arg_rpc_client_secret_key();
+  command_line::arg_descriptor<std::string> arg_password_file();
 
   const char* tr(const char* str);
 
@@ -47,10 +47,11 @@ namespace wallet_args
 
   \return
     pair.first: The list of parsed options, iff there are no errors.
-    pair.second: Should the execution terminate succesfully without actually launching the application
+    pair.second: Should the execution terminate successfully without actually launching the application
   */
   std::pair<boost::optional<boost::program_options::variables_map>, bool> main(
-    int argc, char** argv,
+    int argc,
+    const char* const argv[],
     const char* const usage,
     const char* const notice,
     boost::program_options::options_description desc_params,

@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 //
@@ -28,9 +28,12 @@
 //
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
+#include <atomic>
+#include <csignal>
 #include <memory>
 #include <stdexcept>
 #include <boost/algorithm/string/split.hpp>
+#include <boost/asio/ip/address.hpp>
 #include "misc_log_ex.h"
 #include "daemon/daemon.h"
 #include "rpc/daemon_handler.h"
@@ -58,11 +61,50 @@ using namespace epee;
 
 namespace daemonize {
 
+namespace
+{
+#ifndef _WIN32
+  std::atomic<bool> reopen_log_requested{false};
+  static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "SIGUSR1 requires a lock-free atomic flag");
+
+  void request_log_reopen(int)
+  {
+    reopen_log_requested.store(true, std::memory_order_relaxed);
+  }
+#endif
+
+  void verify_zmq_rpc_bind(const boost::program_options::variables_map& vm)
+  {
+    std::string bind_ip = command_line::get_arg(vm, daemon_args::arg_zmq_rpc_bind_ip);
+    if (bind_ip.empty())
+      return;
+
+    // ZMQ bind input already accepts bracketed IPv6 literals, but
+    // boost::asio::ip::make_address does not.
+    if (bind_ip.size() >= 2 && bind_ip.front() == '[' && bind_ip.back() == ']')
+      bind_ip = bind_ip.substr(1, bind_ip.size() - 2);
+
+    boost::system::error_code ec{};
+    const auto parsed_ip = boost::asio::ip::make_address(bind_ip, ec);
+    if (ec)
+      throw std::runtime_error{"Invalid IP address given for --" + std::string(daemon_args::arg_zmq_rpc_bind_ip.name)};
+
+    if (!parsed_ip.is_loopback() && !command_line::get_arg(vm, daemon_args::arg_confirm_zmq_rpc_external_bind))
+    {
+      throw std::runtime_error{
+        std::string{"--"} + daemon_args::arg_zmq_rpc_bind_ip.name +
+        " permits inbound unencrypted external connections. Consider SSH tunnel or SSL proxy instead. Override with --" +
+        daemon_args::arg_confirm_zmq_rpc_external_bind.name
+      };
+    }
+  }
+}
+
 struct zmq_internals
 {
-  explicit zmq_internals(t_core& core, t_p2p& p2p)
-    : rpc_handler{core.get(), p2p.get()}
-    , server{rpc_handler}
+  explicit zmq_internals(t_core& core, t_p2p& p2p, const bool restricted)
+    : rpc_handler{core.get(), p2p.get(), restricted}
+    , server{rpc_handler, restricted}
   {}
 
   cryptonote::rpc::DaemonHandler rpc_handler;
@@ -94,17 +136,23 @@ public:
     const auto main_rpc_port = command_line::get_arg(vm, cryptonote::core_rpc_server::arg_rpc_bind_port);
     const auto restricted_rpc_port_arg = cryptonote::core_rpc_server::arg_rpc_restricted_bind_port;
     const bool has_restricted_rpc_port_arg = !command_line::is_arg_defaulted(vm, restricted_rpc_port_arg);
-    rpcs.emplace_back(new t_rpc{vm, core, p2p, restricted, main_rpc_port, "core", !has_restricted_rpc_port_arg});
+    const bool restricted_no_login = command_line::get_arg(vm, cryptonote::core_rpc_server::arg_rpc_restricted_no_login);
+    if (restricted_no_login && !has_restricted_rpc_port_arg)
+      throw std::runtime_error("--rpc-restricted-no-login requires --rpc-restricted-bind-port");
+    rpcs.emplace_back(new t_rpc{vm, core, p2p, restricted, main_rpc_port, "core", false});
 
     if(has_restricted_rpc_port_arg)
     {
       auto restricted_rpc_port = command_line::get_arg(vm, restricted_rpc_port_arg);
-      rpcs.emplace_back(new t_rpc{vm, core, p2p, true, restricted_rpc_port, "restricted", true});
+      rpcs.emplace_back(new t_rpc{vm, core, p2p, true, restricted_rpc_port, "restricted", restricted_no_login});
     }
 
     if (!command_line::get_arg(vm, daemon_args::arg_zmq_rpc_disabled))
     {
-      zmq.reset(new zmq_internals{core, p2p});
+      verify_zmq_rpc_bind(vm);
+
+      const bool restricted = command_line::get_arg(vm, daemon_args::arg_restricted_zmq_rpc);
+      zmq.reset(new zmq_internals{core, p2p, restricted});
 
       const std::string zmq_port = command_line::get_arg(vm, daemon_args::arg_zmq_rpc_bind_port);
       const std::string zmq_address = command_line::get_arg(vm, daemon_args::arg_zmq_rpc_bind_ip);
@@ -119,8 +167,36 @@ public:
 
       if (shared)
       {
+        core.get().get_blockchain_storage().set_txpool_notify(cryptonote::listener::zmq_pub::txpool_add{shared});
         core.get().get_blockchain_storage().add_block_notify(cryptonote::listener::zmq_pub::chain_main{shared});
-        core.get().set_txpool_listener(cryptonote::listener::zmq_pub::txpool_add{shared});
+        core.get().get_blockchain_storage().add_miner_notify(cryptonote::listener::zmq_pub::miner_data{shared});
+      }
+    }
+    else // if --no-zmq specified
+    {
+      // Assert that none of --zmq-rpc-bind-port, --zmq-rpc-bind-ip, and --zmq-pub are specified b/c
+      // that does not make semantic sense with --no-zmq.
+      if (command_line::get_arg(vm, daemon_args::arg_zmq_rpc_bind_port) !=
+          daemon_args::arg_zmq_rpc_bind_port.default_value)
+      {
+        MWARNING("WARN: --zmq-rpc-bind-port has no effect because --no-zmq was specified");
+      }
+      if (command_line::get_arg(vm, daemon_args::arg_zmq_rpc_bind_ip) !=
+          daemon_args::arg_zmq_rpc_bind_ip.default_value)
+      {
+        MWARNING("WARN: --zmq-rpc-bind-ip has no effect because --no-zmq was specified");
+      }
+      if (command_line::get_arg(vm, daemon_args::arg_confirm_zmq_rpc_external_bind))
+      {
+        MWARNING("WARN: --confirm-zmq-rpc-external-bind has no effect because --no-zmq was specified");
+      }
+      if (command_line::get_arg(vm, daemon_args::arg_restricted_zmq_rpc))
+      {
+        MWARNING("WARN: --restricted-zmq-rpc has no effect because --no-zmq was specified");
+      }
+      if (!command_line::get_arg(vm, daemon_args::arg_zmq_pub).empty())
+      {
+        MWARNING("WARN: --zmq-pub has no effect because --no-zmq was specified");
       }
     }
   }
@@ -174,14 +250,36 @@ bool t_daemon::run(bool interactive)
     throw std::runtime_error{"Can't run stopped daemon"};
   }
 
+#ifndef _WIN32
+  reopen_log_requested.store(false, std::memory_order_relaxed);
+  struct sigaction reopen_action = {};
+  reopen_action.sa_handler = request_log_reopen;
+  reopen_action.sa_flags = SA_RESTART;
+  sigemptyset(&reopen_action.sa_mask);
+  struct sigaction previous_action = {};
+  const bool reopen_signal_installed = sigaction(SIGUSR1, &reopen_action, &previous_action) == 0;
+  const epee::scope_guard restore_reopen_signal([&] {
+    if (reopen_signal_installed)
+      sigaction(SIGUSR1, &previous_action, nullptr);
+  });
+  if (!reopen_signal_installed)
+    MWARNING("Failed to install SIGUSR1 log reopen handler");
+#endif
+
   std::atomic<bool> stop(false), shutdown(false);
   boost::thread stop_thread = boost::thread([&stop, &shutdown, this] {
     while (!stop)
+    {
+#ifndef _WIN32
+      if (reopen_log_requested.exchange(false, std::memory_order_relaxed) && !mlog_reopen())
+        MERROR("Failed to reopen the log file after SIGUSR1");
+#endif
       epee::misc_utils::sleep_no_w(100);
+    }
     if (shutdown)
       this->stop_p2p();
   });
-  epee::misc_utils::auto_scope_leave_caller scope_exit_handler = epee::misc_utils::create_scope_leave_handler([&](){
+  const epee::scope_guard scope_exit_handler([&](){
     stop = true;
     stop_thread.join();
   });

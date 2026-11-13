@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -38,6 +38,8 @@ namespace Monero {
 class WalletManagerImpl : public WalletManager
 {
 public:
+    virtual ~WalletManagerImpl() override;
+
     Wallet * createWallet(const std::string &path, const std::string &password,
                           const std::string &language, NetworkType nettype, uint64_t kdf_rounds = 1) override;
     Wallet * openWallet(const std::string &path, const std::string &password, NetworkType nettype, uint64_t kdf_rounds = 1, WalletListener * listener = nullptr) override;
@@ -75,6 +77,14 @@ public:
                                             const std::string &subaddressLookahead = "",
                                             uint64_t kdf_rounds = 1,
                                             WalletListener * listener = nullptr) override;
+    Wallet * createWalletFromPolyseed(const std::string &path,
+                                        const std::string &password,
+                                        NetworkType nettype,
+                                        const std::string &mnemonic,
+                                        const std::string &passphrase,
+                                        bool newWallet = true,
+                                        uint64_t restore_height = 0,
+                                        uint64_t kdf_rounds = 1) override;
     virtual bool closeWallet(Wallet *wallet, bool store = true) override;
     bool walletExists(const std::string &path) override;
     bool verifyWalletPassword(const std::string &keys_file_name, const std::string &password, bool no_spend_key, uint64_t kdf_rounds = 1) const override;
@@ -95,12 +105,10 @@ public:
     bool setProxy(const std::string &address) override;
 
 private:
-    WalletManagerImpl() {}
+    WalletManagerImpl();
     friend struct WalletManagerFactory;
     net::http::client m_http_client;
     std::string m_errorString;
 };
 
 } // namespace
-
-namespace Bitmonero = Monero;

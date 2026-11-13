@@ -2,7 +2,7 @@
 /// @author rfree (current maintainer in monero.cc project)
 /// @brief base for connection, contains e.g. the ratelimit hooks
 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -34,24 +34,14 @@
 
 #include "net/connection_basic.hpp"
 
-#include "net/net_utils_base.h" 
 #include "misc_log_ex.h" 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/thread.hpp>
-#include "misc_language.h"
-#include "pragma_comp_defs.h"
-#include <iomanip>
 
 #include <boost/asio/basic_socket.hpp>
 
 // TODO:
 #include "net/network_throttle-detail.hpp"
-
-#if BOOST_VERSION >= 107000
-#define GET_IO_SERVICE(s) ((boost::asio::io_context&)(s).get_executor().context())
-#else
-#define GET_IO_SERVICE(s) ((s).get_io_service())
-#endif
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net.conn"
@@ -73,21 +63,6 @@ namespace
 		return state->ssl_context;
 	}
 }
-
-  std::string to_string(t_connection_type type)
-  {
-	  if (type == e_connection_type_NET)
-		return std::string("NET");
-	  else if (type == e_connection_type_RPC)
-	    return std::string("RPC");
-	  else if (type == e_connection_type_P2P)
-	    return std::string("P2P");
-	  
-	  return std::string("UNKNOWN");
-  }
-
-
-/* ============================================================================ */
 
 class connection_basic_pimpl {
 	public:
@@ -128,12 +103,12 @@ connection_basic_pimpl::connection_basic_pimpl(const std::string &name) : m_thro
 int connection_basic_pimpl::m_default_tos;
 
 // methods:
-connection_basic::connection_basic(boost::asio::ip::tcp::socket&& sock, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support)
+connection_basic::connection_basic(boost::asio::io_context &io_context, boost::asio::ip::tcp::socket&& sock, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support)
 	:
 	m_state(std::move(state)),
 	mI( new connection_basic_pimpl("peer") ),
-	strand_(GET_IO_SERVICE(sock)),
-	socket_(GET_IO_SERVICE(sock), get_context(m_state.get())),
+	strand_(io_context),
+	socket_(io_context, get_context(m_state.get())),
 	m_want_close_connection(false),
 	m_was_shutdown(false),
 	m_is_multithreaded(false),
@@ -153,12 +128,12 @@ connection_basic::connection_basic(boost::asio::ip::tcp::socket&& sock, std::sha
 	_note("Spawned connection #"<<mI->m_peer_number<<" to " << remote_addr_str << " currently we have sockets count:" << m_state->sock_count);
 }
 
-connection_basic::connection_basic(boost::asio::io_service &io_service, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support)
+connection_basic::connection_basic(boost::asio::io_context &io_context, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support)
 	:
 	m_state(std::move(state)),
 	mI( new connection_basic_pimpl("peer") ),
-	strand_(io_service),
-	socket_(io_service, get_context(m_state.get())),
+	strand_(io_context),
+	socket_(io_context, get_context(m_state.get())),
 	m_want_close_connection(false),
 	m_was_shutdown(false),
 	m_is_multithreaded(false),
@@ -189,7 +164,6 @@ void connection_basic::set_rate_up_limit(uint64_t limit) {
 		CRITICAL_REGION_LOCAL(	network_throttle_manager::m_lock_get_global_throttle_out );
 		network_throttle_manager::get_global_throttle_out().set_target_speed(limit);
 	}
-	save_limit_to_file(limit);
 }
 
 void connection_basic::set_rate_down_limit(uint64_t limit) {
@@ -202,7 +176,6 @@ void connection_basic::set_rate_down_limit(uint64_t limit) {
 	  CRITICAL_REGION_LOCAL(	network_throttle_manager::m_lock_get_global_throttle_inreq );
 		network_throttle_manager::get_global_throttle_inreq().set_target_speed(limit);
 	}
-    save_limit_to_file(limit);
 }
 
 uint64_t connection_basic::get_rate_up_limit() {
@@ -222,9 +195,6 @@ uint64_t connection_basic::get_rate_down_limit() {
 	}
     return limit;
 }
-
-void connection_basic::save_limit_to_file(int limit) {
-}
  
 void connection_basic::set_tos_flag(int tos) {
 	connection_basic_pimpl::m_default_tos = tos;
@@ -232,46 +202,6 @@ void connection_basic::set_tos_flag(int tos) {
 
 int connection_basic::get_tos_flag() {
 	return connection_basic_pimpl::m_default_tos;
-}
-
-void connection_basic::sleep_before_packet(size_t packet_size, int phase,  int q_len) {
-	double delay=0; // will be calculated
-	do
-	{ // rate limiting
-		if (m_was_shutdown) { 
-			_dbg2("m_was_shutdown - so abort sleep");
-			return;
-		}
-
-		{ 
-			CRITICAL_REGION_LOCAL(	network_throttle_manager::m_lock_get_global_throttle_out );
-			delay = network_throttle_manager::get_global_throttle_out().get_sleep_time_after_tick( packet_size );
-		}
-
-		delay *= 0.50;
-		if (delay > 0) {
-            long int ms = (long int)(delay * 1000);
-			MTRACE("Sleeping in " << __FUNCTION__ << " for " << ms << " ms before packet_size="<<packet_size); // debug sleep
-			boost::this_thread::sleep(boost::posix_time::milliseconds( ms ) );
-		}
-	} while(delay > 0);
-
-// XXX LATER XXX
-	{
-	  CRITICAL_REGION_LOCAL(	network_throttle_manager::m_lock_get_global_throttle_out );
-		network_throttle_manager::get_global_throttle_out().handle_trafic_exact( packet_size ); // increase counter - global
-	}
-
-}
-
-void connection_basic::do_send_handler_write(const void* ptr , size_t cb ) {
-        // No sleeping here; sleeping is done once and for all in connection<t_protocol_handler>::handle_write
-	MTRACE("handler_write (direct) - before ASIO write, for packet="<<cb<<" B (after sleep)");
-}
-
-void connection_basic::do_send_handler_write_from_queue( const boost::system::error_code& e, size_t cb, int q_len ) {
-        // No sleeping here; sleeping is done once and for all in connection<t_protocol_handler>::handle_write
-	MTRACE("handler_write (after write, from queue="<<q_len<<") - before ASIO write, for packet="<<cb<<" B (after sleep)");
 }
 
 void connection_basic::logger_handle_net_read(size_t size) { // network data read

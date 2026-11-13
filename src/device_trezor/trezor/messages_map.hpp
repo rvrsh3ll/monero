@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -44,6 +44,10 @@
 #include <google/protobuf/generated_enum_reflection.h>
 #include "google/protobuf/descriptor.pb.h"
 
+#ifdef PROTOBUF_HAS_ABSEIL
+#include <absl/strings/string_view.h>
+#endif
+
 #include "messages/messages.pb.h"
 
 namespace hw {
@@ -62,16 +66,20 @@ namespace trezor {
     static messages::MessageType get_message_wire_number(const google::protobuf::Message & msg);
     static messages::MessageType get_message_wire_number(const std::string & msg_name);
 
+#ifdef PROTOBUF_HAS_ABSEIL
+    static messages::MessageType get_message_wire_number(const absl::string_view & msg_name); // Protobuf 30 and up
+#endif
+
     template<class t_message=google::protobuf::Message>
     static messages::MessageType get_message_wire_number() {
-      BOOST_STATIC_ASSERT(boost::is_base_of<google::protobuf::Message, t_message>::value);
+      static_assert(std::is_base_of_v<google::protobuf::Message, t_message>);
       return get_message_wire_number(t_message::default_instance().GetDescriptor()->name());
     }
   };
 
   template<class t_message=google::protobuf::Message>
   std::shared_ptr<t_message> message_ptr_retype(std::shared_ptr<google::protobuf::Message> & in){
-    BOOST_STATIC_ASSERT(boost::is_base_of<google::protobuf::Message, t_message>::value);
+    static_assert(std::is_base_of_v<google::protobuf::Message, t_message>);
     if (!in){
       return nullptr;
     }
@@ -81,7 +89,7 @@ namespace trezor {
 
   template<class t_message=google::protobuf::Message>
   std::shared_ptr<t_message> message_ptr_retype_static(std::shared_ptr<google::protobuf::Message> & in){
-    BOOST_STATIC_ASSERT(boost::is_base_of<google::protobuf::Message, t_message>::value);
+    static_assert(std::is_base_of_v<google::protobuf::Message, t_message>);
     if (!in){
       return nullptr;
     }

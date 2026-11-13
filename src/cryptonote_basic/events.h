@@ -1,4 +1,4 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2020-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -41,6 +41,8 @@ namespace cryptonote
   {
     cryptonote::transaction tx;
     crypto::hash hash;
+    uint64_t blob_size;
+    uint64_t weight;
     bool res; //!< Listeners must ignore `tx` when this is false.
   };
 }

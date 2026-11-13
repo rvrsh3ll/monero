@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -37,7 +37,9 @@
 
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "cryptonote_core/cryptonote_tx_utils.h"
+#include "net/jsonrpc_structs.h"
 #include "rpc/core_rpc_server_commands_defs.h"
+#include "rpc/core_rpc_server_error_codes.h"
 #include "include_base_utils.h"
 
 
@@ -63,6 +65,7 @@ namespace tools
     //       invalid_password
     //       invalid_priority
     //       invalid_multisig_seed
+    //       invalid_spend_key
     //       refresh_error *
     //         acc_outs_lookup_error
     //         block_parse_error
@@ -85,14 +88,21 @@ namespace tools
     //         tx_too_big
     //         zero_amount
     //         zero_destination
+    //         subtract_fee_from_bad_index
+    //         nonzero_unlock_time
     //       wallet_rpc_error *
     //         daemon_busy
     //         no_connection_to_daemon
     //         is_key_image_spent_error
     //         get_histogram_error
     //         get_output_distribution
-    //         payment_required
+    //         deprecated_rpc_access
     //       wallet_files_doesnt_correspond
+    //       scan_tx_error *
+    //         wont_reprocess_recent_txs_via_untrusted_daemon
+    //       background_sync_error *
+    //         background_wallet_already_open
+    //         background_custom_password_same_as_wallet_password
     //
     // * - class with protected ctor
 
@@ -300,6 +310,16 @@ namespace tools
       std::string to_string() const { return wallet_logic_error::to_string(); }
     };
 
+    struct invalid_spend_key : public wallet_logic_error
+    {
+      explicit invalid_spend_key(std::string&& loc)
+        : wallet_logic_error(std::move(loc), "invalid spend key")
+      {
+      }
+
+      std::string to_string() const { return wallet_logic_error::to_string(); }
+    };
+
     //----------------------------------------------------------------------------------------------------
     struct invalid_pregenerated_random : public wallet_logic_error
     {
@@ -422,7 +442,7 @@ namespace tools
     struct out_of_hashchain_bounds_error : public refresh_error
     {
       explicit out_of_hashchain_bounds_error(std::string&& loc)
-        : refresh_error(std::move(loc), "Index out of bounds of of hashchain")
+        : refresh_error(std::move(loc), "Index out of bounds of hashchain")
       {
       }
 
@@ -432,6 +452,16 @@ namespace tools
     struct reorg_depth_error : public refresh_error
     {
       explicit reorg_depth_error(std::string&& loc, const std::string& message)
+        : refresh_error(std::move(loc), message)
+      {
+      }
+
+      std::string to_string() const { return refresh_error::to_string(); }
+    };
+    //----------------------------------------------------------------------------------------------------
+    struct incorrect_fork_version : public refresh_error
+    {
+      explicit incorrect_fork_version(std::string&& loc, const std::string& message)
         : refresh_error(std::move(loc), message)
       {
       }
@@ -464,11 +494,13 @@ namespace tools
         : transfer_error(std::move(loc), "not enough unlocked money")
         , m_available(available)
         , m_tx_amount(tx_amount)
+        , m_fee(fee)
       {
       }
 
       uint64_t available() const { return m_available; }
       uint64_t tx_amount() const { return m_tx_amount; }
+      uint64_t fee() const { return m_fee; }
 
       std::string to_string() const
       {
@@ -482,6 +514,7 @@ namespace tools
     private:
       uint64_t m_available;
       uint64_t m_tx_amount;
+      uint64_t m_fee;
     };
     //----------------------------------------------------------------------------------------------------
     struct not_enough_money : public transfer_error
@@ -490,11 +523,13 @@ namespace tools
         : transfer_error(std::move(loc), "not enough money")
         , m_available(available)
         , m_tx_amount(tx_amount)
+        , m_fee(fee)
       {
       }
 
       uint64_t available() const { return m_available; }
       uint64_t tx_amount() const { return m_tx_amount; }
+      uint64_t fee() const { return m_fee; }
 
       std::string to_string() const
       {
@@ -508,6 +543,7 @@ namespace tools
     private:
       uint64_t m_available;
       uint64_t m_tx_amount;
+      uint64_t m_fee;
     };
     //----------------------------------------------------------------------------------------------------
     struct tx_not_possible : public transfer_error
@@ -579,20 +615,17 @@ namespace tools
           std::string && loc
         , sources_t const & sources
         , destinations_t const & destinations
-        , uint64_t unlock_time
         , cryptonote::network_type nettype
         )
         : transfer_error(std::move(loc), "transaction was not constructed")
         , m_sources(sources)
         , m_destinations(destinations)
-        , m_unlock_time(unlock_time)
         , m_nettype(nettype)
       {
       }
 
       const sources_t& sources() const { return m_sources; }
       const destinations_t& destinations() const { return m_destinations; }
-      uint64_t unlock_time() const { return m_unlock_time; }
 
       std::string to_string() const
       {
@@ -624,15 +657,12 @@ namespace tools
             cryptonote::print_money(dst.amount);
         }
 
-        ss << "\nunlock_time: " << m_unlock_time;
-
         return ss.str();
       }
 
     private:
       sources_t m_sources;
       destinations_t m_destinations;
-      uint64_t m_unlock_time;
       cryptonote::network_type m_nettype;
     };
     //----------------------------------------------------------------------------------------------------
@@ -767,6 +797,23 @@ namespace tools
       }
     };
     //----------------------------------------------------------------------------------------------------
+    struct subtract_fee_from_bad_index : public transfer_error
+    {
+      explicit subtract_fee_from_bad_index(std::string&& loc, long bad_index)
+        : transfer_error(std::move(loc),
+          "subtractfeefrom: bad index: " + std::to_string(bad_index) + " (indexes are 0-based)")
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
+    struct nonzero_unlock_time : public transfer_error
+    {
+      explicit nonzero_unlock_time(std::string&& loc)
+        : transfer_error(std::move(loc), "transaction cannot have non-zero unlock time")
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
     struct wallet_rpc_error : public wallet_logic_error
     {
       const std::string& request() const { return m_request; }
@@ -855,10 +902,11 @@ namespace tools
       }
     };
     //----------------------------------------------------------------------------------------------------
-    struct payment_required: public wallet_rpc_error
+    struct deprecated_rpc_access: public wallet_rpc_error
     {
-      explicit payment_required(std::string&& loc, const std::string& request)
-        : wallet_rpc_error(std::move(loc), "payment required", request)
+      // The daemon we connected to has enabled the old pay-to-access RPC feature
+      explicit deprecated_rpc_access(std::string&& loc, const std::string& request)
+        : wallet_rpc_error(std::move(loc), "daemon requires deprecated RPC payment", request)
       {
       }
     };
@@ -905,41 +953,56 @@ namespace tools
       }
     };
     //----------------------------------------------------------------------------------------------------
-
-#if !defined(_MSC_VER)
+    struct scan_tx_error : public wallet_logic_error
+    {
+    protected:
+      explicit scan_tx_error(std::string&& loc, const std::string& message)
+        : wallet_logic_error(std::move(loc), message)
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
+    struct wont_reprocess_recent_txs_via_untrusted_daemon : public scan_tx_error
+    {
+      explicit wont_reprocess_recent_txs_via_untrusted_daemon(std::string&& loc)
+        : scan_tx_error(std::move(loc), "The wallet has already seen 1 or more recent transactions than the scanned tx")
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
+    struct background_sync_error : public wallet_logic_error
+    {
+    protected:
+      explicit background_sync_error(std::string&& loc, const std::string& message)
+        : wallet_logic_error(std::move(loc), message)
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
+    struct background_wallet_already_open : public background_sync_error
+    {
+      explicit background_wallet_already_open(std::string&& loc, const std::string& background_wallet_file)
+        : background_sync_error(std::move(loc), "background wallet " + background_wallet_file + " is already opened by another wallet program")
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
+    struct background_custom_password_same_as_wallet_password : public background_sync_error
+    {
+      explicit background_custom_password_same_as_wallet_password(std::string&& loc)
+        : background_sync_error(std::move(loc), "custom background password must be different than wallet password")
+      {
+      }
+    };
+    //----------------------------------------------------------------------------------------------------
 
     template<typename TException, typename... TArgs>
-    void throw_wallet_ex(std::string&& loc, const TArgs&... args)
+    [[noreturn]] void throw_wallet_ex(std::string&& loc, const TArgs&... args)
     {
       TException e(std::move(loc), args...);
       LOG_PRINT_L0(e.to_string());
       throw e;
     }
-
-#else
-    #include <boost/preprocessor/repetition/enum_binary_params.hpp>
-    #include <boost/preprocessor/repetition/enum_params.hpp>
-    #include <boost/preprocessor/repetition/repeat_from_to.hpp>
-
-    template<typename TException>
-    void throw_wallet_ex(std::string&& loc)
-    {
-      TException e(std::move(loc));
-      LOG_PRINT_L0(e.to_string());
-      throw e;
-    }
-
-#define GEN_throw_wallet_ex(z, n, data)                                                       \
-    template<typename TException, BOOST_PP_ENUM_PARAMS(n, typename TArg)>                     \
-    void throw_wallet_ex(std::string&& loc, BOOST_PP_ENUM_BINARY_PARAMS(n, const TArg, &arg)) \
-    {                                                                                         \
-      TException e(std::move(loc), BOOST_PP_ENUM_PARAMS(n, arg));                             \
-      LOG_PRINT_L0(e.to_string());                                                            \
-      throw e;                                                                                \
-    }
-
-    BOOST_PP_REPEAT_FROM_TO(1, 6, GEN_throw_wallet_ex, ~)
-#endif
   }
 }
 
@@ -958,3 +1021,33 @@ namespace tools
     LOG_ERROR(#cond << ". THROW EXCEPTION: " << #err_type);                                                 \
     tools::error::throw_wallet_ex<err_type>(std::string(__FILE__ ":" STRINGIZE(__LINE__)), ## __VA_ARGS__); \
   }
+
+namespace tools
+{
+  namespace error
+  {
+    inline void throw_on_rpc_response_error(bool r, const epee::json_rpc::error &error, const std::string &status, const char *method)
+    {
+      // Treat all RPC payment access errors the same, whether payment is actually required or not
+      THROW_WALLET_EXCEPTION_IF(error.code == CORE_RPC_ERROR_CODE_INVALID_CLIENT, tools::error::deprecated_rpc_access, method);
+      THROW_WALLET_EXCEPTION_IF(error.code, tools::error::wallet_coded_rpc_error, method, error.code, get_rpc_server_error_message(error.code));
+      THROW_WALLET_EXCEPTION_IF(!r, tools::error::no_connection_to_daemon, method);
+      // empty string -> not connection
+      THROW_WALLET_EXCEPTION_IF(status.empty(), tools::error::no_connection_to_daemon, method);
+
+      THROW_WALLET_EXCEPTION_IF(status == CORE_RPC_STATUS_BUSY, tools::error::daemon_busy, method);
+      THROW_WALLET_EXCEPTION_IF(status == CORE_RPC_STATUS_PAYMENT_REQUIRED, tools::error::deprecated_rpc_access, method);
+      // Deprecated RPC payment access endpoints would set status to "Client signature does not verify for <method>"
+      THROW_WALLET_EXCEPTION_IF(status.compare(0, 16, "Client signature") == 0, tools::error::deprecated_rpc_access, method);
+    }
+  }
+}
+
+#define THROW_ON_RPC_RESPONSE_ERROR(r, err, res, method, ...) \
+  do { \
+    tools::error::throw_on_rpc_response_error(r, err, res.status, method); \
+    THROW_WALLET_EXCEPTION_IF(res.status != CORE_RPC_STATUS_OK, ## __VA_ARGS__); \
+  } while(0)
+
+#define THROW_ON_RPC_RESPONSE_ERROR_GENERIC(r, err, res, method) \
+    THROW_ON_RPC_RESPONSE_ERROR(r, err, res, method, tools::error::wallet_generic_rpc_error, method, res.status)

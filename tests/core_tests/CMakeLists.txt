@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -44,6 +44,7 @@ set(core_tests_sources
   v2_tests.cpp
   rct.cpp
   bulletproofs.cpp
+  bulletproof_plus.cpp
   rct2.cpp
   wallet_tools.cpp)
 
@@ -65,6 +66,7 @@ set(core_tests_headers
   v2_tests.h
   rct.h
   bulletproofs.h
+  bulletproof_plus.h
   rct2.h
   wallet_tools.h)
 
@@ -80,6 +82,7 @@ target_link_libraries(core_tests
     epee
     device
     wallet
+    ${Boost_CHRONO_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES})
 enable_stack_trace(core_tests)

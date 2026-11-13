@@ -29,34 +29,35 @@
 
 #pragma once
 
-//#include <Winsock2.h>
-//#include <Ws2tcpip.h>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <boost/version.hpp>
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/thread/future.hpp>
 #include <boost/lambda/bind.hpp>
 #include <boost/lambda/lambda.hpp>
-#include <boost/interprocess/detail/atomic.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/utility/string_ref.hpp>
 #include <functional>
-#include "net/net_utils_base.h"
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+#include <boost/asio/posix/stream_descriptor.hpp>
+#include <cerrno>
+#include <fcntl.h>
+#include <stdexcept>
+#include <unistd.h>
+#endif
 #include "net/net_ssl.h"
-#include "misc_language.h"
+
+#include "misc_log_ex.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net"
-
-#ifndef MAKE_IP
-#define MAKE_IP( a1, a2, a3, a4 )	(a1|(a2<<8)|(a3<<16)|(a4<<24))
-#endif
-
 
 namespace epee
 {
@@ -107,14 +108,41 @@ namespace net_utils
 				m_ssl_socket(new boost::asio::ssl::stream<boost::asio::ip::tcp::socket>(m_io_service, m_ctx)),
 				m_connector(direct_connect{}),
 				m_ssl_options(epee::net_utils::ssl_support_t::e_ssl_support_autodetect),
-				m_initialized(true),
 				m_connected(false),
 				m_deadline(m_io_service, std::chrono::steady_clock::time_point::max()),
-				m_shutdowned(0),
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+				m_wake_reader(m_io_service),
+				m_wake_writer(-1),
+#endif
+				m_aborted(false),
 				m_bytes_sent(0),
 				m_bytes_received(0)
 		{
 			check_deadline();
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+			// self-pipe so shutdown() can wake a blocked run_one() with an async-signal-safe
+			// write(); without it aborts would wait out the op deadline, so refuse to construct
+			int fds[2];
+			if (0 != ::pipe(fds))
+				throw std::runtime_error("failed to create shutdown wake pipe");
+			bool flags_set = true;
+			for (const int fd : fds)
+			{
+				if (-1 == ::fcntl(fd, F_SETFL, O_NONBLOCK) || -1 == ::fcntl(fd, F_SETFD, FD_CLOEXEC))
+					flags_set = false;
+			}
+			boost::system::error_code ec;
+			if (flags_set)
+				m_wake_reader.assign(fds[0], ec);
+			if (!flags_set || ec)
+			{
+				::close(fds[0]);
+				::close(fds[1]);
+				throw std::runtime_error("failed to set up shutdown wake pipe");
+			}
+			m_wake_writer = fds[1];
+			wait_wake();
+#endif
 		}
 
 		/*! The first/second parameters are host/port respectively. The third
@@ -137,8 +165,12 @@ namespace net_utils
 			~blocked_mode_client()
 		{
 			//profile_tools::local_coast lc("~blocked_mode_client()", 3);
-			try { shutdown(); }
+			try { disconnect(); }
 			catch(...) { /* ignore */ }
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+			if (m_wake_writer != -1)
+				::close(m_wake_writer); // read end is owned and closed by m_wake_reader
+#endif
 		}
 
 		inline void set_ssl(ssl_options_t ssl_options)
@@ -151,19 +183,19 @@ namespace net_utils
 		}
 
     inline
-      bool connect(const std::string& addr, int port, std::chrono::milliseconds timeout)
-    {
-      return connect(addr, std::to_string(port), timeout);
-    }
-
-    inline
 			try_connect_result_t try_connect(const std::string& addr, const std::string& port, std::chrono::milliseconds timeout)
 		{
-				m_deadline.expires_from_now(timeout);
+				const auto deadline = std::chrono::steady_clock::now() + timeout;
+				m_deadline.expires_after(timeout);
 				boost::unique_future<boost::asio::ip::tcp::socket> connection = m_connector(addr, port, m_deadline);
 				for (;;)
 				{
-					m_io_service.reset();
+					// aborted or timed out: abandon the attempt; its handlers own their state
+					// and their socket dies with them, at completion or client destruction
+					if (shutdown_requested() || std::chrono::steady_clock::now() >= deadline)
+						return CONNECT_FAILURE;
+
+					m_io_service.restart();
 					m_io_service.run_one();
 
 					if (connection.is_ready())
@@ -172,6 +204,12 @@ namespace net_utils
 
 				m_ssl_socket->next_layer() = connection.get();
 				m_deadline.cancel();
+				if (shutdown_requested())
+				{
+					boost::system::error_code ignored_ec;
+					m_ssl_socket->next_layer().close(ignored_ec);
+					return CONNECT_FAILURE; // aborted by shutdown() from another thread
+				}
 				if (m_ssl_socket->next_layer().is_open())
 				{
 					m_connected = true;
@@ -179,8 +217,13 @@ namespace net_utils
 					// SSL Options
 					if (m_ssl_options.support == epee::net_utils::ssl_support_t::e_ssl_support_enabled || m_ssl_options.support == epee::net_utils::ssl_support_t::e_ssl_support_autodetect)
 					{
-						if (!m_ssl_options.handshake(*m_ssl_socket, boost::asio::ssl::stream_base::client, {}, addr, timeout))
+						if (!m_ssl_options.handshake(m_io_service, *m_ssl_socket, boost::asio::ssl::stream_base::client, {}, addr, timeout, [this] { return shutdown_requested(); }))
 						{
+							if (shutdown_requested())
+							{
+								m_connected = false;
+								return CONNECT_FAILURE; // aborted: says nothing about the server's TLS support
+							}
 							if (m_ssl_options.support == epee::net_utils::ssl_support_t::e_ssl_support_autodetect)
 							{
 								boost::system::error_code ignored_ec;
@@ -197,6 +240,15 @@ namespace net_utils
 							}
 						}
 					}
+					// recheck after publishing m_connected: shutdown() between the check above
+					// and the publish must not leave a live connection behind
+					if (shutdown_requested())
+					{
+						m_connected = false;
+						boost::system::error_code ignored_ec;
+						m_ssl_socket->next_layer().close(ignored_ec);
+						return CONNECT_FAILURE;
+					}
 					return CONNECT_SUCCESS;
 				}else
 				{
@@ -209,10 +261,13 @@ namespace net_utils
     inline
 			bool connect(const std::string& addr, const std::string& port, std::chrono::milliseconds timeout)
 		{
+			if (shutdown_requested())
+				return false; // torn down: the client never reconnects after shutdown()
 			m_connected = false;
 			try
 			{
 				m_ssl_socket->next_layer().close();
+				m_pending_read.reset();
 
 				// Set SSL options
 				// disable sslv2
@@ -256,14 +311,18 @@ namespace net_utils
 		inline 
 		bool disconnect()
 		{
+			m_connected = false;
 			try
 			{	
-				if(m_connected)
+				if(!shutdown_requested() && m_ssl_socket->next_layer().is_open())
 				{
-					m_connected = false;
 					if(m_ssl_options)
 						shutdown_ssl();
-					m_ssl_socket->next_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both);
+					// The peer or the TLS shutdown deadline may already have closed the connection.
+					boost::system::error_code ignored_ec;
+					m_ssl_socket->next_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored_ec);
+					// shutdown() alone leaves is_open() true and repeats TLS shutdown on later calls.
+					m_ssl_socket->next_layer().close();
 				}
 			}
 			catch(const boost::system::system_error& /*er*/)
@@ -283,10 +342,9 @@ namespace net_utils
 		inline 
 		bool send(const boost::string_ref buff, std::chrono::milliseconds timeout)
 		{
-
 			try
 			{
-				m_deadline.expires_from_now(timeout);
+				m_deadline.expires_after(timeout);
 
 				// Set up the variable that receives the result of the asynchronous
 				// operation. The error code is set to would_block to signal that the
@@ -302,10 +360,23 @@ namespace net_utils
 				async_write(buff.data(), buff.size(), ec);
 
 				// Block until the asynchronous operation has completed.
-				while (ec == boost::asio::error::would_block)
+				while (ec == boost::asio::error::would_block && !shutdown_requested())
 				{
-					m_io_service.reset();
+					m_io_service.restart();
 					m_io_service.run_one(); 
+				}
+
+				// aborted by shutdown(): the pending handler references this frame, so
+				// close the socket and pump until it completes before returning
+				if (ec == boost::asio::error::would_block)
+				{
+					boost::system::error_code ignored_ec;
+					m_ssl_socket->next_layer().close(ignored_ec);
+					while (ec == boost::asio::error::would_block)
+					{
+						m_io_service.restart();
+						m_io_service.run_one();
+					}
 				}
 
 				if (ec)
@@ -334,83 +405,76 @@ namespace net_utils
 			return true;
 		}
 
-		inline 
-			bool send(const void* data, size_t sz)
-		{
-			try
-			{
-				/*
-				m_deadline.expires_from_now(boost::posix_time::milliseconds(m_reciev_timeout));
-
-				// Set up the variable that receives the result of the asynchronous
-				// operation. The error code is set to would_block to signal that the
-				// operation is incomplete. Asio guarantees that its asynchronous
-				// operations will never fail with would_block, so any other value in
-				// ec indicates completion.
-				boost::system::error_code ec = boost::asio::error::would_block;
-
-				// Start the asynchronous operation itself. The boost::lambda function
-				// object is used as a callback and will update the ec variable when the
-				// operation completes. The blocking_udp_client.cpp example shows how you
-				// can use boost::bind rather than boost::lambda.
-				boost::asio::async_write(m_socket, boost::asio::buffer(data, sz), boost::lambda::var(ec) = boost::lambda::_1);
-
-				// Block until the asynchronous operation has completed.
-				while (ec == boost::asio::error::would_block)
-				{
-					m_io_service.run_one();
-				}
-				*/
-				boost::system::error_code ec;
-
-				size_t writen = write(data, sz, ec);
-
-				if (!writen || ec)
-				{
-					LOG_PRINT_L3("Problems at write: " << ec.message());
-          m_connected = false;
-					return false;
-				}else
-				{
-					m_deadline.expires_at(std::chrono::steady_clock::time_point::max());
-					m_bytes_sent += sz;
-				}
-			}
-
-			catch(const boost::system::system_error& er)
-			{
-				LOG_ERROR("Some problems at send, message: " << er.what());
-        m_connected = false;
-				return false;
-			}
-			catch(...)
-			{
-				LOG_ERROR("Some fatal problems.");
-				return false;
-			}
-
-			return true;
-		}
-
 		bool is_connected(bool *ssl = NULL)
 		{
 			if (!m_connected || !m_ssl_socket->next_layer().is_open())
 				return false;
+
+			boost::system::error_code ec;
+			if (m_ssl_options)
+			{
+				// let Asio process TLS alerts and retain a byte of application data for recv
+				if (!m_pending_read)
+				{
+					const auto pending = std::make_shared<pending_read>();
+					// reconnect may replace the stream before this handler completes
+					const auto socket = m_ssl_socket;
+					socket->async_read_some(boost::asio::buffer(&pending->byte, 1),
+						[socket, pending](const boost::system::error_code& error, size_t) {
+							pending->error = error;
+							if (pending->handler)
+							{
+								auto handler = std::move(pending->handler);
+								handler(error, pending->byte);
+							}
+						});
+					m_pending_read = pending;
+				}
+				m_io_service.restart();
+				m_io_service.poll();
+				ec = m_pending_read->error;
+			}
+			else
+			{
+				// peek for EOF without consuming application data or changing the socket mode
+				auto& socket = m_ssl_socket->next_layer();
+				const bool non_blocking = socket.non_blocking();
+				socket.non_blocking(true, ec);
+				if (!ec)
+				{
+					char byte;
+					socket.receive(boost::asio::buffer(&byte, 1), boost::asio::ip::tcp::socket::message_peek, ec);
+					boost::system::error_code restore_error;
+					socket.non_blocking(non_blocking, restore_error);
+					if (restore_error)
+					{
+						m_connected = false;
+						return false;
+					}
+				}
+			}
+			if (ec && ec != boost::asio::error::would_block &&
+				ec != boost::asio::error::try_again && ec != boost::asio::error::interrupted)
+			{
+				MDEBUG("Peer closed idle connection, marking disconnected: " << ec.message());
+				m_connected = false;
+				return false;
+			}
+
 			if (ssl)
 				*ssl = m_ssl_options.support != ssl_support_t::e_ssl_support_disabled;
-			return true;
+			return m_connected;
 		}
 
 		inline 
 		bool recv(std::string& buff, std::chrono::milliseconds timeout)
 		{
-
 			try
 			{
 				// Set a deadline for the asynchronous operation. Since this function uses
 				// a composed operation (async_read_until), the deadline applies to the
 				// entire operation, rather than individual reads from the socket.
-				m_deadline.expires_from_now(timeout);
+				m_deadline.expires_after(timeout);
 
 				// Set up the variable that receives the result of the asynchronous
 				// operation. The error code is set to would_block to signal that the
@@ -432,18 +496,31 @@ namespace net_utils
 				static const size_t max_size = 16384;
 				buff.resize(max_size);
 				
-				async_read(&buff[0], max_size, boost::asio::transfer_at_least(1), hndlr);
+				async_read(&buff[0], max_size, hndlr);
 
 				// Block until the asynchronous operation has completed.
-				while (ec == boost::asio::error::would_block && !boost::interprocess::ipcdetail::atomic_read32(&m_shutdowned))
+				while (ec == boost::asio::error::would_block && !shutdown_requested())
 				{
-					m_io_service.reset();
+					m_io_service.restart();
 					m_io_service.run_one(); 
 				}
 
+				// aborted by shutdown(): the pending handler references this frame, so
+				// close the socket and pump until it completes before returning
+				if (ec == boost::asio::error::would_block)
+				{
+					boost::system::error_code ignored_ec;
+					m_ssl_socket->next_layer().close(ignored_ec);
+					while (ec == boost::asio::error::would_block)
+					{
+						m_io_service.restart();
+						m_io_service.run_one();
+					}
+				}
 
 				if (ec)
 				{
+					m_connected = false;
                     MTRACE("READ ENDS: Connection err_code " << ec.value());
                     if(ec == boost::asio::error::eof)
                     {
@@ -454,7 +531,6 @@ namespace net_utils
                     }
 
 					MDEBUG("Problems at read: " << ec.message());
-                    m_connected = false;
 					return false;
 				}else
 				{
@@ -488,107 +564,23 @@ namespace net_utils
 
 		}
 
-		inline bool recv_n(std::string& buff, int64_t sz, std::chrono::milliseconds timeout)
-		{
-
-			try
-			{
-				// Set a deadline for the asynchronous operation. Since this function uses
-				// a composed operation (async_read_until), the deadline applies to the
-				// entire operation, rather than individual reads from the socket.
-				m_deadline.expires_from_now(timeout);
-
-				// Set up the variable that receives the result of the asynchronous
-				// operation. The error code is set to would_block to signal that the
-				// operation is incomplete. Asio guarantees that its asynchronous
-				// operations will never fail with would_block, so any other value in
-				// ec indicates completion.
-				//boost::system::error_code ec = boost::asio::error::would_block;
-
-				// Start the asynchronous operation itself. The boost::lambda function
-				// object is used as a callback and will update the ec variable when the
-				// operation completes. The blocking_udp_client.cpp example shows how you
-				// can use boost::bind rather than boost::lambda.
-
-				buff.resize(static_cast<size_t>(sz));
-				boost::system::error_code ec = boost::asio::error::would_block;
-				size_t bytes_transfered = 0;
-
-				
-				handler_obj hndlr(ec, bytes_transfered);
-				async_read((char*)buff.data(), buff.size(), boost::asio::transfer_at_least(buff.size()), hndlr);
-				
-				// Block until the asynchronous operation has completed.
-				while (ec == boost::asio::error::would_block && !boost::interprocess::ipcdetail::atomic_read32(&m_shutdowned))
-				{
-					m_io_service.run_one(); 
-				}
-
-				if (ec)
-				{
-					LOG_PRINT_L3("Problems at read: " << ec.message());
-          m_connected = false;
-					return false;
-				}else
-				{
-					m_deadline.expires_at(std::chrono::steady_clock::time_point::max());
-				}
-
-				m_bytes_received += bytes_transfered;
-				if(bytes_transfered != buff.size())
-				{
-					LOG_ERROR("Transferred mismatch with transfer_at_least value: m_bytes_transferred=" << bytes_transfered << " at_least value=" << buff.size());
-					return false;
-				}
-
-				return true;
-			}
-
-			catch(const boost::system::system_error& er)
-			{
-				LOG_ERROR("Some problems at read, message: " << er.what());
-        m_connected = false;
-				return false;
-			}
-			catch(...)
-			{
-				LOG_ERROR("Some fatal problems at read.");
-				return false;
-			}
-
-
-
-			return false;
-		}
-		
 		bool shutdown()
 		{
-			m_deadline.cancel();
-			boost::system::error_code ec;
-			if(m_ssl_options)
-				shutdown_ssl();
-			m_ssl_socket->next_layer().cancel(ec);
-			if(ec)
-				MDEBUG("Problems at cancel: " << ec.message());
-			m_ssl_socket->next_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-			if(ec)
-				MDEBUG("Problems at shutdown: " << ec.message());
-			m_ssl_socket->next_layer().close(ec);
-			if(ec)
-				MDEBUG("Problems at close: " << ec.message());
-			boost::interprocess::ipcdetail::atomic_write32(&m_shutdowned, 1);
-      m_connected = false;
+			// callable from any thread, on POSIX even a signal handler: only atomics and a self-pipe
+			// write(); a blocked call closes the socket on abort, an idle client's closes at destruction
+			m_aborted = true;
+			m_connected = false;
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+			// construction guarantees the pipe exists
+			const int saved_errno = errno;
+			const char wake = 0;
+			while (::write(m_wake_writer, &wake, 1) == -1 && errno == EINTR) {}
+			errno = saved_errno; // a full pipe already holds a pending wake
+#else
+			// Windows console handlers run on their own thread: post() a wake
+			boost::asio::post(m_io_service, []{});
+#endif
 			return true;
-		}
-		
-		boost::asio::io_service& get_io_service()
-		{
-			return m_io_service;
-		}
-
-		boost::asio::ip::tcp::socket& get_socket()
-		{
-			return m_ssl_socket->next_layer();
 		}
 
 		uint64_t get_bytes_sent() const
@@ -603,12 +595,33 @@ namespace net_utils
 
 	private:
 
+		struct pending_read
+		{
+			char byte = 0;
+			boost::system::error_code error = boost::asio::error::would_block;
+			std::function<void(const boost::system::error_code&, char)> handler;
+		};
+
+		bool shutdown_requested() const
+		{
+			return m_aborted.load();
+		}
+
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+		// perpetual pipe read so a wake byte written by shutdown() unblocks run_one()
+		void wait_wake()
+		{
+			m_wake_reader.async_read_some(boost::asio::buffer(m_wake_buf),
+				[this] (const boost::system::error_code& ec, std::size_t) { if (!ec) wait_wake(); });
+		}
+#endif
+
 		void check_deadline()
 		{
 			// Check whether the deadline has passed. We compare the deadline against
 			// the current time since a new asynchronous operation may have moved the
 			// deadline before this actor had a chance to run.
-			if (m_deadline.expires_at() <= std::chrono::steady_clock::now())
+			if (m_deadline.expiry() <= std::chrono::steady_clock::now())
 			{
 				// The deadline has passed. The socket is closed so that any outstanding
 				// asynchronous operations are cancelled. This allows the blocked
@@ -629,11 +642,11 @@ namespace net_utils
 		void shutdown_ssl() {
 			// ssl socket shutdown blocks if server doesn't respond. We close after 2 secs
 			boost::system::error_code ec = boost::asio::error::would_block;
-			m_deadline.expires_from_now(std::chrono::milliseconds(2000));
+			m_deadline.expires_after(std::chrono::milliseconds(2000));
 			m_ssl_socket->async_shutdown(boost::lambda::var(ec) = boost::lambda::_1);
 			while (ec == boost::asio::error::would_block)
 			{
-				m_io_service.reset();
+				m_io_service.restart();
 				m_io_service.run_one();
 			}
 			// Ignore "short read" error
@@ -649,16 +662,6 @@ namespace net_utils
 		}
 		
 	protected:
-		bool write(const void* data, size_t sz, boost::system::error_code& ec)
-		{
-			bool success;
-			if(m_ssl_options.support != ssl_support_t::e_ssl_support_disabled)
-				success = boost::asio::write(*m_ssl_socket, boost::asio::buffer(data, sz), ec);
-			else
-				success = boost::asio::write(m_ssl_socket->next_layer(), boost::asio::buffer(data, sz), ec);
-			return success;
-		}
-		
 		void async_write(const void* data, size_t sz, boost::system::error_code& ec) 
 		{
 			if(m_ssl_options.support != ssl_support_t::e_ssl_support_disabled)
@@ -667,140 +670,56 @@ namespace net_utils
 				boost::asio::async_write(m_ssl_socket->next_layer(), boost::asio::buffer(data, sz), boost::lambda::var(ec) = boost::lambda::_1);
 		}
 		
-		void async_read(char* buff, size_t sz, boost::asio::detail::transfer_at_least_t transfer_at_least, handler_obj& hndlr)
+		void async_read(char* buff, size_t sz, handler_obj& hndlr)
 		{
+			// finish the probe before starting another TLS read
+			if (sz && m_pending_read)
+			{
+				const auto pending = m_pending_read;
+				auto on_read = [buff, hndlr]
+					(const boost::system::error_code& error, char byte) mutable {
+						if (error)
+						{
+							hndlr(error, 0);
+							return;
+						}
+						buff[0] = byte;
+						// recv() only needs one byte; deliver it before observing any later EOF.
+						hndlr(error, 1);
+					};
+				if (pending->error == boost::asio::error::would_block)
+					pending->handler = std::move(on_read);
+				m_pending_read.reset();
+				if (pending->error != boost::asio::error::would_block)
+					on_read(pending->error, pending->byte);
+				return;
+			}
 			if(m_ssl_options.support == ssl_support_t::e_ssl_support_disabled)
-				boost::asio::async_read(m_ssl_socket->next_layer(), boost::asio::buffer(buff, sz), transfer_at_least, hndlr);
+				boost::asio::async_read(m_ssl_socket->next_layer(), boost::asio::buffer(buff, sz), boost::asio::transfer_at_least(1), hndlr);
 			else
-				boost::asio::async_read(*m_ssl_socket, boost::asio::buffer(buff, sz), transfer_at_least, hndlr);
+				boost::asio::async_read(*m_ssl_socket, boost::asio::buffer(buff, sz), boost::asio::transfer_at_least(1), hndlr);
 			
 		}
 		
 	protected:
-		boost::asio::io_service m_io_service;
+		boost::asio::io_context m_io_service;
 		boost::asio::ssl::context m_ctx;
 		std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> m_ssl_socket;
+		std::shared_ptr<pending_read> m_pending_read;
 		std::function<connect_func> m_connector;
 		ssl_options_t m_ssl_options;
-		bool m_initialized;
-		bool m_connected;
+		std::atomic<bool> m_connected;
 		boost::asio::steady_timer m_deadline;
-		volatile uint32_t m_shutdowned;
+#ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
+		// self-pipe: shutdown() write()s the pipe to wake run_one() signal-safely
+		boost::asio::posix::stream_descriptor m_wake_reader;
+		int m_wake_writer;
+		char m_wake_buf[8];
+#endif
+		// sticky: set once by shutdown(), never cleared; the client is being torn down
+		std::atomic<bool> m_aborted;
 		std::atomic<uint64_t> m_bytes_sent;
 		std::atomic<uint64_t> m_bytes_received;
-	};
-
-
-	/************************************************************************/
-	/*                                                                      */
-	/************************************************************************/
-	class async_blocked_mode_client: public blocked_mode_client
-	{
-	public:
-		async_blocked_mode_client():m_send_deadline(blocked_mode_client::m_io_service)
-		{
-
-			// No deadline is required until the first socket operation is started. We
-			// set the deadline to positive infinity so that the actor takes no action
-			// until a specific deadline is set.
-			m_send_deadline.expires_at(boost::posix_time::pos_infin);
-
-			// Start the persistent actor that checks for deadline expiry.
-			check_send_deadline();
-		}
-		~async_blocked_mode_client()
-		{
-			m_send_deadline.cancel();
-		}
-		
-		bool shutdown()
-		{
-			blocked_mode_client::shutdown();
-			m_send_deadline.cancel();
-			return true;
-		}
-
-		inline 
-			bool send(const void* data, size_t sz)
-		{
-			try
-			{
-				/*
-				m_send_deadline.expires_from_now(boost::posix_time::milliseconds(m_reciev_timeout));
-
-				// Set up the variable that receives the result of the asynchronous
-				// operation. The error code is set to would_block to signal that the
-				// operation is incomplete. Asio guarantees that its asynchronous
-				// operations will never fail with would_block, so any other value in
-				// ec indicates completion.
-				boost::system::error_code ec = boost::asio::error::would_block;
-
-				// Start the asynchronous operation itself. The boost::lambda function
-				// object is used as a callback and will update the ec variable when the
-				// operation completes. The blocking_udp_client.cpp example shows how you
-				// can use boost::bind rather than boost::lambda.
-				boost::asio::async_write(m_socket, boost::asio::buffer(data, sz), boost::lambda::var(ec) = boost::lambda::_1);
-
-				// Block until the asynchronous operation has completed.
-				while(ec == boost::asio::error::would_block)
-				{
-					m_io_service.run_one();
-				}*/
-				
-				boost::system::error_code ec;
-
-				size_t writen = write(data, sz, ec);
-				
-				if (!writen || ec)
-				{
-					LOG_PRINT_L3("Problems at write: " << ec.message());
-					return false;
-				}else
-				{
-					m_send_deadline.expires_at(boost::posix_time::pos_infin);
-				}
-			}
-
-			catch(const boost::system::system_error& er)
-			{
-				LOG_ERROR("Some problems at connect, message: " << er.what());
-				return false;
-			}
-			catch(...)
-			{
-				LOG_ERROR("Some fatal problems.");
-				return false;
-			}
-
-			return true;
-		}
-
-
-	private:
-
-		boost::asio::deadline_timer m_send_deadline;
-
-		void check_send_deadline()
-		{
-			// Check whether the deadline has passed. We compare the deadline against
-			// the current time since a new asynchronous operation may have moved the
-			// deadline before this actor had a chance to run.
-			if (m_send_deadline.expires_at() <= boost::asio::deadline_timer::traits_type::now())
-			{
-				// The deadline has passed. The socket is closed so that any outstanding
-				// asynchronous operations are cancelled. This allows the blocked
-				// connect(), read_line() or write_line() functions to return.
-				LOG_PRINT_L3("Timed out socket");
-				m_ssl_socket->next_layer().close();
-
-				// There is no longer an active deadline. The expiry is set to positive
-				// infinity so that the actor takes no action until a new deadline is set.
-				m_send_deadline.expires_at(boost::posix_time::pos_infin);
-			}
-
-			// Put the actor back to sleep.
-			m_send_deadline.async_wait(boost::bind(&async_blocked_mode_client::check_send_deadline, this));
-		}
 	};
 }
 }

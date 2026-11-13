@@ -1,4 +1,5 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
+
 //
 // All rights reserved.
 //
@@ -817,27 +818,15 @@ TEST(Expect, EqualNoCopies)
 
 TEST(Expect, Macros) {
     EXPECT_TRUE(
-        [] () -> ::common_error {
-            MONERO_PRECOND(true);
-            return {common_error::kInvalidErrorCode};
-        } () == common_error::kInvalidErrorCode
-    );
-    EXPECT_TRUE(
-        [] () -> ::common_error {
-            MONERO_PRECOND(false);
-            return {common_error::kInvalidErrorCode};
-        } () == common_error::kInvalidArgument
-    );
-    EXPECT_TRUE(
         [] () -> std::error_code {
             MONERO_PRECOND(true);
-            return {common_error::kInvalidErrorCode};
+            return common_error::kInvalidErrorCode;
         } () == common_error::kInvalidErrorCode
     );
     EXPECT_TRUE(
         [] () -> std::error_code {
             MONERO_PRECOND(false);
-            return {common_error::kInvalidErrorCode};
+            return common_error::kInvalidErrorCode;
         } () == common_error::kInvalidArgument
     );
     EXPECT_TRUE(

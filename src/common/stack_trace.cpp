@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -26,7 +26,7 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#if !defined __GNUC__ || defined __MINGW32__ || defined __MINGW64__ || defined __ANDROID__
+#if !defined __GNUC__ || defined __clang__ || defined __MINGW32__ || defined __MINGW64__ || defined __ANDROID__
 #define USE_UNWIND
 #else
 #define ELPP_FEATURE_CRASH_LOG 1
@@ -34,12 +34,14 @@
 #include "easylogging++/easylogging++.h"
 
 #include <stdexcept>
+#include <iomanip>
+#include <sstream>
 #ifdef USE_UNWIND
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 #include <cxxabi.h>
 #endif
-#ifndef STATICLIB
+#if !defined(STATICLIB) && !defined(STACK_TRACE_USE_WRAP)
 #include <dlfcn.h>
 #endif
 #include <boost/algorithm/string.hpp>
@@ -53,7 +55,9 @@
   do { \
     auto elpp = ELPP; \
     if (elpp) { \
-      CINFO(el::base::Writer,el::base::DispatchAction::FileOnlyLog,MONERO_DEFAULT_LOG_CATEGORY) << x; \
+      std::stringstream ss; \
+      ss << x; \
+      CINFO(el::base::Writer,el::base::DispatchAction::FileOnlyLog,MONERO_DEFAULT_LOG_CATEGORY) << ss.str(); \
     } \
     else { \
       std::cout << x << std::endl; \
@@ -63,19 +67,19 @@
 // from https://stackoverflow.com/questions/11665829/how-can-i-print-stack-trace-for-caught-exceptions-in-c-code-injection-in-c
 
 // The decl of __cxa_throw in /usr/include/.../cxxabi.h uses
-// 'std::type_info *', but GCC's built-in protype uses 'void *'.
+// 'std::type_info *', but GCC's built-in prototype uses 'void *'.
 #ifdef __clang__
 #define CXA_THROW_INFO_T std::type_info
 #else // !__clang__
 #define CXA_THROW_INFO_T void
 #endif // !__clang__
 
-#ifdef STATICLIB
+#if defined(STATICLIB) || defined(STACK_TRACE_USE_WRAP)
 #define CXA_THROW __wrap___cxa_throw
 extern "C"
 __attribute__((noreturn))
 void __real___cxa_throw(void *ex, CXA_THROW_INFO_T *info, void (*dest)(void*));
-#else // !STATICLIB
+#else // STATICLIB || STACK_TRACE_USE_WRAP
 #define CXA_THROW __cxa_throw
 extern "C"
 typedef
@@ -83,7 +87,7 @@ typedef
 __attribute__((noreturn))
 #endif // __clang__
 void (cxa_throw_t)(void *ex, CXA_THROW_INFO_T *info, void (*dest)(void*));
-#endif // !STATICLIB
+#endif // STATICLIB || STACK_TRACE_USE_WRAP
 
 extern "C"
 __attribute__((noreturn))
@@ -95,27 +99,17 @@ void CXA_THROW(void *ex, CXA_THROW_INFO_T *info, void (*dest)(void*))
   tools::log_stack_trace((std::string("Exception: ")+((!status && dsym) ? dsym : (const char*)info)).c_str());
   free(dsym);
 
-#ifndef STATICLIB
+#if !defined(STATICLIB) && !defined(STACK_TRACE_USE_WRAP)
 #ifndef __clang__ // for GCC the attr can't be applied in typedef like for clang
   __attribute__((noreturn))
 #endif // !__clang__
    cxa_throw_t *__real___cxa_throw = (cxa_throw_t*)dlsym(RTLD_NEXT, "__cxa_throw");
-#endif // !STATICLIB
+#endif // !STATICLIB && !STACK_TRACE_USE_WRAP
   __real___cxa_throw(ex, info, dest);
-}
-
-namespace
-{
-  std::string stack_trace_log;
 }
 
 namespace tools
 {
-
-void set_stack_trace_log(const std::string &log)
-{
-  stack_trace_log = log;
-}
 
 void log_stack_trace(const char *msg)
 {
@@ -126,7 +120,6 @@ void log_stack_trace(const char *msg)
   unsigned level;
   char sym[512], *dsym;
   int status;
-  const char *log = stack_trace_log.empty() ? NULL : stack_trace_log.c_str();
 #endif
 
   if (msg)

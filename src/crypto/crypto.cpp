@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -34,14 +34,17 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/lock_guard.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include "common/varint.h"
+#include "hex.h"
 #include "warnings.h"
 #include "crypto.h"
 #include "hash.h"
+#include "blake2b.h"
 
 #include "cryptonote_config.h"
 
@@ -74,6 +77,8 @@ namespace crypto {
   const crypto::public_key null_pkey = crypto::public_key{};
   const crypto::secret_key null_skey = crypto::secret_key{};
 
+  static constexpr ec_point infinity = {{1}};
+
   static inline unsigned char *operator &(ec_point &point) {
     return &reinterpret_cast<unsigned char &>(point);
   }
@@ -90,7 +95,7 @@ namespace crypto {
     return &reinterpret_cast<const unsigned char &>(scalar);
   }
 
-  boost::mutex &get_random_lock()
+  static boost::mutex &get_random_lock()
   {
     static boost::mutex random_lock;
     return random_lock;
@@ -106,6 +111,48 @@ namespace crypto {
   {
     boost::lock_guard<boost::mutex> lock(get_random_lock());
     add_extra_entropy_not_thread_safe(ptr, bytes);
+  }
+
+  template<typename T>
+  typename std::enable_if<std::is_integral<T>::value, T>::type rand_range(T range_min, T range_max) {
+    crypto::random_device rd;
+    std::uniform_int_distribution<T> dis(range_min, range_max);
+    return dis(rd);
+  }
+  #define INSTANTIATE_RAND_RANGE(t) template t rand_range<t>(t,t);
+  INSTANTIATE_RAND_RANGE(long)
+  INSTANTIATE_RAND_RANGE(long long)
+  INSTANTIATE_RAND_RANGE(unsigned)
+  INSTANTIATE_RAND_RANGE(unsigned long)
+  INSTANTIATE_RAND_RANGE(unsigned long long)
+  #undef INSTANTIATE_RAND_RANGE
+
+  std::ostream &operator <<(std::ostream &o, const crypto::public_key &v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
+  }
+
+  std::ostream &operator <<(std::ostream &o, const secret_key_explicit_print_ref v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(unwrap(unwrap(v.sk)))); return o;
+  }
+
+  std::ostream &operator <<(std::ostream &o, const crypto::key_derivation &v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
+  }
+
+  std::ostream &operator <<(std::ostream &o, const crypto::key_image &v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
+  }
+
+  std::ostream &operator <<(std::ostream &o, const crypto::signature &v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
+  }
+
+  std::ostream &operator <<(std::ostream &o, const crypto::view_tag &v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
+  }
+
+  std::ostream &operator <<(std::ostream &o, const crypto::ec_point &v) {
+    epee::to_hex::formatted(o, epee::as_byte_span(v)); return o;
   }
 
   static inline bool less32(const unsigned char *k0, const unsigned char *k1)
@@ -177,6 +224,23 @@ namespace crypto {
     return ge_frombytes_vartime(&point, &key) == 0;
   }
 
+  bool get_valid_torsion_cleared_point_vartime(const ec_point &point, ec_point &torsion_cleared_out) {
+    ge_p3 p3;
+    if (ge_frombytes_vartime(&p3, &point) != 0)
+      return false;
+    ge_clear_torsion_vartime(&torsion_cleared_out, &p3);
+    if (torsion_cleared_out == EC_I)
+      return false;
+    return true;
+  }
+
+  public_key pubkey_clear_torsion(const public_key &pubkey) {
+    public_key result;
+    if (!get_valid_torsion_cleared_point_vartime(pubkey, result))
+      static_cast<ec_point &>(result) = EC_I;
+    return result;
+  }
+
   bool crypto_ops::secret_key_to_public_key(const secret_key &sec, public_key &pub) {
     ge_p3 point;
     if (sc_check(&unwrap(sec)) != 0) {
@@ -231,6 +295,7 @@ namespace crypto {
     ge_add(&point4, &point1, &point3);
     ge_p1p1_to_p2(&point5, &point4);
     ge_tobytes(&derived_key, &point5);
+    memwipe(&scalar, sizeof(scalar));
     return true;
   }
 
@@ -240,6 +305,7 @@ namespace crypto {
     assert(sc_check(&base) == 0);
     derivation_to_scalar(derivation, output_index, scalar);
     sc_add(&unwrap(derived_key), &unwrap(base), &scalar);
+    memwipe(&scalar, sizeof(scalar));
   }
 
   bool crypto_ops::derive_subaddress_public_key(const public_key &out_key, const key_derivation &derivation, std::size_t output_index, public_key &derived_key) {
@@ -258,6 +324,7 @@ namespace crypto {
     ge_sub(&point4, &point1, &point3);
     ge_p1p1_to_p2(&point5, &point4);
     ge_tobytes(&derived_key, &point5);
+    memwipe(&scalar, sizeof(scalar));
     return true;
   }
 
@@ -332,7 +399,6 @@ namespace crypto {
     }
     ge_double_scalarmult_base_vartime(&tmp2, &sig.c, &tmp3, &sig.r);
     ge_tobytes(&buf.comm, &tmp2);
-    static const ec_point infinity = {{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
     if (memcmp(&buf.comm, &infinity, 32) == 0)
       return false;
     hash_to_scalar(&buf, sizeof(s_comm), c);
@@ -608,7 +674,7 @@ namespace crypto {
     return sc_isnonzero(&c2) == 0;
   }
 
-  static void hash_to_ec(const public_key &key, ge_p3 &res) {
+  static void biased_hash_to_ec(const public_key &key, ge_p3 &res) {
     hash h;
     ge_p2 point;
     ge_p1p1 point2;
@@ -618,11 +684,58 @@ namespace crypto {
     ge_p1p1_to_p3(&res, &point2);
   }
 
+  void crypto_ops::unbiased_hash_to_ec(const unsigned char *preimage, const std::size_t length, ec_point &res) {
+    unsigned char hash[64];
+    if (blake2b_monero(std::addressof(hash), 64, preimage, length, NULL, 0) != 0)
+      throw std::runtime_error("Failed blake2b");
+
+    ge_p2 first;
+    ge_fromfe_frombytes_vartime(&first, hash);
+    ge_p1p1 first_p1p1;
+    ge_mul8(&first_p1p1, &first);
+    ge_p3 first_p3;
+    ge_p1p1_to_p3(&first_p3, &first_p1p1);
+
+    ge_p2 second;
+    ge_fromfe_frombytes_vartime(&second, hash + 32);
+    ge_p1p1 second_p1p1;
+    ge_mul8(&second_p1p1, &second);
+    ge_p3 second_p3;
+    ge_p1p1_to_p3(&second_p3, &second_p1p1);
+    ge_cached second_cached;
+    ge_p3_to_cached(&second_cached, &second_p3);
+
+    ge_p1p1 point;
+    ge_add(&point, &first_p3, &second_cached);
+
+    ge_p3 res_ge_p3;
+    ge_p1p1_to_p3(&res_ge_p3, &point);
+    ge_p3_tobytes(&res, &res_ge_p3);
+  }
+
+  static void biased_derive_key_image_generator(const public_key &pub, ec_point &ki_gen) {
+    ge_p3 point;
+    biased_hash_to_ec(pub, point);
+    ge_p3_tobytes(&ki_gen, &point);
+  }
+
+  static void unbiased_derive_key_image_generator(const public_key &pub, ec_point &ki_gen) {
+    unbiased_hash_to_ec(&pub, sizeof(public_key), ki_gen);
+  }
+
+  void crypto_ops::derive_key_image_generator(const public_key &pub, const bool biased, ec_point &ki_gen) {
+    if (biased)
+      biased_derive_key_image_generator(pub, ki_gen);
+    else
+      unbiased_derive_key_image_generator(pub, ki_gen);
+  }
+
+  // key image derivation used before FCMP++/Carrot
   void crypto_ops::generate_key_image(const public_key &pub, const secret_key &sec, key_image &image) {
     ge_p3 point;
     ge_p2 point2;
     assert(sc_check(&sec) == 0);
-    hash_to_ec(pub, point);
+    biased_hash_to_ec(pub, point);
     ge_scalarmult(&point2, &unwrap(sec), &point);
     ge_tobytes(&image, &point2);
   }
@@ -683,7 +796,7 @@ POP_WARNINGS
         random_scalar(k);
         ge_scalarmult_base(&tmp3, &k);
         ge_p3_tobytes(&buf->ab[i].a, &tmp3);
-        hash_to_ec(*pubs[i], tmp3);
+        biased_hash_to_ec(*pubs[i], tmp3);
         ge_scalarmult(&tmp2, &k, &tmp3);
         ge_tobytes(&buf->ab[i].b, &tmp2);
       } else {
@@ -695,7 +808,7 @@ POP_WARNINGS
         }
         ge_double_scalarmult_base_vartime(&tmp2, &sig[i].c, &tmp3, &sig[i].r);
         ge_tobytes(&buf->ab[i].a, &tmp2);
-        hash_to_ec(*pubs[i], tmp3);
+        biased_hash_to_ec(*pubs[i], tmp3);
         ge_double_scalarmult_precomp_vartime(&tmp2, &sig[i].r, &tmp3, &sig[i].c, image_pre);
         ge_tobytes(&buf->ab[i].b, &tmp2);
         sc_add(&sum, &sum, &sig[i].c);
@@ -723,10 +836,15 @@ POP_WARNINGS
       assert(check_key(*pubs[i]));
     }
 #endif
+    if (0 == memcmp(image.data, infinity.data, sizeof(image)))
+      return false; // false if key image is identity
     if (ge_frombytes_vartime(&image_unp, &image) != 0) {
       return false;
     }
     ge_dsm_precomp(image_pre, &image_unp);
+    ge_scalarmult_p3(&image_unp, sc_l, &image_unp);
+    if (!ge_p3_is_point_at_infinity_vartime(&image_unp))
+      return false; // false if key image is torsioned
     sc_0(&sum);
     buf->h = prefix_hash;
     for (i = 0; i < pubs_count; i++) {
@@ -740,7 +858,7 @@ POP_WARNINGS
       }
       ge_double_scalarmult_base_vartime(&tmp2, &sig[i].c, &tmp3, &sig[i].r);
       ge_tobytes(&buf->ab[i].a, &tmp2);
-      hash_to_ec(*pubs[i], tmp3);
+      biased_hash_to_ec(*pubs[i], tmp3);
       ge_double_scalarmult_precomp_vartime(&tmp2, &sig[i].r, &tmp3, &sig[i].c, image_pre);
       ge_tobytes(&buf->ab[i].b, &tmp2);
       sc_add(&sum, &sum, &sig[i].c);
@@ -748,5 +866,29 @@ POP_WARNINGS
     hash_to_scalar(buf.get(), rs_comm_size(pubs_count), h);
     sc_sub(&h, &h, &sum);
     return sc_isnonzero(&h) == 0;
+  }
+
+  void crypto_ops::derive_view_tag(const key_derivation &derivation, size_t output_index, view_tag &view_tag) {
+    #pragma pack(push, 1)
+    struct {
+      char salt[8]; // view tag domain-separator
+      key_derivation derivation;
+      char output_index[(sizeof(size_t) * 8 + 6) / 7];
+    } buf;
+    #pragma pack(pop)
+
+    char *end = buf.output_index;
+    memcpy(buf.salt, "view_tag", 8); // leave off null terminator
+    buf.derivation = derivation;
+    tools::write_varint(end, output_index);
+    assert(end <= buf.output_index + sizeof buf.output_index);
+
+    // view_tag_full = H[salt|derivation|output_index]
+    hash view_tag_full;
+    cn_fast_hash(&buf, end - reinterpret_cast<char *>(&buf), view_tag_full);
+
+    // only need a slice of view_tag_full to realize optimal perf/space efficiency
+    static_assert(sizeof(crypto::view_tag) <= sizeof(view_tag_full), "view tag should not be larger than hash result");
+    memcpy(&view_tag, &view_tag_full, sizeof(crypto::view_tag));
   }
 }

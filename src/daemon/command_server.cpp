@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -125,6 +125,12 @@ t_command_server::t_command_server(
     , "Stop mining."
     );
   m_command_lookup.set_handler(
+      "generate_blocks"
+    , std::bind(&t_command_parser_executor::generate_blocks, &m_parser, p::_1)
+    , "generate_blocks <addr> <numblocks> [<starting_nonce>]"
+    , "Generate blocks for the specified address in regtest mode."
+    );
+  m_command_lookup.set_handler(
       "mining_status"
     , std::bind(&t_command_parser_executor::mining_status, &m_parser, p::_1)
     , "Show current mining status."
@@ -240,8 +246,8 @@ t_command_server::t_command_server(
     m_command_lookup.set_handler(
       "unban"
     , std::bind(&t_command_parser_executor::unban, &m_parser, p::_1)
-    , "unban <address>"
-    , "Unban a given <IP>."
+    , "unban <address>|all"
+    , "Unban a given <address>, or all banned addresses."
     );
     m_command_lookup.set_handler(
       "banned"
@@ -299,13 +305,8 @@ t_command_server::t_command_server(
     m_command_lookup.set_handler(
       "pop_blocks"
     , std::bind(&t_command_parser_executor::pop_blocks, &m_parser, p::_1)
-    , "pop_blocks <nblocks>"
-    , "Remove blocks from end of blockchain"
-    );
-    m_command_lookup.set_handler(
-      "rpc_payments"
-    , std::bind(&t_command_parser_executor::rpc_payments, &m_parser, p::_1)
-    , "Print information about RPC payments."
+    , "pop_blocks <nblocks> [keep-txs|no-keep-txs]"
+    , "Remove blocks from end of blockchain, optionally moving popped txs into the mempool (not default)"
     );
     m_command_lookup.set_handler(
       "version"
@@ -322,13 +323,6 @@ t_command_server::t_command_server(
       "check_blockchain_pruning"
     , std::bind(&t_command_parser_executor::check_blockchain_pruning, &m_parser, p::_1)
     , "Check the blockchain pruning."
-    );
-    m_command_lookup.set_handler(
-      "set_bootstrap_daemon"
-    , std::bind(&t_command_parser_executor::set_bootstrap_daemon, &m_parser, p::_1)
-    , "set_bootstrap_daemon (auto | none | host[:port] [username] [password]) [proxy_ip:proxy_port]"
-    , "URL of a 'bootstrap' remote daemon that the connected wallets can use while this daemon is still not fully synced.\n"
-      "Use 'auto' to enable automatic public nodes discovering and bootstrap daemon switching"
     );
     m_command_lookup.set_handler(
       "flush_cache"

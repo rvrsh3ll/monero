@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020, The Monero Project
+// Copyright (c) 2016-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -51,7 +51,7 @@ class ZmqServer final
 {
   public:
 
-    ZmqServer(RpcHandler& h);
+    ZmqServer(RpcHandler& h, bool restricted);
 
     ~ZmqServer();
 
@@ -68,6 +68,7 @@ class ZmqServer final
 
   private:
     RpcHandler& handler;
+    const bool restricted;
 
     net::zmq::context context;
 

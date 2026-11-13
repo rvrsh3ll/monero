@@ -40,7 +40,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/algorithm/string.hpp>
 #include "string_tools.h"
-#include "misc_os_dependent.h"
+#include "time_helper.h"
 #include "misc_log_ex.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -176,11 +176,12 @@ void mlog_configure(const std::string &filename_base, bool console, const std::s
       std::vector<boost::filesystem::path> found_files;
       const boost::filesystem::directory_iterator end_itr;
       const boost::filesystem::path filename_base_path(filename_base);
+      const std::string filename_base_name = filename_base_path.filename().string();
       const boost::filesystem::path parent_path = filename_base_path.has_parent_path() ? filename_base_path.parent_path() : ".";
       for (boost::filesystem::directory_iterator iter(parent_path); iter != end_itr; ++iter)
       {
-        const std::string filename = iter->path().string();
-        if (filename.size() >= filename_base.size() && std::memcmp(filename.data(), filename_base.data(), filename_base.size()) == 0)
+        const std::string filename = iter->path().filename().string();
+        if (filename.size() >= filename_base_name.size() && std::memcmp(filename.data(), filename_base_name.data(), filename_base_name.size()) == 0)
         {
           found_files.push_back(iter->path());
         }
@@ -233,6 +234,28 @@ void mlog_configure(const std::string &filename_base, bool console, const std::s
 #ifdef WIN32
   EnableVTMode();
 #endif
+}
+
+bool mlog_reopen()
+{
+  el::base::threading::ScopedLock lock(el::Helpers::storage()->lock());
+  el::Logger *logger = el::Loggers::getLogger("default", false);
+  if (!logger)
+    return false;
+
+  el::base::TypedConfigurations *config = logger->typedConfigurations();
+  el::base::type::fstream_t *stream = config->fileStream(el::Level::Info);
+  if (!stream || !config->toFile(el::Level::Info))
+    return false;
+
+  el::base::type::fstream_t replacement(config->filename(el::Level::Info).c_str(),
+      el::base::type::fstream_t::out | el::base::type::fstream_t::app);
+  if (!replacement.is_open())
+    return false;
+
+  stream->flush();
+  stream->swap(replacement);
+  return true;
 }
 
 void mlog_set_categories(const char *categories)
@@ -338,9 +361,19 @@ bool is_stdout_a_tty()
   return is_a_tty.load(std::memory_order_relaxed);
 }
 
+static bool is_nocolor()
+{
+  static const char *no_color_var = getenv("NO_COLOR");
+  static const bool no_color = no_color_var && *no_color_var; // apparently, NO_COLOR=0 means no color too (as per no-color.org)
+  return no_color;
+}
+
 void set_console_color(int color, bool bright)
 {
   if (!is_stdout_a_tty())
+    return;
+
+  if (is_nocolor())
     return;
 
   switch(color)
@@ -459,6 +492,9 @@ void set_console_color(int color, bool bright)
 
 void reset_console_color() {
   if (!is_stdout_a_tty())
+    return;
+
+  if (is_nocolor())
     return;
 
 #ifdef WIN32

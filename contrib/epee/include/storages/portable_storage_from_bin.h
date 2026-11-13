@@ -28,10 +28,12 @@
 
 #pragma once 
 
-#include "misc_language.h"
 #include "misc_log_ex.h"
 #include "portable_storage_base.h"
 #include "portable_storage_bin_utils.h"
+
+#undef MONERO_DEFAULT_LOG_CATEGORY
+#define MONERO_DEFAULT_LOG_CATEGORY "serialization"
 
 #ifdef EPEE_PORTABLE_STORAGE_RECURSION_LIMIT
 #define EPEE_PORTABLE_STORAGE_RECURSION_LIMIT_INTERNAL EPEE_PORTABLE_STORAGE_RECURSION_LIMIT
@@ -80,8 +82,6 @@ namespace epee
       void read(section& sec);
       void read(std::string& str);
       void read(array_entry &ae);
-      template<class t_type>
-      size_t min_bytes() const;
       void set_limits(size_t objects, size_t fields, size_t strings);
     private:
       struct recursuion_limitation_guard
@@ -157,6 +157,18 @@ namespace epee
       pod_val = CONVERT_POD(pod_val);
     }
     
+    template<>
+    void throwable_buffer_reader::read<bool>(bool& pod_val)
+    {
+      RECURSION_LIMITATION();
+      static_assert(std::is_pod<bool>::value, "POD type expected");
+      static_assert(sizeof(bool) == sizeof(uint8_t), "We really shouldn't use bool directly in serialization code. Replace it with uint8_t if this assert triggers!");
+      uint8_t t;
+      read(&t, sizeof(t));
+      CHECK_AND_ASSERT_THROW_MES(t <= 1, "Invalid bool value " << t);
+      pod_val = (t != 0);
+    }
+    
     template<class t_type>
     t_type throwable_buffer_reader::read()
     {
@@ -170,6 +182,7 @@ namespace epee
     template<class type_name>
     storage_entry throwable_buffer_reader::read_ae()
     {
+      static_assert(!std::is_same_v<type_name, array_entry>);
       RECURSION_LIMITATION();
       //for pod types
       array_entry_t<type_name> sa;
@@ -208,14 +221,14 @@ namespace epee
       case SERIALIZE_TYPE_UINT32: return read_ae<uint32_t>();
       case SERIALIZE_TYPE_UINT16: return read_ae<uint16_t>();
       case SERIALIZE_TYPE_UINT8:  return read_ae<uint8_t>();
-      case SERIALIZE_TYPE_DUOBLE: return read_ae<double>();
+      case SERIALIZE_TYPE_DOUBLE: return read_ae<double>();
       case SERIALIZE_TYPE_BOOL:   return read_ae<bool>();
       case SERIALIZE_TYPE_STRING: return read_ae<std::string>();
       case SERIALIZE_TYPE_OBJECT: return read_ae<section>();
-      case SERIALIZE_TYPE_ARRAY:  return read_ae<array_entry>();
       default: 
-        CHECK_AND_ASSERT_THROW_MES(false, "unknown entry_type code = " << type);
+        CHECK_AND_ASSERT_THROW_MES(false, "unknown entry_type code = " << static_cast<int>(type));
       }
+      return read_ae<int8_t>(); // unreachable, dummy return to avoid compiler warning
     }
 
     inline 
@@ -276,7 +289,7 @@ namespace epee
       RECURSION_LIMITATION();
       uint8_t ent_type = 0;
       read(ent_type);
-      CHECK_AND_ASSERT_THROW_MES(ent_type&SERIALIZE_FLAG_ARRAY, "wrong type sequenses");
+      CHECK_AND_ASSERT_THROW_MES(ent_type&SERIALIZE_FLAG_ARRAY, "wrong type sequences");
       return load_storage_array_entry(ent_type);
     }
 
@@ -299,14 +312,15 @@ namespace epee
       case SERIALIZE_TYPE_UINT32: return read_se<uint32_t>();
       case SERIALIZE_TYPE_UINT16: return read_se<uint16_t>();
       case SERIALIZE_TYPE_UINT8:  return read_se<uint8_t>();
-      case SERIALIZE_TYPE_DUOBLE: return read_se<double>();
+      case SERIALIZE_TYPE_DOUBLE: return read_se<double>();
       case SERIALIZE_TYPE_BOOL:   return read_se<bool>();
       case SERIALIZE_TYPE_STRING: return read_se<std::string>();
       case SERIALIZE_TYPE_OBJECT: return read_se<section>();
       case SERIALIZE_TYPE_ARRAY:  return read_se<array_entry>();
       default: 
-        CHECK_AND_ASSERT_THROW_MES(false, "unknown entry_type code = " << ent_type);
+        CHECK_AND_ASSERT_THROW_MES(false, "unknown entry_type code = " << static_cast<int>(ent_type));
       }
+      return read_se<int8_t>(); // unreachable, dummy return to avoid compiler warning
     }
     inline 
     void throwable_buffer_reader::read(section& sec)

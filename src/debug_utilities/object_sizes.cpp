@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -70,9 +70,9 @@ int main(int argc, char* argv[])
   mlog_configure("", true);
 
   SL(boost::thread);
-  SL(boost::asio::io_service);
-  SL(boost::asio::io_service::work);
-  SL(boost::asio::deadline_timer);
+  SL(boost::asio::io_context);
+  SL(boost::asio::executor_work_guard<boost::asio::io_context::executor_type>);
+  SL(boost::asio::steady_timer);
 
   SL(cryptonote::DB_ERROR);
   SL(cryptonote::mdb_txn_safe);
@@ -94,8 +94,6 @@ int main(int argc, char* argv[])
   SL(nodetool::anchor_peerlist_entry);
   SL(nodetool::node_server<cryptonote::t_cryptonote_protocol_handler<cryptonote::core>>);
   SL(nodetool::p2p_connection_context_t<cryptonote::t_cryptonote_protocol_handler<cryptonote::core>::connection_context>);
-  SL(nodetool::network_address_old);
-  SL(nodetool::peerlist_entry_base<nodetool::network_address_old>);
 
   SL(nodetool::network_config);
   SL(nodetool::basic_node_data);

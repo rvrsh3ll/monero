@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2021, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -100,7 +100,7 @@ int main(int argc, const char ** argv)
     const std::chrono::steady_clock::time_point tbegin = std::chrono::steady_clock::now();
     for(auto & e : futures) 
     {
-       e.get();
+       (void)e.get();
     }
     // Stop measuring the time.
     const std::chrono::steady_clock::time_point tend = std::chrono::steady_clock::now();

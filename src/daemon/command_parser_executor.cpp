@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -382,9 +382,21 @@ bool t_command_parser_executor::start_mining(const std::vector<std::string>& arg
     {
       if(!cryptonote::get_account_address_from_str(info, cryptonote::STAGENET, args.front()))
       {
-        bool dnssec_valid;
-        std::string address_str = tools::dns_utils::get_account_address_as_str_from_url(args.front(), dnssec_valid,
-            [](const std::string &url, const std::vector<std::string> &addresses, bool dnssec_valid){return addresses[0];});
+        tools::dns_utils::dnssec_status dnssec;
+        std::string address_str = tools::dns_utils::get_account_address_as_str_from_url(args.front(), dnssec,
+            [](const std::string &url, const std::vector<std::string> &addresses, tools::dns_utils::dnssec_status dnssec) -> std::string {
+              if (dnssec != tools::dns_utils::dnssec_status::valid) return {};
+              if (addresses.empty()) return {};
+              return addresses[0];
+            });
+        if(dnssec != tools::dns_utils::dnssec_status::valid)
+        {
+          const char *dnssec_msg = dnssec == tools::dns_utils::dnssec_status::invalid
+              ? "Invalid DNSSEC"
+              : "DNSSEC not available";
+          std::cout << "Invalid syntax: " << dnssec_msg << " for " << args.front() << std::endl;
+          return true;
+        }
         if(!cryptonote::get_account_address_from_str(info, cryptonote::MAINNET, address_str))
         {
           if(!cryptonote::get_account_address_from_str(info, cryptonote::TESTNET, address_str))
@@ -483,6 +495,31 @@ bool t_command_parser_executor::stop_mining(const std::vector<std::string>& args
   }
 
   return m_executor.stop_mining();
+}
+
+bool t_command_parser_executor::generate_blocks(const std::vector<std::string>& args)
+{
+  if (args.size() < 2 || args.size() > 3)
+  {
+    std::cout << "Invalid syntax: Expected an address, number of blocks, and optional starting nonce. For more details, use the help command." << std::endl;
+    return true;
+  }
+
+  uint64_t amount = 0;
+  if (!epee::string_tools::get_xtype_from_string(amount, args[1]) || amount == 0)
+  {
+    std::cout << "Invalid syntax: Wrong number of blocks. For more details, use the help command." << std::endl;
+    return true;
+  }
+
+  uint32_t starting_nonce = 0;
+  if (args.size() == 3 && !epee::string_tools::get_xtype_from_string(starting_nonce, args[2]))
+  {
+    std::cout << "Invalid syntax: Wrong starting nonce. For more details, use the help command." << std::endl;
+    return true;
+  }
+
+  return m_executor.generate_blocks(args[0], amount, starting_nonce);
 }
 
 bool t_command_parser_executor::mining_status(const std::vector<std::string>& args)
@@ -696,6 +733,16 @@ bool t_command_parser_executor::ban(const std::vector<std::string>& args)
       std::ifstream ifs(ban_list_path.string());
       for (std::string line; std::getline(ifs, line); )
       {
+        // ignore comments after '#' character
+        const size_t pound_idx = line.find('#');
+        if (pound_idx != std::string::npos)
+          line.resize(pound_idx);
+
+        // trim whitespace and ignore empty lines
+        boost::trim(line);
+        if (line.empty())
+          continue;
+
         auto subnet = net::get_ipv4_subnet_address(line);
         if (subnet)
         {
@@ -921,9 +968,14 @@ bool t_command_parser_executor::sync_info(const std::vector<std::string>& args)
 
 bool t_command_parser_executor::pop_blocks(const std::vector<std::string>& args)
 {
-  if (args.size() != 1)
+  if (args.size() < 1)
   {
-    std::cout << "Invalid syntax: One parameter expected. For more details, use the help command." << std::endl;
+    std::cout << "Invalid syntax: At least one parameter expected. For more details, use the help command." << std::endl;
+    return true;
+  }
+  else if (args.size() > 2)
+  {
+    std::cout << "Invalid syntax: A maximum of two parameters expected. For more details, use the help command." << std::endl;
     return true;
   }
 
@@ -935,23 +987,28 @@ bool t_command_parser_executor::pop_blocks(const std::vector<std::string>& args)
       std::cout << "Invalid syntax: Number of blocks must be greater than 0. For more details, use the help command." << std::endl;
       return true;
     }
-    return m_executor.pop_blocks(nblocks);
+    bool keep_txs = false;
+    if (args.size() > 1)
+    {
+      const std::string keep_arg = args.at(1);
+      if (keep_arg == "keep-txs")
+        keep_txs = true;
+      else if (keep_arg == "no-keep-txs")
+        keep_txs = false;
+      else
+      {
+        std::cout << "Invalid syntax: Unrecognized argument: '" << keep_arg
+          << "'. For more details, use the help command." << std::endl;
+        return true;
+      }
+    }
+    return m_executor.pop_blocks(nblocks, keep_txs);
   }
   catch (const boost::bad_lexical_cast&)
   {
     std::cout << "Invalid syntax: Number of blocks must be a number greater than 0. For more details, use the help command." << std::endl;
   }
   return true;
-}
-
-bool t_command_parser_executor::rpc_payments(const std::vector<std::string>& args)
-{
-  if (args.size() != 0) {
-    std::cout << "Invalid syntax: No parameters expected. For more details, use the help command." << std::endl;
-    return true;
-  }
-
-  return m_executor.rpc_payments();
 }
 
 bool t_command_parser_executor::version(const std::vector<std::string>& args)
@@ -986,74 +1043,9 @@ bool t_command_parser_executor::check_blockchain_pruning(const std::vector<std::
   return m_executor.check_blockchain_pruning();
 }
 
-bool t_command_parser_executor::set_bootstrap_daemon(const std::vector<std::string>& args)
-{
-  struct parsed_t
-  {
-    std::string address;
-    std::string user;
-    std::string password;
-    std::string proxy;
-  };
-
-  boost::optional<parsed_t> parsed = [&args]() -> boost::optional<parsed_t> {
-    const size_t args_count = args.size();
-    if (args_count == 0)
-    {
-      return {};
-    }
-    if (args[0] == "auto")
-    {
-      if (args_count == 1)
-      {
-        return {{args[0], "", "", ""}};
-      }
-      if (args_count == 2)
-      {
-        return {{args[0], "", "", args[1]}};
-      }
-    }
-    else if (args[0] == "none")
-    {
-      if (args_count == 1)
-      {
-        return {{"", "", "", ""}};
-      }
-    }
-    else
-    {
-      if (args_count == 1)
-      {
-        return {{args[0], "", "", ""}};
-      }
-      if (args_count == 2)
-      {
-        return {{args[0], "", "", args[1]}};
-      }
-      if (args_count == 3)
-      {
-        return {{args[0], args[1], args[2], ""}};
-      }
-      if (args_count == 4)
-      {
-        return {{args[0], args[1], args[2], args[3]}};
-      }
-    }
-    return {};
-  }();
-
-  if (!parsed)
-  {
-    std::cout << "Invalid syntax: Wrong number of parameters. For more details, use the help command." << std::endl;
-    return true;
-  }
-
-  return m_executor.set_bootstrap_daemon(parsed->address, parsed->user, parsed->password, parsed->proxy);
-}
-
 bool t_command_parser_executor::flush_cache(const std::vector<std::string>& args)
 {
-  bool bad_txs = false, bad_blocks = false;
+  bool bad_blocks = false;
   std::string arg;
 
   if (args.empty())
@@ -1062,18 +1054,16 @@ bool t_command_parser_executor::flush_cache(const std::vector<std::string>& args
   for (size_t i = 0; i < args.size(); ++i)
   {
     arg = args[i];
-    if (arg == "bad-txs")
-      bad_txs = true;
-    else if (arg == "bad-blocks")
+    if (arg == "bad-blocks")
       bad_blocks = true;
     else
       goto show_list;
   }
-  return m_executor.flush_cache(bad_txs, bad_blocks);
+  return m_executor.flush_cache(bad_blocks);
 
 show_list:
   std::cout << "Invalid cache type: " << arg << std::endl;
-  std::cout << "Cache types: bad-txs bad-blocks" << std::endl;
+  std::cout << "Cache types: bad-blocks" << std::endl;
   return true;
 }
 

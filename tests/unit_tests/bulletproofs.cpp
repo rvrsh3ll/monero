@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -77,6 +77,20 @@ TEST(bulletproofs, valid_multi_random)
   }
 }
 
+TEST(bulletproofs, invalid_too_many_outputs)
+{
+  std::vector<uint64_t> amounts(16, 0);
+  rct::keyV gamma(16);
+  for (rct::key &mask: gamma)
+    mask = rct::skGen();
+  rct::Bulletproof proof = bulletproof_PROVE(amounts, gamma);
+  ASSERT_TRUE(rct::bulletproof_VERIFY(proof));
+  proof.V.push_back(proof.V.back());
+  proof.L.push_back(proof.L.back());
+  proof.R.push_back(proof.R.back());
+  ASSERT_FALSE(rct::bulletproof_VERIFY(proof));
+}
+
 TEST(bulletproofs, multi_splitting)
 {
   rct::ctkeyV sc, pc;
@@ -131,13 +145,14 @@ TEST(bulletproofs, multi_splitting)
     }
 
     rct::ctkeyV outSk;
-    rct::RCTConfig rct_config { rct::RangeProofPaddedBulletproof, 0 };
-    rct::rctSig s = rct::genRctSimple(rct::zero(), sc, destinations, inamounts, outamounts, available, mixRing, amount_keys, NULL, NULL, index, outSk, rct_config, hw::get_device("default"));
+    rct::RCTConfig rct_config { rct::RangeProofPaddedBulletproof, 4 };
+
+    rct::rctSig s = rct::genRctSimple(rct::zero(), sc, destinations, inamounts, outamounts, available, mixRing, amount_keys, index, outSk, rct_config, hw::get_device("default"));
     ASSERT_TRUE(rct::verRctSimple(s));
     for (size_t i = 0; i < n_outputs; ++i)
     {
       rct::key mask;
-      rct::decodeRctSimple(s, amount_keys[i], i, mask, hw::get_device("default"));
+      rct::decodeRct(s, amount_keys[i], i, mask, hw::get_device("default"));
       ASSERT_TRUE(mask == outSk[i].mask);
     }
   }

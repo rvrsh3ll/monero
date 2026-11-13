@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2019-2020 The Monero Project
+# Copyright (c) 2019-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -28,7 +28,6 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from __future__ import print_function
 import time
 
 """Test peer baning RPC calls
@@ -110,6 +109,16 @@ class BanTest():
         assert res.bans[0].seconds >= 198 and res.bans[0].seconds <= 200 # allow for slow RPC
 
         daemon.set_bans([{'host': '5.6.7.8', 'ban': False}])
+        res = daemon.get_bans()
+        assert 'bans' not in res or len(res.bans) == 0
+
+        daemon.set_bans([
+            {'host': '1.2.3.4', 'ban': True, 'seconds': 100},
+            {'host': '5.6.7.0/24', 'ban': True, 'seconds': 100},
+        ])
+        res = daemon.get_bans()
+        assert len(res.bans) == 2
+        daemon.set_bans([{'host': 'all', 'ban': False}])
         res = daemon.get_bans()
         assert 'bans' not in res or len(res.bans) == 0
 

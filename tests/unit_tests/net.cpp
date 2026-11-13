@@ -1,4 +1,4 @@
-// Copyright (c) 2018, The Monero Project
+// Copyright (c) 2018-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -31,7 +31,7 @@
 #include <boost/archive/portable_binary_oarchive.hpp>
 #include <boost/archive/portable_binary_iarchive.hpp>
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -51,12 +51,20 @@
 #include <gtest/gtest.h>
 #include <map>
 #include <memory>
+#include <thread>
 #include <type_traits>
+#ifndef _WIN32
+#include <atomic>
+#include <csignal>
+#include <pthread.h>
+#endif
 
 #include "crypto/crypto.h"
 #include "net/dandelionpp.h"
 #include "net/error.h"
+#include "net/host.h"
 #include "net/i2p_address.h"
+#include "net/net_helper.h"
 #include "net/net_utils_base.h"
 #include "net/socks.h"
 #include "net/socks_connect.h"
@@ -66,6 +74,14 @@
 #include "p2p/net_peerlist_boost_serialization.h"
 #include "serialization/keyvalue_serialization.h"
 #include "storages/portable_storage.h"
+#include "unit_tests_utils.h"
+
+TEST(host, canonicalize_host)
+{
+    std::string host{"ABCdef123.ONION"};
+    net::canonicalize_host(host);
+    EXPECT_EQ("abcdef123.onion", host);
+}
 
 namespace
 {
@@ -73,7 +89,683 @@ namespace
         "xmrto2bturnore26.onion";
     static constexpr const char v3_onion[] =
         "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+    static constexpr const char v3_onion_upper[] =
+        "VWW6YBAL4BD7SZMGNCYRUUCPGFKQAHZDDI37KTCEO3AH7NGMCOPNPYYD.ONION";
+    static constexpr const char v3_onion_2[] =
+        "zpv4fa3szgel7vf6jdjeugizdclq2vzkelscs2bhbgnlldzzggcen3ad.onion";
+
+    static constexpr const char v3_onion_bad_checksum[] =
+        "wrongchecksum777777777777777777777777777777777777777777d.onion";
+    static constexpr const char v3_onion_bad_pubkey[] =
+        "civ5tgldg3yx73ytse6hvvk3nm6q3zctbqvytpszihm35b33ze73kxad.onion";
+    static constexpr const char v3_onion_bad_version[] =
+        "zpv4fa3szgel7vf6jdjeugizdclq2vzkelscs2bhbgnlldzzggcen3ac.onion";
 }
+
+TEST(blocked_mode_client, shutdown_aborts_blocked_recv)
+{
+    boost::asio::io_context server_io;
+    boost::asio::ip::tcp::acceptor acceptor{
+        server_io,
+        {boost::asio::ip::address_v4::loopback(), 0}
+    };
+
+    epee::net_utils::blocked_mode_client client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    const std::string port = std::to_string(acceptor.local_endpoint().port());
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+
+    boost::system::error_code error;
+    boost::asio::ip::tcp::socket peer{server_io};
+    acceptor.accept(peer, error);
+    ASSERT_FALSE(error);
+
+    // recv blocks on the silent peer until a single shutdown from another thread
+    // aborts it; the abort is sticky, so the shot is valid on every timing
+    std::thread stopper{[&client] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        EXPECT_TRUE(client.shutdown());
+    }};
+    std::string response;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.recv(response, std::chrono::seconds{30}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
+    stopper.join();
+    EXPECT_FALSE(client.is_connected());
+}
+
+#ifndef _WIN32
+namespace
+{
+    std::atomic<epee::net_utils::blocked_mode_client*> g_signal_client{nullptr};
+
+    void shutdown_from_signal(int)
+    {
+        epee::net_utils::blocked_mode_client* const client = g_signal_client.load();
+        if (client)
+            client->shutdown();
+    }
+}
+
+TEST(blocked_mode_client, shutdown_aborts_blocked_recv_from_signal_handler)
+{
+    boost::asio::io_context server_io;
+    boost::asio::ip::tcp::acceptor acceptor{
+        server_io,
+        {boost::asio::ip::address_v4::loopback(), 0}
+    };
+
+    epee::net_utils::blocked_mode_client client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    const std::string port = std::to_string(acceptor.local_endpoint().port());
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+
+    boost::system::error_code error;
+    boost::asio::ip::tcp::socket peer{server_io};
+    acceptor.accept(peer, error);
+    ASSERT_FALSE(error);
+
+    struct sigaction handler {}, previous {};
+    handler.sa_handler = shutdown_from_signal;
+    sigemptyset(&handler.sa_mask);
+    ASSERT_EQ(0, sigaction(SIGUSR1, &handler, &previous));
+    g_signal_client = &client;
+
+    // the signal lands on the thread blocked in recv, so the handler's shutdown()
+    // runs in signal context and may only use async-signal-safe calls
+    const pthread_t blocked = pthread_self();
+    std::thread stopper{[blocked] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        pthread_kill(blocked, SIGUSR1);
+    }};
+    std::string response;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.recv(response, std::chrono::seconds{30}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
+    stopper.join();
+    EXPECT_FALSE(client.is_connected());
+
+    g_signal_client = nullptr;
+    sigaction(SIGUSR1, &previous, nullptr);
+}
+#endif
+
+TEST(blocked_mode_client, shutdown_aborts_blocked_connect)
+{
+    // a connector whose future never becomes ready simulates an unresponsive peer
+    const auto never_ready = std::make_shared<boost::promise<boost::asio::ip::tcp::socket>>();
+    epee::net_utils::blocked_mode_client client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    client.set_connector([never_ready] (const std::string&, const std::string&, boost::asio::steady_timer&) {
+        return never_ready->get_future();
+    });
+
+    // a single shutdown aborts the blocked connect; sticky, so valid on every timing
+    std::thread stopper{[&client] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        EXPECT_TRUE(client.shutdown());
+    }};
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect("127.0.0.1", "80", std::chrono::seconds{30}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
+    stopper.join();
+}
+
+TEST(blocked_mode_client, shutdown_aborts_stalled_ssl_handshake)
+{
+    // the acceptor completes TCP connects in the kernel backlog but never
+    // answers the TLS handshake, so the handshake stalls until aborted
+    boost::asio::io_context server_io;
+    boost::asio::ip::tcp::acceptor acceptor{
+        server_io,
+        {boost::asio::ip::address_v4::loopback(), 0}
+    };
+
+    epee::net_utils::blocked_mode_client client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_enabled
+    });
+    const std::string port = std::to_string(acceptor.local_endpoint().port());
+
+    std::thread stopper{[&client] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        EXPECT_TRUE(client.shutdown());
+    }};
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect("127.0.0.1", port, std::chrono::seconds{30}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
+    stopper.join();
+}
+
+TEST(blocked_mode_client, shutdown_is_permanent)
+{
+    boost::asio::io_context server_io;
+    boost::asio::ip::tcp::acceptor acceptor{
+        server_io,
+        {boost::asio::ip::address_v4::loopback(), 0}
+    };
+
+    epee::net_utils::blocked_mode_client client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    const std::string port = std::to_string(acceptor.local_endpoint().port());
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+
+    boost::system::error_code error;
+    boost::asio::ip::tcp::socket peer{server_io};
+    acceptor.accept(peer, error);
+    ASSERT_FALSE(error);
+
+    // the abort is sticky: a shutdown with nothing in flight still fails the next
+    // op promptly, so a request scheduled before it can never start a doomed call
+    EXPECT_TRUE(client.shutdown());
+    EXPECT_FALSE(client.is_connected());
+    std::string response;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.recv(response, std::chrono::seconds{30}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
+
+    // the torn-down client never reconnects
+    EXPECT_FALSE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+}
+
+TEST(blocked_mode_client, eof_marks_disconnected_and_allows_reconnect)
+{
+    boost::asio::io_context server_io;
+    boost::asio::ip::tcp::acceptor acceptor{
+        server_io,
+        {boost::asio::ip::address_v4::loopback(), 0}
+    };
+
+    epee::net_utils::blocked_mode_client client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    const std::string port = std::to_string(acceptor.local_endpoint().port());
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+
+    boost::system::error_code error;
+    boost::asio::ip::tcp::socket first_peer{server_io};
+    acceptor.accept(first_peer, error);
+    ASSERT_FALSE(error);
+    boost::asio::write(first_peer, boost::asio::buffer("x", 1), error);
+    ASSERT_FALSE(error);
+    first_peer.shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+    ASSERT_FALSE(error);
+
+    std::string response;
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_EQ("x", response);
+
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_TRUE(response.empty());
+    EXPECT_FALSE(client.is_connected());
+
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+    boost::asio::ip::tcp::socket second_peer{server_io};
+    acceptor.accept(second_peer, error);
+    ASSERT_FALSE(error);
+    boost::asio::write(second_peer, boost::asio::buffer("y", 1), error);
+    ASSERT_FALSE(error);
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_EQ("y", response);
+}
+
+TEST(blocked_mode_client, peer_eof_detected_before_reuse)
+{
+    boost::asio::io_context server_io;
+    boost::asio::ip::tcp::acceptor acceptor{
+        server_io,
+        {boost::asio::ip::address_v4::loopback(), 0}
+    };
+
+    struct test_client : epee::net_utils::blocked_mode_client
+    {
+        boost::asio::ip::tcp::socket& socket() { return m_ssl_socket->next_layer(); }
+    } client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    const std::string port = std::to_string(acceptor.local_endpoint().port());
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+
+    boost::system::error_code error;
+    boost::asio::ip::tcp::socket peer{server_io};
+    acceptor.accept(peer, error);
+    ASSERT_FALSE(error);
+    for (const bool non_blocking : {false, true})
+    {
+        client.socket().non_blocking(non_blocking);
+        boost::asio::write(peer, boost::asio::buffer("x", 1));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!client.socket().available() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        ASSERT_GT(client.socket().available(), 0u);
+        EXPECT_TRUE(client.is_connected());
+        EXPECT_EQ(non_blocking, client.socket().non_blocking());
+        std::string response;
+        ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+        EXPECT_EQ("x", response);
+    }
+
+    // close the idle connection from the peer; is_connected must observe the EOF without a request failing first
+    peer.shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+    ASSERT_FALSE(error);
+    bool disconnected = false;
+    for (int i = 0; i < 500 && !disconnected; ++i)
+    {
+        disconnected = !client.is_connected();
+        if (!disconnected)
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_TRUE(disconnected);
+
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::seconds{5}));
+    boost::asio::ip::tcp::socket second_peer{server_io};
+    acceptor.accept(second_peer, error);
+    ASSERT_FALSE(error);
+    EXPECT_TRUE(client.is_connected());
+}
+
+TEST(blocked_mode_client, disconnect_is_idempotent_after_peer_close)
+{
+    using tcp = boost::asio::ip::tcp;
+    boost::asio::io_context io;
+    tcp::acceptor acceptor{io, {boost::asio::ip::address_v4::loopback(), 0}};
+    struct test_client : epee::net_utils::blocked_mode_client
+    {
+        bool socket_is_open() const { return m_ssl_socket->next_layer().is_open(); }
+    } client;
+    client.set_ssl(epee::net_utils::ssl_options_t{
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled
+    });
+    ASSERT_TRUE(client.connect("127.0.0.1", std::to_string(acceptor.local_endpoint().port()),
+        std::chrono::seconds{5}));
+    tcp::socket peer{io};
+    acceptor.accept(peer);
+    peer.shutdown(tcp::socket::shutdown_both);
+    peer.close();
+    std::string response;
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    ASSERT_TRUE(response.empty());
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        EXPECT_TRUE(client.disconnect());
+        EXPECT_FALSE(client.socket_is_open());
+        EXPECT_FALSE(client.is_connected());
+    }
+    // disconnect is not the permanent shutdown: reconnect must still work.
+    ASSERT_TRUE(client.connect("127.0.0.1", std::to_string(acceptor.local_endpoint().port()),
+        std::chrono::seconds{5}));
+    acceptor.accept(peer);
+    EXPECT_TRUE(client.is_connected());
+}
+
+namespace
+{
+    class blocked_mode_client_ssl : public testing::TestWithParam<int>
+    {
+    protected:
+        using tcp = boost::asio::ip::tcp;
+        using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
+
+        static epee::net_utils::ssl_options_t ssl_options()
+        {
+            epee::net_utils::ssl_options_t options{epee::net_utils::ssl_support_t::e_ssl_support_enabled};
+            options.verification = epee::net_utils::ssl_verification_t::none;
+            // Public test-only credentials avoid generating RSA keys for every context.
+            options.auth = epee::net_utils::ssl_authentication_t{
+                (unit_test::data_dir / "ssl" / "test.key").string(),
+                (unit_test::data_dir / "ssl" / "test.crt").string()
+            };
+            return options;
+        }
+
+        boost::asio::io_context io;
+        boost::asio::ssl::context context{ssl_options().create_context()};
+        tcp::acceptor acceptor{io, {boost::asio::ip::address_v4::loopback(), 0}};
+        std::unique_ptr<ssl_stream> peer;
+        struct test_client : epee::net_utils::blocked_mode_client
+        {
+            bool socket_is_open() const { return m_ssl_socket->next_layer().is_open(); }
+        } client;
+
+        void SetUp() override
+        {
+#if (OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)) \
+    || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER >= 0x2070000fL)
+            ASSERT_EQ(1, SSL_CTX_set_min_proto_version(context.native_handle(), GetParam()));
+            ASSERT_EQ(1, SSL_CTX_set_max_proto_version(context.native_handle(), GetParam()));
+#endif
+            client.set_ssl(ssl_options());
+            ASSERT_TRUE(connect());
+            ASSERT_EQ(GetParam(), SSL_version(peer->native_handle()));
+        }
+
+        void TearDown() override
+        {
+            boost::system::error_code ignored;
+            if (peer)
+                peer->next_layer().close(ignored);
+            io.restart();
+            io.poll();
+        }
+
+        bool connect()
+        {
+            if (peer)
+            {
+                boost::system::error_code ignored;
+                peer->next_layer().close(ignored);
+                io.restart();
+                io.poll();
+            }
+            peer.reset(new ssl_stream{io, context});
+            io.restart();
+            boost::system::error_code server_error = boost::asio::error::would_block;
+            boost::asio::steady_timer deadline{io, std::chrono::seconds{5}};
+            deadline.async_wait([this](const boost::system::error_code& error) {
+                if (!error)
+                {
+                    boost::system::error_code ignored;
+                    acceptor.cancel(ignored);
+                    peer->next_layer().close(ignored);
+                }
+            });
+            acceptor.async_accept(peer->next_layer(), [&](const boost::system::error_code& error) {
+                if (error)
+                {
+                    server_error = error;
+                    deadline.cancel();
+                    return;
+                }
+                peer->async_handshake(boost::asio::ssl::stream_base::server,
+                    [&](const boost::system::error_code& error) {
+                        server_error = error;
+                        deadline.cancel();
+                    });
+            });
+            std::thread server{[this] { io.run(); }};
+            const bool connected = client.connect("127.0.0.1",
+                std::to_string(acceptor.local_endpoint().port()), std::chrono::seconds{5});
+            server.join();
+            return connected && !server_error;
+        }
+
+        bool wait_for_disconnect()
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+            do
+            {
+                if (!client.is_connected())
+                    return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            } while (std::chrono::steady_clock::now() < deadline);
+            return false;
+        }
+    };
+}
+
+TEST_P(blocked_mode_client_ssl, close_notify_detected_before_reuse)
+{
+    bool ssl = false;
+    ASSERT_TRUE(client.is_connected(&ssl));
+    ASSERT_TRUE(ssl);
+    ASSERT_TRUE(client.send("x", std::chrono::seconds{5}));
+    char request = 0;
+    boost::asio::read(*peer, boost::asio::buffer(&request, 1));
+    ASSERT_EQ('x', request);
+    boost::asio::write(*peer, boost::asio::buffer("y", 1));
+    std::string response;
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    ASSERT_EQ("y", response);
+    ASSERT_TRUE(client.is_connected());
+    // close only after the client has received the response; leave TCP open
+    // while waiting for the client's alert
+    io.restart();
+    peer->async_shutdown([](const boost::system::error_code&) {});
+    io.poll();
+    ASSERT_TRUE(wait_for_disconnect());
+    ASSERT_TRUE(connect());
+    ASSERT_TRUE(client.send("x", std::chrono::seconds{5}));
+    request = 0;
+    boost::asio::read(*peer, boost::asio::buffer(&request, 1));
+    EXPECT_EQ('x', request);
+}
+
+TEST_P(blocked_mode_client_ssl, preserves_unread_data)
+{
+    boost::asio::write(*peer, boost::asio::buffer("xyz", 3));
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_TRUE(client.is_connected());
+    std::string response, received;
+    while (received.size() < 3)
+    {
+        ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+        ASSERT_FALSE(response.empty());
+        received += response;
+    }
+    EXPECT_EQ("xyz", received);
+    EXPECT_EQ(3u, client.get_bytes_received());
+    EXPECT_TRUE(client.is_connected());
+}
+
+TEST_P(blocked_mode_client_ssl, abrupt_eof_detected_before_reuse)
+{
+    peer->next_layer().shutdown(tcp::socket::shutdown_send);
+    EXPECT_TRUE(wait_for_disconnect());
+}
+
+TEST_P(blocked_mode_client_ssl, partial_record_does_not_block)
+{
+    // an incomplete TLS record must not turn a status check into a blocking read
+    const unsigned char header[] = {0x17, 0x03, 0x03, 0x00, 0x20};
+    boost::asio::write(peer->next_layer(), boost::asio::buffer(header));
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{1});
+    peer->next_layer().shutdown(tcp::socket::shutdown_send);
+    EXPECT_TRUE(wait_for_disconnect());
+}
+
+TEST_P(blocked_mode_client_ssl, idle_probe_allows_request_and_response)
+{
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 10; ++i)
+        ASSERT_TRUE(client.is_connected());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{1});
+    ASSERT_TRUE(client.send("x", std::chrono::seconds{5}));
+    char request = 0;
+    boost::asio::read(*peer, boost::asio::buffer(&request, 1));
+    EXPECT_EQ('x', request);
+    boost::asio::write(*peer, boost::asio::buffer("y", 1));
+    std::string response;
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_EQ("y", response);
+    EXPECT_EQ(1u, client.get_bytes_received());
+}
+
+TEST_P(blocked_mode_client_ssl, reconnect_with_pending_probe)
+{
+    ASSERT_TRUE(client.is_connected());
+    ASSERT_TRUE(connect());
+    boost::asio::write(*peer, boost::asio::buffer("y", 1));
+    std::string response;
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_EQ("y", response);
+}
+
+TEST_P(blocked_mode_client_ssl, shutdown_aborts_pending_probe)
+{
+    ASSERT_TRUE(client.is_connected());
+    std::thread stopper{[this] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        client.shutdown();
+    }};
+    std::string response;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.recv(response, std::chrono::seconds{30}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{5});
+    stopper.join();
+    EXPECT_FALSE(client.is_connected());
+}
+
+TEST_P(blocked_mode_client_ssl, data_before_close_notify_is_preserved)
+{
+    boost::asio::write(*peer, boost::asio::buffer("xyz", 3));
+    io.restart();
+    peer->async_shutdown([](const boost::system::error_code&) {});
+    io.poll();
+    ASSERT_TRUE(client.is_connected());
+    std::string response, received;
+    while (received.size() < 3)
+    {
+        ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+        ASSERT_FALSE(response.empty());
+        received += response;
+    }
+    EXPECT_EQ("xyz", received);
+    EXPECT_EQ(3u, client.get_bytes_received());
+    EXPECT_TRUE(wait_for_disconnect());
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
+TEST_P(blocked_mode_client_ssl, key_update_allows_request_and_response)
+{
+    if (GetParam() != TLS1_3_VERSION)
+        GTEST_SKIP() << "SSL_key_update requires TLS 1.3";
+    ASSERT_EQ(1, SSL_key_update(peer->native_handle(), SSL_KEY_UPDATE_REQUESTED));
+    boost::asio::write(*peer, boost::asio::buffer("x", 1));
+    ASSERT_TRUE(client.is_connected());
+    std::string response;
+    ASSERT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_EQ("x", response);
+    ASSERT_TRUE(client.send("y", std::chrono::seconds{5}));
+    char request = 0;
+    boost::asio::read(*peer, boost::asio::buffer(&request, 1));
+    EXPECT_EQ('y', request);
+}
+#endif
+
+TEST_P(blocked_mode_client_ssl, recv_times_out_with_pending_probe)
+{
+    ASSERT_TRUE(client.is_connected());
+    std::string response;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.recv(response, std::chrono::milliseconds{100}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{5});
+    EXPECT_FALSE(client.is_connected());
+}
+
+TEST_P(blocked_mode_client_ssl, disconnect_with_pending_probe_is_graceful)
+{
+    ASSERT_TRUE(client.is_connected());
+    boost::system::error_code peer_error = boost::asio::error::would_block;
+    char byte;
+    io.restart();
+    boost::asio::steady_timer deadline{io, std::chrono::seconds{5}};
+    deadline.async_wait([this](const boost::system::error_code& error) {
+        if (!error)
+        {
+            boost::system::error_code ignored;
+            peer->next_layer().close(ignored);
+        }
+    });
+    peer->async_read_some(boost::asio::buffer(&byte, 1),
+        [&](const boost::system::error_code& error, size_t) {
+            EXPECT_EQ(boost::asio::error::eof, error);
+            if (error != boost::asio::error::eof)
+            {
+                peer_error = boost::asio::error::fault;
+                deadline.cancel();
+            }
+            else
+                peer->async_shutdown([&](const boost::system::error_code& error) {
+                    peer_error = error;
+                    deadline.cancel();
+                });
+        });
+    std::thread server{[this] { io.run(); }};
+    EXPECT_TRUE(client.disconnect());
+    server.join();
+    EXPECT_FALSE(peer_error);
+    EXPECT_FALSE(client.socket_is_open());
+    // Repeated disconnects must not attempt another TLS shutdown, even after the peer closes.
+    peer->next_layer().close();
+    EXPECT_TRUE(client.disconnect());
+    EXPECT_TRUE(client.disconnect());
+    EXPECT_FALSE(client.is_connected());
+    ASSERT_TRUE(connect());
+    EXPECT_TRUE(client.is_connected());
+}
+
+TEST_P(blocked_mode_client_ssl, disconnect_after_peer_eof_is_graceful)
+{
+    boost::system::error_code peer_error = boost::asio::error::would_block;
+    io.restart();
+    boost::asio::steady_timer deadline{io, std::chrono::seconds{5}};
+    deadline.async_wait([this](const boost::system::error_code& error) {
+        if (!error)
+        {
+            boost::system::error_code ignored;
+            peer->next_layer().close(ignored);
+        }
+    });
+    peer->async_shutdown([&](const boost::system::error_code& error) {
+        peer_error = error;
+        deadline.cancel();
+    });
+    std::thread server{[this] { io.run(); }};
+    std::string response;
+    EXPECT_TRUE(client.recv(response, std::chrono::seconds{5}));
+    EXPECT_TRUE(response.empty());
+    EXPECT_FALSE(client.is_connected());
+    EXPECT_TRUE(client.disconnect());
+    server.join();
+    EXPECT_FALSE(peer_error);
+    EXPECT_FALSE(client.socket_is_open());
+    peer->next_layer().close();
+    EXPECT_TRUE(client.disconnect());
+    EXPECT_TRUE(client.disconnect());
+}
+
+TEST_P(blocked_mode_client_ssl, disconnect_after_abrupt_eof_is_idempotent)
+{
+    peer->next_layer().shutdown(tcp::socket::shutdown_both);
+    peer->next_layer().close();
+    ASSERT_TRUE(wait_for_disconnect());
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        EXPECT_TRUE(client.disconnect());
+        EXPECT_FALSE(client.socket_is_open());
+        EXPECT_FALSE(client.is_connected());
+    }
+}
+
+TEST_P(blocked_mode_client_ssl, disconnect_after_shutdown_does_not_wait_for_peer)
+{
+    ASSERT_TRUE(client.is_connected());
+    ASSERT_TRUE(client.shutdown());
+    // permanent shutdown must not wait for the peer's TLS close alert
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_TRUE(client.disconnect());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{1});
+    EXPECT_FALSE(client.is_connected());
+}
+
+INSTANTIATE_TEST_SUITE_P(tls, blocked_mode_client_ssl, testing::Values(
+    TLS1_2_VERSION
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
+    , TLS1_3_VERSION
+#endif
+));
 
 TEST(tor_address, constants)
 {
@@ -93,18 +785,20 @@ TEST(tor_address, invalid)
     EXPECT_TRUE(net::tor_address::make(":").has_error());
     EXPECT_TRUE(net::tor_address::make(".onion").has_error());
     EXPECT_TRUE(net::tor_address::make(".onion:").has_error());
-    EXPECT_TRUE(net::tor_address::make(v2_onion + 1).has_error());
     EXPECT_TRUE(net::tor_address::make(v3_onion + 1).has_error());
-    EXPECT_TRUE(net::tor_address::make(boost::string_ref{v2_onion, sizeof(v2_onion) - 2}).has_error());
     EXPECT_TRUE(net::tor_address::make(boost::string_ref{v3_onion, sizeof(v3_onion) - 2}).has_error());
-    EXPECT_TRUE(net::tor_address::make(std::string{v2_onion} + ":-").has_error());
-    EXPECT_TRUE(net::tor_address::make(std::string{v2_onion} + ":900a").has_error());
+    EXPECT_TRUE(net::tor_address::make(std::string{v3_onion} + ":-").has_error());
+    EXPECT_TRUE(net::tor_address::make(std::string{v3_onion} + ":900a").has_error());
     EXPECT_TRUE(net::tor_address::make(std::string{v3_onion} + ":65536").has_error());
     EXPECT_TRUE(net::tor_address::make(std::string{v3_onion} + ":-1").has_error());
 
     std::string onion{v3_onion};
     onion.at(10) = 1;
     EXPECT_TRUE(net::tor_address::make(onion).has_error());
+
+    EXPECT_TRUE(net::tor_address::make(v3_onion_bad_checksum).has_error());
+    EXPECT_TRUE(net::tor_address::make(v3_onion_bad_pubkey).has_error());
+    EXPECT_TRUE(net::tor_address::make(v3_onion_bad_version).has_error());
 }
 
 TEST(tor_address, unblockable_types)
@@ -145,6 +839,10 @@ TEST(tor_address, valid)
     EXPECT_STREQ(v3_onion, address1->str().c_str());
     EXPECT_TRUE(address1->is_blockable());
 
+    const auto uppercase = net::tor_address::make(v3_onion_upper);
+    ASSERT_TRUE(uppercase.has_value());
+    EXPECT_EQ(*address1, *uppercase);
+
     net::tor_address address2{*address1};
 
     EXPECT_EQ(0u, address2.port());
@@ -162,11 +860,11 @@ TEST(tor_address, valid)
     EXPECT_FALSE(address2.less(*address1));
     EXPECT_FALSE(address1->less(address2));
 
-    address2 = MONERO_UNWRAP(net::tor_address::make(std::string{v2_onion} + ":6545"));
+    address2 = MONERO_UNWRAP(net::tor_address::make(std::string{v3_onion_2} + ":6545"));
 
     EXPECT_EQ(6545, address2.port());
-    EXPECT_STREQ(v2_onion, address2.host_str());
-    EXPECT_EQ(std::string{v2_onion} + ":6545", address2.str().c_str());
+    EXPECT_STREQ(v3_onion_2, address2.host_str());
+    EXPECT_EQ(std::string{v3_onion_2} + ":6545", address2.str().c_str());
     EXPECT_TRUE(address2.is_blockable());
     EXPECT_FALSE(address2.equal(*address1));
     EXPECT_FALSE(address1->equal(address2));
@@ -238,60 +936,9 @@ namespace
         net::tor_address tor;
 
         BEGIN_KV_SERIALIZE_MAP()
-            KV_SERIALIZE(tor);
+            KV_SERIALIZE(tor)
         END_KV_SERIALIZE_MAP()
     };
-}
-
-TEST(tor_address, epee_serializev_v2)
-{
-    epee::byte_slice buffer{};
-    {
-        test_command_tor command{MONERO_UNWRAP(net::tor_address::make(v2_onion, 10))};
-        EXPECT_FALSE(command.tor.is_unknown());
-        EXPECT_NE(net::tor_address{}, command.tor);
-        EXPECT_STREQ(v2_onion, command.tor.host_str());
-        EXPECT_EQ(10u, command.tor.port());
-
-        epee::serialization::portable_storage stg{};
-        EXPECT_TRUE(command.store(stg));
-        EXPECT_TRUE(stg.store_to_binary(buffer));
-    }
-
-    test_command_tor command{};
-    {
-        EXPECT_TRUE(command.tor.is_unknown());
-        EXPECT_EQ(net::tor_address{}, command.tor);
-        EXPECT_STREQ(net::tor_address::unknown_str(), command.tor.host_str());
-        EXPECT_EQ(0u, command.tor.port());
-
-        epee::serialization::portable_storage stg{};
-        EXPECT_TRUE(stg.load_from_binary(epee::to_span(buffer)));
-        EXPECT_TRUE(command.load(stg));
-    }
-    EXPECT_FALSE(command.tor.is_unknown());
-    EXPECT_NE(net::tor_address{}, command.tor);
-    EXPECT_STREQ(v2_onion, command.tor.host_str());
-    EXPECT_EQ(10u, command.tor.port());
-
-    // make sure that exceeding max buffer doesn't destroy tor_address::_load
-    {
-        epee::serialization::portable_storage stg{};
-        stg.load_from_binary(epee::to_span(buffer));
-
-        std::string host{};
-        ASSERT_TRUE(stg.get_value("host", host, stg.open_section("tor", nullptr, false)));
-        EXPECT_EQ(std::strlen(v2_onion), host.size());
-
-        host.push_back('k');
-        EXPECT_TRUE(stg.set_value("host", std::move(host), stg.open_section("tor", nullptr, false)));
-        EXPECT_TRUE(command.load(stg)); // poor error reporting from `KV_SERIALIZE`
-    }
-
-    EXPECT_TRUE(command.tor.is_unknown());
-    EXPECT_EQ(net::tor_address{}, command.tor);
-    EXPECT_STREQ(net::tor_address::unknown_str(), command.tor.host_str());
-    EXPECT_EQ(0u, command.tor.port());
 }
 
 TEST(tor_address, epee_serializev_v3)
@@ -320,6 +967,20 @@ TEST(tor_address, epee_serializev_v3)
         EXPECT_TRUE(stg.load_from_binary(epee::to_span(buffer)));
         EXPECT_TRUE(command.load(stg));
     }
+    EXPECT_FALSE(command.tor.is_unknown());
+    EXPECT_NE(net::tor_address{}, command.tor);
+    EXPECT_STREQ(v3_onion, command.tor.host_str());
+    EXPECT_EQ(10u, command.tor.port());
+
+    // make sure tor_address::_load canonicalizes incoming hosts
+    {
+        epee::serialization::portable_storage stg{};
+        stg.load_from_binary(epee::to_span(buffer));
+
+        EXPECT_TRUE(stg.set_value("host", std::string{v3_onion_upper}, stg.open_section("tor", nullptr, false)));
+        EXPECT_TRUE(command.load(stg));
+    }
+
     EXPECT_FALSE(command.tor.is_unknown());
     EXPECT_NE(net::tor_address{}, command.tor);
     EXPECT_STREQ(v3_onion, command.tor.host_str());
@@ -394,41 +1055,6 @@ TEST(tor_address, epee_serialize_unknown)
     EXPECT_EQ(net::tor_address{}, command.tor);
     EXPECT_STRNE(v3_onion, command.tor.host_str());
     EXPECT_EQ(0u, command.tor.port());
-}
-
-TEST(tor_address, boost_serialize_v2)
-{
-    std::string buffer{};
-    {
-        const net::tor_address tor = MONERO_UNWRAP(net::tor_address::make(v2_onion, 10));
-        EXPECT_FALSE(tor.is_unknown());
-        EXPECT_NE(net::tor_address{}, tor);
-        EXPECT_STREQ(v2_onion, tor.host_str());
-        EXPECT_EQ(10u, tor.port());
-
-        std::ostringstream stream{};
-        {
-            boost::archive::portable_binary_oarchive archive{stream};
-            archive << tor;
-        }
-        buffer = stream.str();
-    }
-
-    net::tor_address tor{};
-    {
-        EXPECT_TRUE(tor.is_unknown());
-        EXPECT_EQ(net::tor_address{}, tor);
-        EXPECT_STREQ(net::tor_address::unknown_str(), tor.host_str());
-        EXPECT_EQ(0u, tor.port());
-
-        std::istringstream stream{buffer};
-        boost::archive::portable_binary_iarchive archive{stream};
-        archive >> tor;
-    }
-    EXPECT_FALSE(tor.is_unknown());
-    EXPECT_NE(net::tor_address{}, tor);
-    EXPECT_STREQ(v2_onion, tor.host_str());
-    EXPECT_EQ(10u, tor.port());
 }
 
 TEST(tor_address, boost_serialize_v3)
@@ -510,6 +1136,9 @@ TEST(get_network_address, onion)
     address = net::get_network_address(".onion", 0);
     EXPECT_EQ(net::error::invalid_tor_address, address);
 
+    address = net::get_network_address(v2_onion, 1000);
+    EXPECT_EQ(net::error::legacy_tor_address, address);
+
     address = net::get_network_address(v3_onion, 1000);
     ASSERT_TRUE(bool(address));
     EXPECT_EQ(epee::net_utils::address_type::tor, address->get_type_id());
@@ -530,8 +1159,13 @@ namespace
 {
     static constexpr const char b32_i2p[] =
         "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopn.b32.i2p";
+    static constexpr const char b32_i2p_upper[] =
+        "VWW6YBAL4BD7SZMGNCYRUUCPGFKQAHZDDI37KTCEO3AH7NGMCOPN.B32.I2P";
     static constexpr const char b32_i2p_2[] =
         "xmrto2bturnore26xmrto2bturnore26xmrto2bturnore26xmr2.b32.i2p";
+
+    static constexpr const char standard_i2p[] = "test.i2p";
+    static constexpr const char standard_i2p_2[] = "reg.i2p";
 }
 
 TEST(i2p_address, constants)
@@ -552,14 +1186,40 @@ TEST(i2p_address, invalid)
     EXPECT_TRUE(net::i2p_address::make(":").has_error());
     EXPECT_TRUE(net::i2p_address::make(".b32.i2p").has_error());
     EXPECT_TRUE(net::i2p_address::make(".b32.i2p:").has_error());
+    EXPECT_TRUE(net::i2p_address::make(".i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make(".i2p:").has_error());
+
+    EXPECT_TRUE(net::i2p_address::make("m=nero.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("-monero.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make(std::string(net::i2p_name_max_length, 'a') + ".i2p").has_value());
+    EXPECT_TRUE(net::i2p_address::make(std::string(net::i2p_name_max_length + 1, 'a') + ".i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("monero-.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("a.-monero.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("m..ero.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("m..ero.b32.i2p.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("monero.i2p-").has_error());
+    EXPECT_TRUE(net::i2p_address::make("monero..i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("a-.b.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("a.-b.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("a--b.i2p").has_error());
+    EXPECT_TRUE(net::i2p_address::make("a.b.i2p").has_value());
+    EXPECT_TRUE(net::i2p_address::make("abc-123.i2p").has_value());
+    EXPECT_TRUE(net::i2p_address::make("example.b32.i2p").has_error());
     EXPECT_TRUE(net::i2p_address::make(b32_i2p + 1).has_error());
+
+    EXPECT_TRUE(net::i2p_address::make("test.b32.i2p.i2p").has_value());
+    EXPECT_TRUE(net::i2p_address::make(std::string{b32_i2p} + ".i2p").has_value());
+
     EXPECT_TRUE(net::i2p_address::make(boost::string_ref{b32_i2p, sizeof(b32_i2p) - 2}).has_error());
-    EXPECT_TRUE(net::i2p_address::make(std::string{b32_i2p} + ":65536").has_error());
-    EXPECT_TRUE(net::i2p_address::make(std::string{b32_i2p} + ":-1").has_error());
+    EXPECT_TRUE(net::i2p_address::make(boost::string_ref{standard_i2p, sizeof(standard_i2p) - 2}).has_error());
 
     std::string i2p{b32_i2p};
     i2p.at(10) = 1;
     EXPECT_TRUE(net::i2p_address::make(i2p).has_error());
+
+    std::string i2p_standard{standard_i2p};
+    i2p_standard.at(7) = 1;
+    EXPECT_TRUE(net::i2p_address::make(i2p_standard).has_error());
 }
 
 TEST(i2p_address, unblockable_types)
@@ -569,7 +1229,7 @@ TEST(i2p_address, unblockable_types)
     ASSERT_NE(nullptr, i2p.host_str());
     EXPECT_STREQ("<unknown i2p host>", i2p.host_str());
     EXPECT_STREQ("<unknown i2p host>", i2p.str().c_str());
-    EXPECT_EQ(0u, i2p.port());
+    EXPECT_EQ(1u, i2p.port());
     EXPECT_TRUE(i2p.is_unknown());
     EXPECT_FALSE(i2p.is_local());
     EXPECT_FALSE(i2p.is_loopback());
@@ -580,7 +1240,7 @@ TEST(i2p_address, unblockable_types)
     ASSERT_NE(nullptr, i2p.host_str());
     EXPECT_STREQ("<unknown i2p host>", i2p.host_str());
     EXPECT_STREQ("<unknown i2p host>", i2p.str().c_str());
-    EXPECT_EQ(0u, i2p.port());
+    EXPECT_EQ(1u, i2p.port());
     EXPECT_TRUE(i2p.is_unknown());
     EXPECT_FALSE(i2p.is_local());
     EXPECT_FALSE(i2p.is_loopback());
@@ -590,19 +1250,23 @@ TEST(i2p_address, unblockable_types)
     EXPECT_EQ(net::i2p_address{}, net::i2p_address::unknown());
 }
 
-TEST(i2p_address, valid)
+TEST(i2p_address, valid_b32)
 {
     const auto address1 = net::i2p_address::make(b32_i2p);
 
     ASSERT_TRUE(address1.has_value());
-    EXPECT_EQ(0u, address1->port());
+    EXPECT_EQ(1u, address1->port());
     EXPECT_STREQ(b32_i2p, address1->host_str());
     EXPECT_STREQ(b32_i2p, address1->str().c_str());
     EXPECT_TRUE(address1->is_blockable());
 
+    const auto uppercase = net::i2p_address::make(b32_i2p_upper);
+    ASSERT_TRUE(uppercase.has_value());
+    EXPECT_EQ(*address1, *uppercase);
+
     net::i2p_address address2{*address1};
 
-    EXPECT_EQ(0u, address2.port());
+    EXPECT_EQ(1u, address2.port());
     EXPECT_STREQ(b32_i2p, address2.host_str());
     EXPECT_STREQ(b32_i2p, address2.str().c_str());
     EXPECT_TRUE(address2.is_blockable());
@@ -619,9 +1283,9 @@ TEST(i2p_address, valid)
 
     address2 = MONERO_UNWRAP(net::i2p_address::make(std::string{b32_i2p_2} + ":6545"));
 
-    EXPECT_EQ(6545, address2.port());
+    EXPECT_EQ(1u, address2.port());
     EXPECT_STREQ(b32_i2p_2, address2.host_str());
-    EXPECT_EQ(std::string{b32_i2p_2} + ":6545", address2.str().c_str());
+    EXPECT_EQ(std::string{b32_i2p_2}, address2.str().c_str());
     EXPECT_TRUE(address2.is_blockable());
     EXPECT_FALSE(address2.equal(*address1));
     EXPECT_FALSE(address1->equal(address2));
@@ -634,22 +1298,22 @@ TEST(i2p_address, valid)
     EXPECT_FALSE(address2.less(*address1));
     EXPECT_TRUE(address1->less(address2));
 
-    net::i2p_address address3 = MONERO_UNWRAP(net::i2p_address::make(std::string{b32_i2p} + ":", 65535));
+    net::i2p_address address3 = MONERO_UNWRAP(net::i2p_address::make(std::string{b32_i2p} + ":65535"));
 
-    EXPECT_EQ(65535, address3.port());
+    EXPECT_EQ(1u, address3.port());
     EXPECT_STREQ(b32_i2p, address3.host_str());
-    EXPECT_EQ(std::string{b32_i2p} + ":65535", address3.str().c_str());
+    EXPECT_EQ(std::string{b32_i2p}, address3.str().c_str());
     EXPECT_TRUE(address3.is_blockable());
-    EXPECT_FALSE(address3.equal(*address1));
-    EXPECT_FALSE(address1->equal(address3));
-    EXPECT_FALSE(address3 == *address1);
-    EXPECT_FALSE(*address1 == address3);
-    EXPECT_TRUE(address3 != *address1);
-    EXPECT_TRUE(*address1 != address3);
+    EXPECT_TRUE(address3.equal(*address1));
+    EXPECT_TRUE(address1->equal(address3));
+    EXPECT_TRUE(address3 == *address1);
+    EXPECT_TRUE(*address1 == address3);
+    EXPECT_FALSE(address3 != *address1);
+    EXPECT_FALSE(*address1 != address3);
     EXPECT_TRUE(address3.is_same_host(*address1));
     EXPECT_TRUE(address1->is_same_host(address3));
     EXPECT_FALSE(address3.less(*address1));
-    EXPECT_TRUE(address1->less(address3));
+    EXPECT_FALSE(address1->less(address3));
 
     EXPECT_FALSE(address3.equal(address2));
     EXPECT_FALSE(address2.equal(address3));
@@ -663,10 +1327,89 @@ TEST(i2p_address, valid)
     EXPECT_FALSE(address2.less(address3));
 }
 
+TEST(i2p_address, valid_standard)
+{
+    const auto address1 = net::i2p_address::make(standard_i2p);
+
+    ASSERT_TRUE(address1.has_value());
+    EXPECT_EQ(1u, address1->port());
+    EXPECT_STREQ(standard_i2p, address1->host_str());
+    EXPECT_STREQ(standard_i2p, address1->str().c_str());
+    EXPECT_TRUE(address1->is_blockable());
+
+    net::i2p_address address2{*address1};
+
+    EXPECT_EQ(1u, address2.port());
+    EXPECT_STREQ(standard_i2p, address2.host_str());
+    EXPECT_STREQ(standard_i2p, address2.str().c_str());
+    EXPECT_TRUE(address2.is_blockable());
+    EXPECT_TRUE(address2.equal(*address1));
+    EXPECT_TRUE(address1->equal(address2));
+    EXPECT_TRUE(address2 == *address1);
+    EXPECT_TRUE(*address1 == address2);
+    EXPECT_FALSE(address2 != *address1);
+    EXPECT_FALSE(*address1 != address2);
+    EXPECT_TRUE(address2.is_same_host(*address1));
+    EXPECT_TRUE(address1->is_same_host(address2));
+    EXPECT_FALSE(address2.less(*address1));
+    EXPECT_FALSE(address1->less(address2));
+
+    address2 = MONERO_UNWRAP(net::i2p_address::make(std::string{standard_i2p_2} + ":6545"));
+
+    EXPECT_EQ(1u, address2.port());
+    EXPECT_STREQ(standard_i2p_2, address2.host_str());
+    EXPECT_EQ(std::string{standard_i2p_2}, address2.str().c_str());
+    EXPECT_TRUE(address2.is_blockable());
+    EXPECT_FALSE(address2.equal(*address1));
+    EXPECT_FALSE(address1->equal(address2));
+    EXPECT_FALSE(address2 == *address1);
+    EXPECT_FALSE(*address1 == address2);
+    EXPECT_TRUE(address2 != *address1);
+    EXPECT_TRUE(*address1 != address2);
+    EXPECT_FALSE(address2.is_same_host(*address1));
+    EXPECT_FALSE(address1->is_same_host(address2));
+    EXPECT_FALSE(address1->less(address2));
+    EXPECT_TRUE(address2.less(*address1));
+
+    net::i2p_address address3 = MONERO_UNWRAP(net::i2p_address::make(std::string{standard_i2p} + ":65535"));
+
+    EXPECT_EQ(1u, address3.port());
+    EXPECT_STREQ(standard_i2p, address3.host_str());
+    EXPECT_EQ(std::string{standard_i2p}, address3.str().c_str());
+    EXPECT_TRUE(address3.is_blockable());
+    EXPECT_TRUE(address3.equal(*address1));
+    EXPECT_TRUE(address1->equal(address3));
+    EXPECT_TRUE(address3 == *address1);
+    EXPECT_TRUE(*address1 == address3);
+    EXPECT_FALSE(address3 != *address1);
+    EXPECT_FALSE(*address1 != address3);
+    EXPECT_TRUE(address3.is_same_host(*address1));
+    EXPECT_TRUE(address1->is_same_host(address3));
+    EXPECT_FALSE(address3.less(*address1));
+    EXPECT_FALSE(address1->less(address3));
+
+    EXPECT_FALSE(address3.equal(address2));
+    EXPECT_FALSE(address2.equal(address3));
+    EXPECT_FALSE(address3 == address2);
+    EXPECT_FALSE(address2 == address3);
+    EXPECT_TRUE(address3 != address2);
+    EXPECT_TRUE(address2 != address3);
+    EXPECT_FALSE(address3.is_same_host(address2));
+    EXPECT_FALSE(address2.is_same_host(address3));
+    EXPECT_TRUE(address2.less(address3));
+    EXPECT_FALSE(address3.less(address2));
+
+    {
+        const auto address = net::i2p_address::make("Example.I2P");
+        ASSERT_TRUE(address.has_value());
+        EXPECT_STREQ("example.i2p", address->host_str());
+    }
+}
+
 TEST(i2p_address, generic_network_address)
 {
-    const epee::net_utils::network_address i2p1{MONERO_UNWRAP(net::i2p_address::make(b32_i2p, 8080))};
-    const epee::net_utils::network_address i2p2{MONERO_UNWRAP(net::i2p_address::make(b32_i2p, 8080))};
+    const epee::net_utils::network_address i2p1{MONERO_UNWRAP(net::i2p_address::make(b32_i2p))};
+    const epee::net_utils::network_address i2p2{MONERO_UNWRAP(net::i2p_address::make(b32_i2p))};
     const epee::net_utils::network_address ip{epee::net_utils::ipv4_network_address{100, 200}};
 
     EXPECT_EQ(i2p1, i2p2);
@@ -674,7 +1417,7 @@ TEST(i2p_address, generic_network_address)
     EXPECT_LT(ip, i2p1);
 
     EXPECT_STREQ(b32_i2p, i2p1.host_str().c_str());
-    EXPECT_EQ(std::string{b32_i2p} + ":8080", i2p1.str());
+    EXPECT_STREQ(b32_i2p, i2p1.str().c_str());
     EXPECT_EQ(epee::net_utils::address_type::i2p, i2p1.get_type_id());
     EXPECT_EQ(epee::net_utils::address_type::i2p, i2p2.get_type_id());
     EXPECT_EQ(epee::net_utils::address_type::ipv4, ip.get_type_id());
@@ -684,6 +1427,22 @@ TEST(i2p_address, generic_network_address)
     EXPECT_TRUE(i2p1.is_blockable());
     EXPECT_TRUE(i2p2.is_blockable());
     EXPECT_TRUE(ip.is_blockable());
+
+    const epee::net_utils::network_address i2p1_standard{MONERO_UNWRAP(net::i2p_address::make(standard_i2p))};
+    const epee::net_utils::network_address i2p2_standard{MONERO_UNWRAP(net::i2p_address::make(standard_i2p))};
+
+    EXPECT_EQ(i2p1_standard, i2p2_standard);
+    EXPECT_NE(ip, i2p1_standard);
+    EXPECT_LT(ip, i2p1_standard);
+
+    EXPECT_STREQ(standard_i2p, i2p1_standard.host_str().c_str());
+    EXPECT_STREQ(standard_i2p, i2p1_standard.str().c_str());
+    EXPECT_EQ(epee::net_utils::address_type::i2p, i2p1_standard.get_type_id());
+    EXPECT_EQ(epee::net_utils::address_type::i2p, i2p2_standard.get_type_id());
+    EXPECT_EQ(epee::net_utils::zone::i2p, i2p1_standard.get_zone());
+    EXPECT_EQ(epee::net_utils::zone::i2p, i2p2_standard.get_zone());
+    EXPECT_TRUE(i2p1_standard.is_blockable());
+    EXPECT_TRUE(i2p2_standard.is_blockable());
 }
 
 namespace
@@ -693,7 +1452,7 @@ namespace
         net::i2p_address i2p;
 
         BEGIN_KV_SERIALIZE_MAP()
-            KV_SERIALIZE(i2p);
+            KV_SERIALIZE(i2p)
         END_KV_SERIALIZE_MAP()
     };
 }
@@ -702,11 +1461,11 @@ TEST(i2p_address, epee_serializev_b32)
 {
     epee::byte_slice buffer{};
     {
-        test_command_i2p command{MONERO_UNWRAP(net::i2p_address::make(b32_i2p, 10))};
+        test_command_i2p command{MONERO_UNWRAP(net::i2p_address::make(b32_i2p))};
         EXPECT_FALSE(command.i2p.is_unknown());
         EXPECT_NE(net::i2p_address{}, command.i2p);
         EXPECT_STREQ(b32_i2p, command.i2p.host_str());
-        EXPECT_EQ(10u, command.i2p.port());
+        EXPECT_EQ(1u, command.i2p.port());
 
         epee::serialization::portable_storage stg{};
         EXPECT_TRUE(command.store(stg));
@@ -718,7 +1477,7 @@ TEST(i2p_address, epee_serializev_b32)
         EXPECT_TRUE(command.i2p.is_unknown());
         EXPECT_EQ(net::i2p_address{}, command.i2p);
         EXPECT_STREQ(net::i2p_address::unknown_str(), command.i2p.host_str());
-        EXPECT_EQ(0u, command.i2p.port());
+        EXPECT_EQ(1u, command.i2p.port());
 
         epee::serialization::portable_storage stg{};
         EXPECT_TRUE(stg.load_from_binary(epee::to_span(buffer)));
@@ -727,7 +1486,21 @@ TEST(i2p_address, epee_serializev_b32)
     EXPECT_FALSE(command.i2p.is_unknown());
     EXPECT_NE(net::i2p_address{}, command.i2p);
     EXPECT_STREQ(b32_i2p, command.i2p.host_str());
-    EXPECT_EQ(10u, command.i2p.port());
+    EXPECT_EQ(1u, command.i2p.port());
+
+    // make sure i2p_address::_load canonicalizes incoming hosts
+    {
+        epee::serialization::portable_storage stg{};
+        stg.load_from_binary(epee::to_span(buffer));
+
+        EXPECT_TRUE(stg.set_value("host", std::string{b32_i2p_upper}, stg.open_section("i2p", nullptr, false)));
+        EXPECT_TRUE(command.load(stg));
+    }
+
+    EXPECT_FALSE(command.i2p.is_unknown());
+    EXPECT_NE(net::i2p_address{}, command.i2p);
+    EXPECT_STREQ(b32_i2p, command.i2p.host_str());
+    EXPECT_EQ(1u, command.i2p.port());
 
     // make sure that exceeding max buffer doesn't destroy i2p_address::_load
     {
@@ -746,7 +1519,7 @@ TEST(i2p_address, epee_serializev_b32)
     EXPECT_TRUE(command.i2p.is_unknown());
     EXPECT_EQ(net::i2p_address{}, command.i2p);
     EXPECT_STRNE(b32_i2p, command.i2p.host_str());
-    EXPECT_EQ(0u, command.i2p.port());
+    EXPECT_EQ(1u, command.i2p.port());
 }
 
 TEST(i2p_address, epee_serialize_unknown)
@@ -757,7 +1530,7 @@ TEST(i2p_address, epee_serialize_unknown)
         EXPECT_TRUE(command.i2p.is_unknown());
         EXPECT_EQ(net::i2p_address{}, command.i2p);
         EXPECT_STREQ(net::i2p_address::unknown_str(), command.i2p.host_str());
-        EXPECT_EQ(0u, command.i2p.port());
+        EXPECT_EQ(1u, command.i2p.port());
 
         epee::serialization::portable_storage stg{};
         EXPECT_TRUE(command.store(stg));
@@ -769,7 +1542,7 @@ TEST(i2p_address, epee_serialize_unknown)
         EXPECT_TRUE(command.i2p.is_unknown());
         EXPECT_EQ(net::i2p_address{}, command.i2p);
         EXPECT_STRNE(b32_i2p, command.i2p.host_str());
-        EXPECT_EQ(0u, command.i2p.port());
+        EXPECT_EQ(1u, command.i2p.port());
 
         epee::serialization::portable_storage stg{};
         EXPECT_TRUE(stg.load_from_binary(epee::to_span(buffer)));
@@ -778,7 +1551,7 @@ TEST(i2p_address, epee_serialize_unknown)
     EXPECT_TRUE(command.i2p.is_unknown());
     EXPECT_EQ(net::i2p_address{}, command.i2p);
     EXPECT_STREQ(net::i2p_address::unknown_str(), command.i2p.host_str());
-    EXPECT_EQ(0u, command.i2p.port());
+    EXPECT_EQ(1u, command.i2p.port());
 
     // make sure that exceeding max buffer doesn't destroy i2p_address::_load
     {
@@ -797,18 +1570,18 @@ TEST(i2p_address, epee_serialize_unknown)
     EXPECT_TRUE(command.i2p.is_unknown());
     EXPECT_EQ(net::i2p_address{}, command.i2p);
     EXPECT_STRNE(b32_i2p, command.i2p.host_str());
-    EXPECT_EQ(0u, command.i2p.port());
+    EXPECT_EQ(1u, command.i2p.port());
 }
 
 TEST(i2p_address, boost_serialize_b32)
 {
     std::string buffer{};
     {
-        const net::i2p_address i2p = MONERO_UNWRAP(net::i2p_address::make(b32_i2p, 10));
+        const net::i2p_address i2p = MONERO_UNWRAP(net::i2p_address::make(b32_i2p));
         EXPECT_FALSE(i2p.is_unknown());
         EXPECT_NE(net::i2p_address{}, i2p);
         EXPECT_STREQ(b32_i2p, i2p.host_str());
-        EXPECT_EQ(10u, i2p.port());
+        EXPECT_EQ(1u, i2p.port());
 
         std::ostringstream stream{};
         {
@@ -823,7 +1596,7 @@ TEST(i2p_address, boost_serialize_b32)
         EXPECT_TRUE(i2p.is_unknown());
         EXPECT_EQ(net::i2p_address{}, i2p);
         EXPECT_STREQ(net::i2p_address::unknown_str(), i2p.host_str());
-        EXPECT_EQ(0u, i2p.port());
+        EXPECT_EQ(1u, i2p.port());
 
         std::istringstream stream{buffer};
         boost::archive::portable_binary_iarchive archive{stream};
@@ -832,7 +1605,7 @@ TEST(i2p_address, boost_serialize_b32)
     EXPECT_FALSE(i2p.is_unknown());
     EXPECT_NE(net::i2p_address{}, i2p);
     EXPECT_STREQ(b32_i2p, i2p.host_str());
-    EXPECT_EQ(10u, i2p.port());
+    EXPECT_EQ(1u, i2p.port());
 }
 
 TEST(i2p_address, boost_serialize_unknown)
@@ -843,7 +1616,7 @@ TEST(i2p_address, boost_serialize_unknown)
         EXPECT_TRUE(i2p.is_unknown());
         EXPECT_EQ(net::i2p_address::unknown(), i2p);
         EXPECT_STREQ(net::i2p_address::unknown_str(), i2p.host_str());
-        EXPECT_EQ(0u, i2p.port());
+        EXPECT_EQ(1u, i2p.port());
 
         std::ostringstream stream{};
         {
@@ -858,7 +1631,7 @@ TEST(i2p_address, boost_serialize_unknown)
         EXPECT_TRUE(i2p.is_unknown());
         EXPECT_EQ(net::i2p_address{}, i2p);
         EXPECT_STREQ(net::i2p_address::unknown_str(), i2p.host_str());
-        EXPECT_EQ(0u, i2p.port());
+        EXPECT_EQ(1u, i2p.port());
 
         std::istringstream stream{buffer};
         boost::archive::portable_binary_iarchive archive{stream};
@@ -867,14 +1640,13 @@ TEST(i2p_address, boost_serialize_unknown)
     EXPECT_TRUE(i2p.is_unknown());
     EXPECT_EQ(net::i2p_address::unknown(), i2p);
     EXPECT_STREQ(net::i2p_address::unknown_str(), i2p.host_str());
-    EXPECT_EQ(0u, i2p.port());
+    EXPECT_EQ(1u, i2p.port());
 }
 
 TEST(get_network_address, i2p)
 {
-    expect<epee::net_utils::network_address> address =
-        net::get_network_address("i2p", 0);
-    EXPECT_EQ(net::error::unsupported_address, address);
+    expect<epee::net_utils::network_address> address = net::get_network_address(".i2p", 0);
+    EXPECT_EQ(net::error::invalid_i2p_address, address);
 
     address = net::get_network_address(".b32.i2p", 0);
     EXPECT_EQ(net::error::invalid_i2p_address, address);
@@ -883,16 +1655,25 @@ TEST(get_network_address, i2p)
     ASSERT_TRUE(bool(address));
     EXPECT_EQ(epee::net_utils::address_type::i2p, address->get_type_id());
     EXPECT_STREQ(b32_i2p, address->host_str().c_str());
-    EXPECT_EQ(std::string{b32_i2p} + ":1000", address->str());
+    EXPECT_EQ(std::string{b32_i2p}, address->str());
 
     address = net::get_network_address(std::string{b32_i2p} + ":2000", 1000);
     ASSERT_TRUE(bool(address));
     EXPECT_EQ(epee::net_utils::address_type::i2p, address->get_type_id());
     EXPECT_STREQ(b32_i2p, address->host_str().c_str());
-    EXPECT_EQ(std::string{b32_i2p} + ":2000", address->str());
+    EXPECT_EQ(std::string{b32_i2p}, address->str());
 
-    address = net::get_network_address(std::string{b32_i2p} + ":65536", 1000);
-    EXPECT_EQ(net::error::invalid_port, address);
+    address = net::get_network_address(standard_i2p, 1000);
+    ASSERT_TRUE(bool(address));
+    EXPECT_EQ(epee::net_utils::address_type::i2p, address->get_type_id());
+    EXPECT_STREQ(standard_i2p, address->host_str().c_str());
+    EXPECT_EQ(std::string{standard_i2p}, address->str());
+
+    address = net::get_network_address(std::string{standard_i2p} + ":2000", 1000);
+    ASSERT_TRUE(bool(address));
+    EXPECT_EQ(epee::net_utils::address_type::i2p, address->get_type_id());
+    EXPECT_STREQ(standard_i2p, address->host_str().c_str());
+    EXPECT_EQ(std::string{standard_i2p}, address->str());
 }
 
 TEST(get_network_address, ipv4)
@@ -917,6 +1698,16 @@ TEST(get_network_address, ipv4)
     EXPECT_STREQ("23.0.0.254:2000", address->str().c_str());
 }
 
+TEST(get_network_address, ipv4_mapped_ipv6)
+{
+    expect<epee::net_utils::network_address> address =
+        net::get_network_address("[::ffff:203.0.113.1]:18080", 0);
+    ASSERT_TRUE(bool(address));
+    EXPECT_EQ(epee::net_utils::address_type::ipv4, address->get_type_id());
+    EXPECT_STREQ("203.0.113.1", address->host_str().c_str());
+    EXPECT_STREQ("203.0.113.1:18080", address->str().c_str());
+}
+
 TEST(get_network_address, ipv4subnet)
 {
     expect<epee::net_utils::ipv4_network_subnet> address = net::get_ipv4_subnet_address("0.0.0.0", true);
@@ -933,6 +1724,316 @@ TEST(get_network_address, ipv4subnet)
 
     address = net::get_ipv4_subnet_address("12.34.56.78/16");
     EXPECT_STREQ("12.34.0.0/16", address->str().c_str());
+
+    address = net::get_ipv4_subnet_address("172.16.1.2/12");
+    EXPECT_STREQ("172.16.0.0/12", address->str().c_str());
+    EXPECT_TRUE(address->matches(epee::net_utils::ipv4_network_address{MAKE_IP(172,16,0,0), 0}));
+    EXPECT_TRUE(address->matches(epee::net_utils::ipv4_network_address{MAKE_IP(172,31,255,255), 0}));
+    EXPECT_FALSE(address->matches(epee::net_utils::ipv4_network_address{MAKE_IP(172,15,255,255), 0}));
+    EXPECT_FALSE(address->matches(epee::net_utils::ipv4_network_address{MAKE_IP(172,32,0,0), 0}));
+}
+
+namespace
+{
+    void na_host_and_port_test(std::string addr, std::string exp_host, std::string exp_port)
+    {
+        std::string host{"xxxxx"};
+        std::string port{"xxxxx"};
+        net::get_network_address_host_and_port(addr, host, port);
+        EXPECT_EQ(exp_host, host);
+        EXPECT_EQ(exp_port, port);
+    }
+} // anonymous namespace
+
+TEST(get_network_address_host_and_port, ipv4)
+{
+    na_host_and_port_test("9.9.9.9", "9.9.9.9", "xxxxx");
+    na_host_and_port_test("9.9.9.9:18081", "9.9.9.9", "18081");
+}
+
+TEST(get_network_address_host_and_port, ipv6)
+{
+    na_host_and_port_test("::ffff", "::ffff", "xxxxx");
+    na_host_and_port_test("[::ffff]", "::ffff", "xxxxx");
+    na_host_and_port_test("[::ffff]:00231", "::ffff", "00231");
+    na_host_and_port_test("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "xxxxx");
+    na_host_and_port_test("[7777:7777:7777:7777:7777:7777:7777:7777]", "7777:7777:7777:7777:7777:7777:7777:7777", "xxxxx");
+    na_host_and_port_test("[7777:7777:7777:7777:7777:7777:7777:7777]:48080", "7777:7777:7777:7777:7777:7777:7777:7777", "48080");
+}
+
+TEST(get_network_address_host_and_port, hostname)
+{
+    na_host_and_port_test("localhost", "localhost", "xxxxx");
+    na_host_and_port_test("bar:29080", "bar", "29080"); // Issue https://github.com/monero-project/monero/issues/8633
+    na_host_and_port_test("xmrchain.net:18081", "xmrchain.net", "18081");
+}
+
+TEST(scheme_and_authority, basic)
+{
+    const auto check = [] (const net::scheme_and_authority& actual, const boost::string_ref scheme, const boost::string_ref authority)
+    {
+        EXPECT_EQ(actual.scheme, scheme);
+        EXPECT_EQ(actual.authority, authority);
+    };
+
+    // valid (some ipv6 hostnames are non-standard but allowed)
+    check(net::scheme_and_authority{"socks://host:port/path"}, "socks", "host:port");
+    check(net::scheme_and_authority{"socks://[::ffff]:8080/path"}, "socks", "[::ffff]:8080");
+    check(net::scheme_and_authority{"socks://192.168.0.1/path"}, "socks", "192.168.0.1");
+    check(net::scheme_and_authority{"socks://host"}, "socks", "host");
+    check(net::scheme_and_authority{"socks://@host"}, "socks", "@host");
+    check(net::scheme_and_authority{"socks://user:pass@host"}, "socks", "user:pass@host");
+    check(net::scheme_and_authority{"host:port/path"}, "", "host:port");
+    check(net::scheme_and_authority{"[::ffff]:8080/path"}, "", "[::ffff]:8080");
+    check(net::scheme_and_authority{"192.168.0.1/path"}, "", "192.168.0.1");
+    check(net::scheme_and_authority{"host"}, "", "host");
+    check(net::scheme_and_authority{"192.168.0.1"}, "", "192.168.0.1");
+    check(net::scheme_and_authority{"192.168.0.1:80/path"}, "", "192.168.0.1:80");
+    check(net::scheme_and_authority{"::ffff"}, "", "::ffff");
+    check(net::scheme_and_authority{"[::ffff]:8080"}, "", "[::ffff]:8080");
+    check(net::scheme_and_authority{"example.com/some://valid/path"}, "", "example.com");
+
+    // unsupported URIs (URN cases)
+    check(net::scheme_and_authority{"urn:isbn:number"}, "", "urn:isbn:number");
+    check(net::scheme_and_authority{"urn:isbn/number"}, "", "urn:isbn");
+
+    // invalid cases _not_ strictly rejected until hostname is parsed fully
+    check(net::scheme_and_authority{""}, "", "");
+    check(net::scheme_and_authority{"socks://"}, "socks", "");
+    check(net::scheme_and_authority{"socks:/"}, "", "socks:");
+    check(net::scheme_and_authority{"192.168.0.1:80://"}, "", "192.168.0.1:80:");
+    check(net::scheme_and_authority{"user@::ffff:443"}, "", "user@::ffff:443");
+    check(net::scheme_and_authority{"socks://user:p%61ss@ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff:8080"}, "socks", "user:p%61ss@ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff:8080");
+}
+
+
+TEST(userinfo_and_hostport, basic)
+{
+    const auto check = [] (const net::userinfo_and_hostport& actual, const boost::string_ref userinfo, const boost::string_ref hostport)
+    {
+        EXPECT_EQ(actual.userinfo, userinfo);
+        EXPECT_EQ(actual.hostport, hostport);
+    };
+
+    check(net::userinfo_and_hostport{"@host:port"}, "", "host:port");
+    check(net::userinfo_and_hostport{"host:port"}, "", "host:port");
+    check(net::userinfo_and_hostport{"[::ffff]"}, "", "[::ffff]");
+    check(net::userinfo_and_hostport{"::ffff"}, "", "::ffff");
+    check(net::userinfo_and_hostport{"user@[::ffff]"}, "user", "[::ffff]");
+    check(net::userinfo_and_hostport{"user:%70ass@192.168.0.1"}, "user:%70ass", "192.168.0.1");
+    check(net::userinfo_and_hostport{"user:pass@host:8080"}, "user:pass", "host:8080");
+
+    // invalid hostname not strictly rejected
+    check(net::userinfo_and_hostport{""}, "", "");
+    check(net::userinfo_and_hostport{"@"}, "", "");
+    check(net::userinfo_and_hostport{":@"}, ":", "");
+    check(net::userinfo_and_hostport{"user@::ffff:443"}, "user", "::ffff:443");
+}
+
+TEST(user_and_pass, basic)
+{
+    const auto check = [] (
+        const std::optional<net::user_and_pass>& actual,
+        const std::optional<std::string>& user = std::nullopt,
+        const boost::string_ref pass = "")
+    {
+        ASSERT_EQ(bool(actual), bool(user));
+        if (actual)
+        {
+            EXPECT_EQ(actual->user, *user);
+            EXPECT_EQ(actual->pass, pass);
+        }
+    };
+
+    check(net::user_and_pass::get(""), std::string{""}, "");
+    check(net::user_and_pass::get("user"), std::string{"user"}, "");
+    check(net::user_and_pass::get("user:"), std::string{"user"}, "");
+    check(net::user_and_pass::get(":pass"), std::string{}, "pass");
+    check(net::user_and_pass::get("user:pass"), std::string("user"), "pass");
+    check(net::user_and_pass::get("user:p%3Ass"), std::string("user"), "p:ss");
+    check(net::user_and_pass::get("%2fser:"), std::string{"/ser"}, "");
+    check(net::user_and_pass::get("user:pas%21"), std::string{"user"}, "pas!");
+    check(net::user_and_pass::get("user::pass"), std::string{"user"}, ":pass");
+    check(net::user_and_pass::get("user%3A:pass"), std::string{"user:"}, "pass");
+    check(net::user_and_pass::get("%25%3A:pass"), std::string{"%:"}, "pass");
+    check(net::user_and_pass::get("user:%00%FF"), std::string{"user"}, boost::string_ref{"\x00\xFF", 2});
+
+    // invalid percent encodings
+    check(net::user_and_pass::get("user%3T"));
+    check(net::user_and_pass::get("user%T"));
+    check(net::user_and_pass::get("user%3"));
+    check(net::user_and_pass::get("user%"));
+}
+
+TEST(uri_components, get)
+{
+    const auto check = [] (
+        const std::optional<net::uri_components>& actual,
+        const std::optional<std::string>& scheme = std::nullopt,
+        const boost::string_ref user = "",
+        const boost::string_ref pass = "",
+        const boost::string_ref hostport = "")
+    {
+        ASSERT_EQ(bool(actual), bool(scheme));
+        if (actual)
+        {
+            EXPECT_EQ(actual->scheme, *scheme);
+            EXPECT_EQ(actual->userinfo.user, user);
+            EXPECT_EQ(actual->userinfo.pass, pass);
+            EXPECT_EQ(actual->hostport, hostport);
+        }
+    };
+
+    // valid (some ipv6 hostnames are non-standard but allowed)
+    check(net::uri_components::get("socks://host:port/path"), std::string{"socks"}, "", "", "host:port");
+    check(net::uri_components::get("socks://[::ffff]:8080/path"), std::string{"socks"}, "", "", "[::ffff]:8080");
+    check(net::uri_components::get("socks://192.168.0.1/path"), "socks", "", "", "192.168.0.1");
+    check(net::uri_components::get("socks://host"), "socks", "", "", "host");
+    check(net::uri_components::get("socks://@host"), std::string{"socks"}, "", "", "host");
+    check(net::uri_components::get("socks://:@host"), std::string{"socks"}, "", "", "host");
+    check(net::uri_components::get("socks://user:@host"), std::string{"socks"}, "user", "", "host");
+    check(net::uri_components::get("socks://:pass@host"), std::string{"socks"}, "", "pass", "host");
+    check(net::uri_components::get("socks://user:pass@host"), std::string{"socks"}, "user", "pass", "host");
+    check(net::uri_components::get("host:port/path"), "", "", "", "host:port");
+    check(net::uri_components::get("[::ffff]:8080/path"), "", "", "", "[::ffff]:8080");
+    check(net::uri_components::get("192.168.0.1/path"), "", "", "", "192.168.0.1");
+    check(net::uri_components::get("host"), "", "", "", "host");
+    check(net::uri_components::get("192.168.0.1"), "", "", "", "192.168.0.1");
+    check(net::uri_components::get("192.168.0.1:80/path"), "", "", "", "192.168.0.1:80");
+    check(net::uri_components::get("::ffff"), std::string{}, "", "", "::ffff");
+    check(net::uri_components::get("[::ffff]:8080"), std::string{}, "", "", "[::ffff]:8080");
+    check(net::uri_components::get("example.com/some://valid/path"), "", "", "", "example.com");
+
+    // unsupported URIs (URN cases)
+    check(net::uri_components::get("urn:isbn:number"), std::string{}, "", "", "urn:isbn:number");
+    check(net::uri_components::get("urn:isbn/number"), std::string{}, "", "", "urn:isbn");
+
+    // invalid cases _not_ strictly rejected until hostname is parsed fully
+    check(net::uri_components::get(""), std::string{}, "", "", "");
+    check(net::uri_components::get("socks://"), std::string{"socks"}, "", "", "");
+    check(net::uri_components::get("socks:/"), std::string{}, "", "", "socks:");
+    check(net::uri_components::get("192.168.0.1:80://"), std::string{}, "", "", "192.168.0.1:80:");
+    check(net::uri_components::get("user@::ffff:443"), std::string{}, "user", "", "::ffff:443");
+    check(net::uri_components::get("socks://user:p%61ss@ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff:8080"), std::string{"socks"}, "user", "pass", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff:8080");
+
+    // invalid percent encodings
+    check(net::uri_components::get("scheme://user%3T@host"));
+    check(net::uri_components::get("user%T@host"));
+    check(net::uri_components::get("scheme://user:%3pass@host"));
+    check(net::uri_components::get("user%@host"));
+}
+
+TEST(socks_endpoint, get)
+{
+    namespace ip = boost::asio::ip;
+    const auto check = [] (
+        const expect<net::socks::endpoint>& actual,
+        const std::optional<boost::asio::ip::address>& address = std::nullopt,
+        const std::uint16_t port = 0,
+        const boost::string_ref user = "",
+        const boost::string_ref pass = "",
+        const net::socks::version ver = net::socks::version::v4a)
+    {
+        ASSERT_EQ(bool(actual), bool(address)) << actual.error().message();
+        if (actual)
+        {
+            EXPECT_EQ(actual->address.address(), address);
+            EXPECT_EQ(actual->address.port(), port);
+            EXPECT_TRUE(actual->resolved_addresses.empty());
+            EXPECT_EQ(actual->userinfo.user, user);
+            EXPECT_EQ(actual->userinfo.pass, pass);
+            EXPECT_EQ(actual->ver, ver);
+        }
+    };
+
+    check(net::socks::endpoint::get("socks://[::ffff]:8080/path"), ip::make_address_v6("::ffff"), 8080, "", "", net::socks::version::v4a);
+    check(net::socks::endpoint::get("socks5://user:%70ass@[::ffff]:8080/path"), ip::make_address_v6("::ffff"), 8080, "user", "pass", net::socks::version::v5);
+    check(net::socks::endpoint::get("socks4a://192.168.0.1:1/path"), ip::make_address_v4("192.168.0.1"), 1, "", "", net::socks::version::v4a);
+    check(net::socks::endpoint::get("socks5://%75@192.168.0.1:1/path"), ip::make_address_v4("192.168.0.1"), 1, "u", "", net::socks::version::v5);
+    check(net::socks::endpoint::get("[::ffff]:8080/path"), ip::make_address_v6("::ffff"), 8080, "", "", net::socks::version::v4a);
+    check(net::socks::endpoint::get("192.168.0.1:50"), ip::make_address_v4("192.168.0.1"), 50, "", "", net::socks::version::v4a);
+    check(net::socks::endpoint::get("192.168.0.1:80/path"), ip::make_address_v4("192.168.0.1"), 80, "", "", net::socks::version::v4a);
+
+    // URNs should be rejected
+    check(net::socks::endpoint::get("urn:isbn:number"));
+    check(net::socks::endpoint::get("urn:isbn/number"));
+
+    // port required for socks
+    check(net::socks::endpoint::get("socks5://192.168.0.1/path"));
+    check(net::socks::endpoint::get("192.168.0.1/path"));
+    check(net::socks::endpoint::get("::ffff"));
+
+    // hostnames are rejected unless explicitly requested
+    check(net::socks::endpoint::get("socks://host:/path"));
+    check(net::socks::endpoint::get("socks://host:1"));
+    check(net::socks::endpoint::get("socks://@host:1"));
+    check(net::socks::endpoint::get("socks://:@host:1"));
+    check(net::socks::endpoint::get("socks://user:@host:1"));
+    check(net::socks::endpoint::get("socks://:pass@host:1"));
+    check(net::socks::endpoint::get("socks://user:pass@host:1"));
+    check(net::socks::endpoint::get("host:1"));
+    check(net::socks::endpoint::get("host:1/path"));
+    check(net::socks::endpoint::get("example.com:1/some://valid/path"));
+
+    // invalid cases rejected - more bad hostnames
+    check(net::socks::endpoint::get(""));
+    check(net::socks::endpoint::get("socks://"));
+    check(net::socks::endpoint::get("socks:/"));
+    check(net::socks::endpoint::get("192.168.0.1:80://"));
+    check(net::socks::endpoint::get("::ffff:443"));
+    check(net::socks::endpoint::get("socks5://user:p%61ss@ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff:8080"));
+
+    // invalid percent encodings
+    check(net::socks::endpoint::get("sock5://user%3T@127.0.0.1:1"));
+    check(net::socks::endpoint::get("socks5::user%T@127.0.0.1:1"));
+    check(net::socks::endpoint::get("socks5://user:%3pass@127.0.0.1:1"));
+    check(net::socks::endpoint::get("socks5://user%@127.0.0.1:1"));
+
+    // user+pass requires socks5
+    check(net::socks::endpoint::get("socks://user:pass@[::ffff]:8080"));
+}
+
+TEST(socks_endpoint, resolve_proxy_hostname)
+{
+    const auto proxy = net::socks::endpoint::get("socks5://user:pass@localhost:9050", true);
+    ASSERT_TRUE(proxy) << proxy.error().message();
+    ASSERT_FALSE(proxy->resolved_addresses.empty());
+    EXPECT_EQ(proxy->address, proxy->resolved_addresses.front());
+    EXPECT_EQ(proxy->userinfo.user, "user");
+    EXPECT_EQ(proxy->userinfo.pass, "pass");
+    EXPECT_EQ(proxy->ver, net::socks::version::v5);
+    for (const auto& address : proxy->resolved_addresses)
+    {
+        EXPECT_TRUE(address.address().is_loopback());
+        EXPECT_EQ(address.port(), 9050);
+    }
+
+    EXPECT_FALSE(net::socks::endpoint::get("localhost:9050"));
+    EXPECT_FALSE(net::socks::endpoint::get("localhost:0", true));
+    EXPECT_FALSE(net::socks::endpoint::get("localhost:bad", true));
+    const auto check_hidden_service = [](const std::string& host)
+    {
+        const auto endpoint = net::socks::endpoint::get(host + ":9050", true);
+        ASSERT_FALSE(endpoint);
+        EXPECT_EQ(endpoint.error(), make_error_code(net::error::invalid_host));
+    };
+    check_hidden_service(v3_onion);
+    check_hidden_service(v3_onion_upper);
+    check_hidden_service(std::string{v3_onion} + ".");
+    check_hidden_service(b32_i2p);
+    check_hidden_service(b32_i2p_upper);
+    check_hidden_service(std::string{b32_i2p} + ".");
+
+    const auto check_repeated_dot = [](const boost::string_ref host)
+    {
+        const auto endpoint = net::socks::endpoint::get(host, true);
+        ASSERT_FALSE(endpoint);
+        EXPECT_EQ(endpoint.error(), make_error_code(net::error::invalid_host));
+    };
+    check_repeated_dot("localhost..:9050");
+    check_repeated_dot("example.onion..:9050");
+    check_repeated_dot("example.i2p..:9050");
+    check_repeated_dot("example..com:9050");
 }
 
 namespace
@@ -941,8 +2042,8 @@ namespace
 
     struct io_thread
     {
-        boost::asio::io_service io_service;
-        boost::asio::io_service::work work;
+        boost::asio::io_context io_service;
+        boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
         stream_type::socket server;
         stream_type::acceptor acceptor;
         boost::thread io;
@@ -950,7 +2051,7 @@ namespace
 
         io_thread()
           : io_service(),
-            work(io_service),
+            work(io_service.get_executor()),
             server(io_service),
             acceptor(io_service),
             io([this] () { try { this->io_service.run(); } catch (const std::exception& e) { MERROR(e.what()); }}),
@@ -990,7 +2091,7 @@ namespace
 
 TEST(socks_client, unsupported_command)
 {
-    boost::asio::io_service io_service{};
+    boost::asio::io_context io_service{};
     stream_type::socket client{io_service};
 
     auto test_client = net::socks::make_connect_client(
@@ -1004,11 +2105,63 @@ TEST(socks_client, unsupported_command)
 
     EXPECT_FALSE(test_client->set_resolve_command("example.com"));
     EXPECT_TRUE(test_client->buffer().empty());
+
+    EXPECT_FALSE(test_client->set_connect_command(epee::net_utils::ipv6_network_address{}));
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    test_client = net::socks::make_connect_client(
+        stream_type::socket{io_service}, net::socks::version::v5, std::bind( [] {} )
+    );
+    ASSERT_TRUE(bool(test_client));
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    net::user_and_pass userinfo{};
+    userinfo.user = std::string(256, 'a');
+
+    EXPECT_FALSE(test_client->set_connect_command(userinfo.user, 8080));
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    EXPECT_FALSE(test_client->set_connect_command("a", 8080, std::addressof(userinfo)));
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    EXPECT_FALSE(
+        test_client->set_connect_command(
+          epee::net_utils::ipv4_network_address{}, std::addressof(userinfo)
+        )
+    );
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    EXPECT_FALSE(
+        test_client->set_connect_command(
+          epee::net_utils::ipv6_network_address{}, std::addressof(userinfo)
+        )
+    );
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    userinfo.pass = std::move(userinfo.user);
+    userinfo.user.clear();
+
+    EXPECT_FALSE(test_client->set_connect_command("a", 8080, std::addressof(userinfo)));
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    EXPECT_FALSE(
+        test_client->set_connect_command(
+          epee::net_utils::ipv4_network_address{}, std::addressof(userinfo)
+        )
+    );
+    EXPECT_TRUE(test_client->buffer().empty());
+
+    EXPECT_FALSE(
+        test_client->set_connect_command(
+          epee::net_utils::ipv6_network_address{}, std::addressof(userinfo)
+        )
+    );
+    EXPECT_TRUE(test_client->buffer().empty());
 }
 
 TEST(socks_client, no_command)
 {
-    boost::asio::io_service io_service{};
+    boost::asio::io_context io_service{};
     stream_type::socket client{io_service};
 
     auto test_client = net::socks::make_connect_client(
@@ -1051,6 +2204,62 @@ TEST(socks_client, connect_command)
     while (!called);
 }
 
+TEST(socks_client, v5_ipv6_connect_command)
+{
+    io_thread io{};
+    stream_type::socket client{io.io_service};
+
+    const boost::asio::ip::address_v6::bytes_type address{0xDE, 0xAD, 0xBE, 0xEF};
+
+    std::atomic<bool> called{false};
+    auto test_client = net::socks::make_connect_client(
+        std::move(client), net::socks::version::v5, checked_client{std::addressof(called), false}
+    );
+    ASSERT_TRUE(bool(test_client));
+
+    ASSERT_TRUE(
+        test_client->set_connect_command(
+            epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6{address}, 80}
+        )
+    );
+    EXPECT_FALSE(test_client->buffer().empty());
+    ASSERT_TRUE(net::socks::client::connect_and_send(std::move(test_client), io.acceptor.local_endpoint()));
+    while (!io.connected)
+        ASSERT_FALSE(called);
+
+    {
+        const std::uint8_t expected_bytes[] = {5, 1, 0};
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {5, 0};
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+    {
+        const std::uint8_t expected_bytes[] = {
+            5, 1, 0, 4, 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0x50
+        };
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {
+            5, 0, 0, 4, 0xBE, 0xEF, 0xDE, 0xAD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0x50
+        };
+
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+
+    // yikes!
+    while (!called);
+}
+
+
 TEST(socks_client, connect_command_failed)
 {
     io_thread io{};
@@ -1087,6 +2296,56 @@ TEST(socks_client, connect_command_failed)
     while (!called);
 }
 
+
+TEST(socks_client, v5_ipv4_connect_command_failed)
+{
+    io_thread io{};
+    stream_type::socket client{io.io_service};
+
+    std::atomic<bool> called{false};
+    auto test_client = net::socks::make_connect_client(
+        std::move(client), net::socks::version::v5, checked_client{std::addressof(called), true}
+    );
+    ASSERT_TRUE(bool(test_client));
+
+    ASSERT_TRUE(
+        test_client->set_connect_command(
+            epee::net_utils::ipv4_network_address{boost::endian::native_to_big(std::uint32_t(5000)), 80}
+        )
+    );
+    EXPECT_FALSE(test_client->buffer().empty());
+    ASSERT_TRUE(net::socks::client::connect_and_send(std::move(test_client), io.acceptor.local_endpoint()));
+    while (!io.connected)
+        ASSERT_FALSE(called);
+
+    {
+        const std::uint8_t expected_bytes[] = {5, 1, 0};
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {5, 0};
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+    {
+        const std::uint8_t expected_bytes[] = {
+            5, 1, 0, 1, 0, 0, 0x13, 0x88, 0, 0x50
+        };
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {5, 2, 0, 1, 0, 0, 0, 0, 0, 0x50};
+
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+
+    // yikes!
+    while (!called);
+}
+
 TEST(socks_client, resolve_command)
 {
     static std::uint8_t reply_bytes[] = {0, 90, 0, 0, 0xff, 0, 0xad, 0};
@@ -1102,7 +2361,7 @@ TEST(socks_client, resolve_command)
           , expected_(false)
         {};
 
-        virtual void done(boost::system::error_code error, std::shared_ptr<client> self) override
+        virtual void done(boost::system::error_code error, const std::shared_ptr<client>& self) override
         {
             EXPECT_EQ(this, self.get());
             EXPECT_EQ(expected_, bool(error)) << "Resolve failure: " << error.message();
@@ -1158,14 +2417,157 @@ TEST(socks_client, resolve_command)
     while (test_client->called_ == 1);
 }
 
+TEST(socks_client, v5_username_host_connect_with_domain_reply)
+{
+    struct domain_reply_client : net::socks::client
+    {
+        std::atomic<bool>& called_;
+
+        domain_reply_client(stream_type::socket&& proxy, std::atomic<bool>& called)
+          : net::socks::client(std::move(proxy), net::socks::version::v5), called_(called)
+        {}
+
+        virtual void done(boost::system::error_code error, const std::shared_ptr<client>& self) override
+        {
+            EXPECT_EQ(this, self.get());
+            EXPECT_FALSE(error) << "Socks server: " << error.message();
+
+            const std::uint8_t expected_bytes[] = {
+                5, 0, 0, 3, 11, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0, 0x50
+            };
+            EXPECT_EQ(sizeof(expected_bytes), buffer().size());
+            if (buffer().size() == sizeof(expected_bytes))
+            {
+                EXPECT_EQ(0, std::memcmp(expected_bytes, buffer().data(), sizeof(expected_bytes)));
+            }
+
+            called_ = true;
+        }
+    };
+
+    io_thread io{};
+    stream_type::socket client{io.io_service};
+
+    std::atomic<bool> called{false};
+    auto test_client = std::make_shared<domain_reply_client>(std::move(client), called);
+    ASSERT_TRUE(bool(test_client));
+
+    const auto userinfo =
+        net::user_and_pass::get("user:pass").value_or(net::user_and_pass{});
+    ASSERT_TRUE(
+        test_client->set_connect_command("example.com", 80, std::addressof(userinfo))
+    );
+    EXPECT_FALSE(test_client->buffer().empty());
+    ASSERT_TRUE(net::socks::client::connect_and_send(test_client, io.acceptor.local_endpoint()));
+    while (!io.connected)
+        ASSERT_FALSE(called);
+
+    {
+        const std::uint8_t expected_bytes[] = {5, 2, 0, 2};
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {5, 2};
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+    {
+        const std::uint8_t expected_bytes[] = {
+            1, 4, 'u', 's', 'e', 'r', 4, 'p', 'a', 's', 's'
+        };
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {1, 0};
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+    {
+        const std::uint8_t expected_bytes[] = {
+            5, 1, 0, 3, 11, 'e','x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o',
+            'm', 0, 0x50
+        };
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_header[] = {5, 0, 0, 3, 11};
+        boost::asio::write(io.server, boost::asio::buffer(reply_header));
+
+        const std::uint8_t reply_address[] = {
+            'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0, 0x50
+        };
+        boost::asio::write(io.server, boost::asio::buffer(reply_address));
+    }
+
+    // yikes!
+    while (!called);
+}
+
+TEST(socks_client, v5_usernameskipped_host_connect)
+{
+    io_thread io{};
+    stream_type::socket client{io.io_service};
+
+    std::atomic<bool> called{false};
+    auto test_client = net::socks::make_connect_client(
+        std::move(client), net::socks::version::v5, checked_client{std::addressof(called), false}
+    );
+    ASSERT_TRUE(bool(test_client));
+
+    const auto userinfo =
+        net::user_and_pass::get("user:pass").value_or(net::user_and_pass{});
+    ASSERT_TRUE(
+        test_client->set_connect_command("example.com", 80, std::addressof(userinfo))
+    );
+    EXPECT_FALSE(test_client->buffer().empty());
+    ASSERT_TRUE(net::socks::client::connect_and_send(std::move(test_client), io.acceptor.local_endpoint()));
+    while (!io.connected)
+        ASSERT_FALSE(called);
+
+    {
+        const std::uint8_t expected_bytes[] = {5, 2, 0, 2};
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {5, 0};
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+    {
+        const std::uint8_t expected_bytes[] = {
+            5, 1, 0, 3, 11, 'e','x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o',
+            'm', 0, 0x50
+        };
+
+        std::uint8_t actual_bytes[sizeof(expected_bytes)];
+        boost::asio::read(io.server, boost::asio::buffer(actual_bytes));
+        EXPECT_TRUE(std::memcmp(expected_bytes, actual_bytes, sizeof(actual_bytes)) == 0);
+
+        const std::uint8_t reply_bytes[] = {
+            5, 0, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF, 0x50, 00
+        };
+        boost::asio::write(io.server, boost::asio::buffer(reply_bytes));
+    }
+
+    // yikes!
+    while (!called);
+}
+
 TEST(socks_connector, host)
 {
     io_thread io{};
     boost::asio::steady_timer timeout{io.io_service};
-    timeout.expires_from_now(std::chrono::seconds{5});
+    timeout.expires_after(std::chrono::seconds{5});
 
     boost::unique_future<boost::asio::ip::tcp::socket> sock =
-        net::socks::connector{io.acceptor.local_endpoint()}("example.com", "8080", timeout);
+        net::socks::connector{
+            std::make_shared<net::socks::endpoint>(io.acceptor.local_endpoint())
+        }("example.com", "8080", timeout);
 
     while (!io.connected)
         ASSERT_FALSE(sock.is_ready());
@@ -1189,10 +2591,12 @@ TEST(socks_connector, ipv4)
 {
     io_thread io{};
     boost::asio::steady_timer timeout{io.io_service};
-    timeout.expires_from_now(std::chrono::seconds{5});
+    timeout.expires_after(std::chrono::seconds{5});
 
     boost::unique_future<boost::asio::ip::tcp::socket> sock =
-        net::socks::connector{io.acceptor.local_endpoint()}("250.88.125.99", "8080", timeout);
+        net::socks::connector{
+            std::make_shared<net::socks::endpoint>(io.acceptor.local_endpoint())
+        }("250.88.125.99", "8080", timeout);
 
     while (!io.connected)
         ASSERT_FALSE(sock.is_ready());
@@ -1215,10 +2619,12 @@ TEST(socks_connector, error)
 {
     io_thread io{};
     boost::asio::steady_timer timeout{io.io_service};
-    timeout.expires_from_now(std::chrono::seconds{5});
+    timeout.expires_after(std::chrono::seconds{5});
 
     boost::unique_future<boost::asio::ip::tcp::socket> sock =
-        net::socks::connector{io.acceptor.local_endpoint()}("250.88.125.99", "8080", timeout);
+        net::socks::connector{
+            std::make_shared<net::socks::endpoint>(io.acceptor.local_endpoint())
+        }("250.88.125.99", "8080", timeout);
 
     while (!io.connected)
         ASSERT_FALSE(sock.is_ready());
@@ -1241,10 +2647,12 @@ TEST(socks_connector, timeout)
 {
     io_thread io{};
     boost::asio::steady_timer timeout{io.io_service};
-    timeout.expires_from_now(std::chrono::milliseconds{10});
+    timeout.expires_after(std::chrono::milliseconds{10});
 
     boost::unique_future<boost::asio::ip::tcp::socket> sock =
-        net::socks::connector{io.acceptor.local_endpoint()}("250.88.125.99", "8080", timeout);
+        net::socks::connector{
+            std::make_shared<net::socks::endpoint>(io.acceptor.local_endpoint())
+        }("250.88.125.99", "8080", timeout);
 
     ASSERT_EQ(boost::future_status::ready, sock.wait_for(boost::chrono::seconds{3}));
     EXPECT_THROW(sock.get().is_open(), boost::system::system_error);

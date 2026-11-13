@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -32,7 +32,6 @@
 
 #include <atomic>
 
-#include <boost/asio/io_service.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
 #include "include_base_utils.h"
@@ -189,7 +188,7 @@ namespace net_load_tests
         LOG_PRINT_L0("Connection isn't opened");
         return false;
       }
-      if (!m_tcp_server.get_config_object().close(m_connections[idx]))
+      if (!m_tcp_server.get_config_object().close(m_connections[idx], true))
       {
         LOG_PRINT_L0("Close connection error: " << m_connections[idx]);
         if (!ignore_close_fails)

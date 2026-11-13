@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020, The Monero Project
+// Copyright (c) 2019-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -120,7 +120,7 @@ namespace levin
       copy_size = payload.remove_prefix(payload_space);
 
       if (payload.empty())
-        head.m_flags = LEVIN_PACKET_END;
+        head.m_flags = SWAP32LE(LEVIN_PACKET_END);
 
       buffer.write(as_byte_span(head));
       buffer.write(payload.data() - copy_size, copy_size);

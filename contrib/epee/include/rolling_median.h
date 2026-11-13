@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020, The Monero Project
+// Copyright (c) 2019-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -36,6 +36,7 @@
 
 #include "misc_language.h"
 
+#include <type_traits>
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -47,6 +48,9 @@ namespace misc_utils
 template<typename Item>
 struct rolling_median_t
 {
+  static_assert(std::is_trivially_copyable_v<Item>,
+    "rolling_median_t requires trivially copyable Item");
+
 private:
   Item* data;  //circular queue of values
   int*  pos;   //index into `heap` for each value
@@ -124,9 +128,29 @@ private:
      return i == 0;
   }
 
+  void consume_from(rolling_median_t& m) noexcept
+  {
+    data = m.data;
+    pos = m.pos;
+    heap = m.heap;
+    N = m.N;
+    idx = m.idx;
+    minCt = m.minCt;
+    maxCt = m.maxCt;
+    sz = m.sz;
+
+    m.data = nullptr;
+    m.pos = nullptr;
+    m.heap = nullptr;
+    m.N = 0;
+    m.idx = 0;
+    m.minCt = 0;
+    m.maxCt = 0;
+    m.sz = 0;
+  }
+
 protected:
   rolling_median_t &operator=(const rolling_median_t&) = delete;
-  rolling_median_t(const rolling_median_t&) = delete;
 
 public:
   //creates new rolling_median_t: to calculate `nItems` running median. 
@@ -139,16 +163,33 @@ public:
     clear();
   }
 
-  rolling_median_t(rolling_median_t &&m)
+  rolling_median_t(const rolling_median_t &other)
   {
-    memcpy(this, &m, sizeof(rolling_median_t));
-    m.data = NULL;
+    N = other.N;
+    int size = N * (sizeof(Item) + sizeof(int) * 2);
+    data = (Item*)malloc(size);
+    memcpy(data, other.data, size);
+    pos = (int*) (data + N);
+    heap = pos + N + (N / 2); //points to middle of storage.
+    idx = other.idx;
+    minCt = other.minCt;
+    maxCt = other.maxCt;
+    sz = other.sz;
   }
-  rolling_median_t &operator=(rolling_median_t &&m)
+
+  rolling_median_t(rolling_median_t &&m) noexcept
   {
-    free(data);
-    memcpy(this, &m, sizeof(rolling_median_t));
-    m.data = NULL;
+    consume_from(m);
+  }
+
+  rolling_median_t &operator=(rolling_median_t &&m) noexcept
+  {
+    if (this != &m)
+    {
+      free(data);
+      consume_from(m);
+    }
+
     return *this;
   }
 

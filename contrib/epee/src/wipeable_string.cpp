@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -27,6 +27,7 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <boost/optional/optional.hpp>
+#include <limits>
 #include <string.h>
 #include "memwipe.h"
 #include "misc_log_ex.h"
@@ -258,6 +259,14 @@ wipeable_string &wipeable_string::operator=(const wipeable_string &other)
   if (&other != this)
     buffer = other.buffer;
   return *this;
+}
+
+char& wipeable_string::at(size_t idx) {
+  return buffer.at(idx);
+}
+
+const char& wipeable_string::at(size_t idx) const {
+  return buffer.at(idx);
 }
 
 }

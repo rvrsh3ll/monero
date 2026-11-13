@@ -1,4 +1,5 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2020-2024, The Monero Project
+
 //
 // All rights reserved.
 //
@@ -73,6 +74,7 @@ namespace epee
   public:
     using char_type = std::uint8_t;
     using Ch = char_type;
+    using value_type = char_type;
 
     //! Increase internal buffer by at least `byte_stream_increase` bytes.
     byte_stream() noexcept
@@ -85,6 +87,7 @@ namespace epee
     ~byte_stream() noexcept = default;
     byte_stream& operator=(byte_stream&& rhs) noexcept;
 
+    std::uint8_t* data() noexcept { return buffer_.get(); }
     const std::uint8_t* data() const noexcept { return buffer_.get(); }
     std::uint8_t* tellp() const noexcept { return next_write_; }
     std::size_t available() const noexcept { return end_ - next_write_; }
@@ -150,7 +153,7 @@ namespace epee
       put_unsafe(ch);
     }
 
-    /*! Copy `ch` to end of stream. Provides rapidjson compatability.
+    /*! Copy `ch` to end of stream. Provides rapidjson compatibility.
         \throw std::range_error if exceeding max `size_t` value.
         \throw std::bad_alloc if allocation fails. */
     void Put(const std::uint8_t ch)
@@ -191,21 +194,21 @@ namespace epee
     byte_buffer take_buffer() noexcept;
   };
 
-  //! Compatability/optimization for rapidjson.
+  //! Compatibility/optimization for rapidjson.
 
   inline void PutReserve(byte_stream& dest, const std::size_t length)
   {
     dest.reserve(length);
   }
 
-  //! Compatability/optimization for rapidjson.
+  //! Compatibility/optimization for rapidjson.
 
   inline void PutUnsafe(byte_stream& dest, const std::uint8_t ch)
   {
     dest.put_unsafe(ch);
   }
 
-  //! Compability/optimization for rapidjson.
+  //! Compatibility/optimization for rapidjson.
   inline void PutN(byte_stream& dest, const std::uint8_t ch, const std::size_t count)
   {
     dest.put_n(ch, count);

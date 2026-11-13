@@ -1,11 +1,17 @@
-freebsd_CC=clang-8
-freebsd_CXX=clang++-8
+freebsd_CC=env -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
+               -u OBJC_INCLUDE_PATH -u OBJCPLUS_INCLUDE_PATH -u CPATH \
+               -u LIBRARY_PATH clang --target=$(host) --sysroot=$(build_prefix)/sysroot -iwithsysroot/usr/include
+freebsd_CXX=env -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
+                -u OBJC_INCLUDE_PATH -u OBJCPLUS_INCLUDE_PATH -u CPATH \
+                -u LIBRARY_PATH clang++ --target=$(host) -stdlib=libc++ --sysroot=$(build_prefix)/sysroot \
+                -iwithsysroot/usr/include/c++/v1 -iwithsysroot/usr/include
+
 freebsd_AR=ar
 freebsd_RANLIB=ranlib
 freebsd_NM=nm
 
-freebsd_CFLAGS=-pipe
-freebsd_CXXFLAGS=$(freebsd_CFLAGS)
+freebsd_CFLAGS=-pipe -std=$(C_STANDARD)
+freebsd_CXXFLAGS=-pipe -std=$(CXX_STANDARD)
 freebsd_ARFLAGS=cr
 
 freebsd_release_CFLAGS=-O2
@@ -16,3 +22,4 @@ freebsd_debug_CXXFLAGS=$(freebsd_debug_CFLAGS)
 
 freebsd_native_toolchain=freebsd_base
 
+freebsd_cmake_system=FreeBSD

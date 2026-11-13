@@ -1,0 +1,1205 @@
+// Copyright (c) 2023-2026, The Monero Project
+//
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification, are
+// permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice, this list of
+//    conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list
+//    of conditions and the following disclaimer in the documentation and/or other
+//    materials provided with the distribution.
+//
+// 3. Neither the name of the copyright holder nor the names of its contributors may be
+//    used to endorse or promote products derived from this software without specific
+//    prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+// THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+// THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#include "unit_tests_utils.h"
+#include "gtest/gtest.h"
+
+#include <cctype>
+
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
+
+#include "file_io_utils.h"
+#include "serialization/binary_utils.h"
+#include "wallet/wallet2.h"
+#include "common/util.h"
+
+using namespace boost::filesystem;
+using namespace epee::file_io_utils;
+
+static constexpr const char WALLET_00fd416a_PRIMARY_ADDRESS[] =
+    "45p2SngJAPSJbqSiUvYfS3BfhEdxZmv8pDt25oW1LzxrZv9Uq6ARagiFViMGUE3gJk5VPWingCXVf1p2tyAy6SUeSHPhbve";
+
+// https://github.com/monero-project/monero/blob/67d190ce7c33602b6a3b804f633ee1ddb7fbb4a1/src/wallet/wallet2.cpp#L156
+static constexpr const char WALLET2_ASCII_OUTPUT_MAGIC[] = "MoneroAsciiDataV1";
+
+class wallet_accessor_test
+{
+public:
+    static void set_monero_c_passphrase(tools::wallet2 &wallet, const std::string &passphrase)
+    {
+        auto &keys = const_cast<cryptonote::account_keys&>(wallet.get_account().get_keys());
+        keys.m_monero_c_passphrase.buffer.assign(passphrase.begin(), passphrase.end());
+    }
+
+    static bool has_custom_background_key(const tools::wallet2 &wallet)
+    {
+        return !!wallet.m_custom_background_key;
+    }
+
+    static bool watch_only_keys_contain_custom_background_key(tools::wallet2 &wallet,
+        const epee::wipeable_string &original_password, const epee::wipeable_string &watch_only_password)
+    {
+        crypto::chacha_key original_key, watch_only_key;
+        wallet.generate_chacha_key_from_password(original_password, original_key);
+        wallet.generate_chacha_key_from_password(watch_only_password, watch_only_key);
+        const auto keys_file_data = wallet.get_keys_file_data(watch_only_key, original_key, true, false, true);
+        if (!keys_file_data)
+            return false;
+        std::string json(keys_file_data->account_data.size(), '\0');
+        crypto::chacha20(keys_file_data->account_data.data(), keys_file_data->account_data.size(),
+            watch_only_key, keys_file_data->iv, &json[0]);
+        const bool contains_key = json.find("\"custom_background_key\"") != std::string::npos;
+        memwipe(&json[0], json.size());
+        return contains_key;
+    }
+
+    static void set_balance_test_data(tools::wallet2 &wallet)
+    {
+        while (wallet.m_blockchain.size() <= CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE)
+            wallet.m_blockchain.push_back(crypto::null_hash);
+        wallet.m_transfers.clear();
+        wallet.m_unconfirmed_txs.clear();
+        wallet.m_unconfirmed_payments.clear();
+
+        const auto add_transfer = [&](uint32_t major, uint32_t minor, uint64_t amount,
+                                      bool spent = false, uint64_t spent_height = 0,
+                                      bool frozen = false, uint64_t block_height = 0)
+        {
+            tools::wallet2::transfer_details td{};
+            td.m_subaddr_index = {major, minor};
+            td.m_amount = amount;
+            td.m_spent = spent;
+            td.m_spent_height = spent_height;
+            td.m_frozen = frozen;
+            td.m_block_height = block_height;
+            wallet.m_transfers.push_back(td);
+        };
+
+        add_transfer(0, 0, 100);
+        add_transfer(0, 1, 40, true);
+        add_transfer(0, 0, 30, true, 1);
+        add_transfer(0, 0, 20, false, 0, true);
+        add_transfer(0, 0, 5);
+        add_transfer(0, 0, 500);
+        add_transfer(1, 1, 70, false, 0, false, wallet.get_blockchain_current_height());
+        add_transfer(2, 1, 5);
+        add_transfer(2, 2, 15, false, 0, true);
+
+        tools::wallet2::unconfirmed_transfer_details pending{};
+        pending.m_subaddr_account = 1;
+        pending.m_change = 9;
+        pending.m_state = tools::wallet2::unconfirmed_transfer_details::pending;
+        pending.m_dests.emplace_back(7, wallet.get_subaddress({1, 0}), true);
+        pending.m_dests.emplace_back(11, wallet.get_subaddress({2, 0}), true);
+        wallet.m_unconfirmed_txs.emplace(crypto::null_hash, pending);
+
+        crypto::hash failed_hash = crypto::null_hash;
+        failed_hash.data[0] = 1;
+        pending.m_change = 25;
+        pending.m_state = tools::wallet2::unconfirmed_transfer_details::failed;
+        wallet.m_unconfirmed_txs.emplace(failed_hash, pending);
+
+        tools::wallet2::pool_payment_details incoming{};
+        incoming.m_pd.m_amount = 13;
+        incoming.m_pd.m_subaddr_index = {2, 0};
+        wallet.m_unconfirmed_payments.emplace(crypto::null_hash, incoming);
+    }
+
+    static void forget_cached_key_image(tools::wallet2 &wallet, const size_t index)
+    {
+        crypto::key_image stale_key_image = AUTO_VAL_INIT(stale_key_image);
+        tools::wallet2::transfer_details &td = wallet.m_transfers.at(index);
+        td.m_key_image = stale_key_image;
+        td.m_key_image_known = false;
+        td.m_key_image_request = true;
+        td.m_key_image_partial = false;
+    }
+
+    static crypto::public_key get_public_key(const tools::wallet2 &wallet, const size_t index)
+    {
+        return wallet.m_transfers.at(index).get_public_key();
+    }
+};
+
+TEST(wallet_balance, batched_account_balances_match_individual_balances)
+{
+    const path wallet_file = unit_test::data_dir / "wallet_9svHk1";
+    tools::wallet2 wallet(cryptonote::TESTNET);
+    wallet.load(wallet_file.string(), epee::wipeable_string("test"));
+    wallet.set_subaddress_lookahead(1, 1);
+    wallet.add_subaddress_account("second");
+    wallet.add_subaddress_account("third");
+    wallet.ignore_outputs_below(10);
+    wallet.ignore_outputs_above(200);
+    wallet_accessor_test::set_balance_test_data(wallet);
+    ASSERT_GT(wallet.get_blockchain_current_height(), CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE);
+
+    for (bool strict: {false, true})
+    {
+        const auto balances = wallet.balances_per_account({0, 1, 2}, strict);
+        ASSERT_EQ(3, balances.size());
+        for (uint32_t account = 0; account < balances.size(); ++account)
+        {
+            EXPECT_EQ(wallet.balance(account, strict), balances[account].balance) << account << ", strict=" << strict;
+            EXPECT_EQ(wallet.unlocked_balance(account, strict), balances[account].unlocked_balance) << account << ", strict=" << strict;
+        }
+        EXPECT_EQ(strict ? 140 : 100, balances[0].balance);
+        EXPECT_EQ(strict ? 140 : 100, balances[0].unlocked_balance);
+        EXPECT_EQ(strict ? 70 : 86, balances[1].balance);
+        EXPECT_EQ(0, balances[1].unlocked_balance);
+        EXPECT_EQ(strict ? 0 : 13, balances[2].balance);
+        EXPECT_EQ(0, balances[2].unlocked_balance);
+
+        const auto filtered = wallet.balances_per_account({1}, strict);
+        EXPECT_EQ(0, filtered[0].balance);
+        EXPECT_EQ(wallet.balance(1, strict), filtered[1].balance);
+        EXPECT_EQ(wallet.unlocked_balance(1, strict), filtered[1].unlocked_balance);
+        EXPECT_EQ(0, filtered[2].balance);
+    }
+}
+
+TEST(wallet_sign, requires_the_selected_private_key)
+{
+    const epee::wipeable_string password("test-password");
+    const std::string message("message to sign");
+    const cryptonote::subaddress_index subaddress{0, 1};
+
+    tools::wallet2 full(cryptonote::MAINNET, 1, true);
+    full.generate("", password);
+    tools::wallet2 view_only(cryptonote::MAINNET, 1, true);
+    view_only.generate("", password, full.get_address(), full.get_account().get_keys().m_view_secret_key);
+    ASSERT_TRUE(view_only.watch_only());
+
+    for (const auto index : {cryptonote::subaddress_index{0, 0}, subaddress})
+    {
+        for (const auto type : {tools::wallet2::sign_with_spend_key, tools::wallet2::sign_with_view_key})
+        {
+            const std::string signature = full.sign(message, type, index);
+            const auto result = full.verify(message, full.get_subaddress(index), signature);
+            EXPECT_TRUE(result.valid);
+            EXPECT_EQ(type, result.type);
+        }
+    }
+
+    const std::string view_signature = view_only.sign(message, tools::wallet2::sign_with_view_key);
+    const auto view_result = full.verify(message, full.get_address(), view_signature);
+    EXPECT_TRUE(view_result.valid);
+    EXPECT_EQ(tools::wallet2::sign_with_view_key, view_result.type);
+    EXPECT_THROW(view_only.sign(message, tools::wallet2::sign_with_spend_key), std::runtime_error);
+    EXPECT_THROW(view_only.sign(message, tools::wallet2::sign_with_spend_key, subaddress), std::runtime_error);
+    EXPECT_THROW(view_only.sign(message, tools::wallet2::sign_with_view_key, subaddress), std::runtime_error);
+}
+
+TEST(wallet_storage, upgrade_legacy_unencrypted_keys)
+{
+    const path test_dir = temp_directory_path() / unique_path("monero-legacy-keys-%%%%-%%%%");
+    ASSERT_TRUE(create_directory(test_dir));
+    struct test_dir_cleanup
+    {
+        const path dir;
+        ~test_dir_cleanup()
+        {
+            boost::system::error_code ec;
+            remove_all(dir, ec);
+        }
+    } cleanup{test_dir};
+
+    const epee::wipeable_string password("test-password");
+    cryptonote::account_base account;
+    const crypto::secret_key spend_key = account.generate();
+    const crypto::secret_key view_key = account.get_keys().m_view_secret_key;
+
+    epee::byte_slice account_data;
+    ASSERT_TRUE(epee::serialization::store_t_to_binary(account, account_data));
+
+    crypto::chacha_key key;
+    crypto::generate_chacha_key(password.data(), password.size(), key, 1);
+    for (const bool json_format : {false, true})
+    {
+        const path wallet_file = test_dir / (json_format ? "json-wallet" : "v0-wallet");
+        std::string plaintext;
+        if (json_format)
+        {
+            rapidjson::Document json;
+            json.SetObject();
+            rapidjson::Value value;
+            value.SetString(reinterpret_cast<const char*>(account_data.data()), account_data.size(), json.GetAllocator());
+            json.AddMember("key_data", value, json.GetAllocator());
+            rapidjson::StringBuffer buffer;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+            json.Accept(writer);
+            plaintext.assign(buffer.GetString(), buffer.GetSize());
+        }
+        else
+            plaintext.assign(reinterpret_cast<const char*>(account_data.data()), account_data.size());
+
+        tools::wallet2::keys_file_data legacy_keys;
+        legacy_keys.iv = crypto::rand<crypto::chacha_iv>();
+        legacy_keys.account_data.resize(plaintext.size());
+        if (json_format)
+            crypto::chacha20(plaintext.data(), plaintext.size(), key, legacy_keys.iv, &legacy_keys.account_data[0]);
+        else
+            crypto::chacha8(plaintext.data(), plaintext.size(), key, legacy_keys.iv, &legacy_keys.account_data[0]);
+
+        std::string keys_buf;
+        ASSERT_TRUE(serialization::dump_binary(legacy_keys, keys_buf));
+        ASSERT_TRUE(save_string_to_file(wallet_file.string() + ".keys", keys_buf));
+
+        for (int load = 0; load < 2; ++load)
+        {
+            {
+                tools::wallet2 wallet;
+                wallet.load(wallet_file.string(), password);
+                tools::wallet_keys_unlocker unlocker(wallet, &password);
+                EXPECT_TRUE(wallet.get_account().get_keys().m_spend_secret_key == spend_key);
+                EXPECT_TRUE(wallet.get_account().get_keys().m_view_secret_key == view_key);
+            }
+
+            if (load == 0)
+            {
+                std::string saved_buf;
+                ASSERT_TRUE(load_file_to_string(wallet_file.string() + ".keys", saved_buf));
+                tools::wallet2::keys_file_data saved_keys;
+                ASSERT_TRUE(serialization::parse_binary(saved_buf, saved_keys));
+                ASSERT_FALSE(saved_keys.account_data.empty());
+                std::string saved_json(saved_keys.account_data.size(), '\0');
+                crypto::chacha20(saved_keys.account_data.data(), saved_keys.account_data.size(), key,
+                    saved_keys.iv, &saved_json[0]);
+                rapidjson::Document upgraded;
+                ASSERT_FALSE(upgraded.Parse(saved_json.c_str()).HasParseError());
+                ASSERT_TRUE(upgraded.IsObject());
+                ASSERT_TRUE(upgraded.HasMember("encrypted_secret_keys"));
+                ASSERT_TRUE(upgraded["encrypted_secret_keys"].IsInt());
+                EXPECT_EQ(1, upgraded["encrypted_secret_keys"].GetInt());
+            }
+        }
+    }
+}
+
+TEST(wallet_balance, batched_subaddress_balances_match_individual_balances)
+{
+    const path wallet_file = unit_test::data_dir / "wallet_9svHk1";
+    tools::wallet2 wallet(cryptonote::TESTNET);
+    wallet.load(wallet_file.string(), epee::wipeable_string("test"));
+    wallet.set_subaddress_lookahead(1, 1);
+    wallet.add_subaddress_account("second");
+    wallet.add_subaddress_account("third");
+    wallet.ignore_outputs_below(10);
+    wallet.ignore_outputs_above(200);
+    wallet_accessor_test::set_balance_test_data(wallet);
+    tools::wallet2::transfer_container transfers;
+    wallet.get_transfers(transfers);
+
+    for (bool strict: {false, true})
+    {
+        const auto batched = wallet.balances_per_subaddress_all(strict);
+        ASSERT_EQ(wallet.get_num_subaddress_accounts(), batched.size());
+        uint64_t total_balance = 0, total_unlocked_balance = 0;
+        uint64_t blocks_to_unlock = 0, time_to_unlock = 0;
+        for (uint32_t major = 0; major < batched.size(); ++major)
+        {
+            const auto balances = wallet.balance_per_subaddress(major, strict);
+            const auto unlocked = wallet.unlocked_balance_per_subaddress(major, strict);
+            std::vector<uint32_t> emitted_indices;
+            for (const auto& entry: batched[major])
+            {
+                emitted_indices.push_back(entry.first);
+                const auto found = balances.find(entry.first);
+                ASSERT_NE(balances.end(), found);
+                EXPECT_EQ(found->second, entry.second.balance);
+                const auto unlocked_entry = unlocked.find(entry.first);
+                EXPECT_EQ(unlocked_entry == unlocked.end() ? 0 : unlocked_entry->second.first, entry.second.unlocked_balance);
+                EXPECT_EQ(unlocked_entry == unlocked.end() ? 0 : unlocked_entry->second.second.first, entry.second.blocks_to_unlock);
+                EXPECT_EQ(unlocked_entry == unlocked.end() ? 0 : unlocked_entry->second.second.second, entry.second.time_to_unlock);
+                EXPECT_EQ(std::count_if(transfers.begin(), transfers.end(), [&](const tools::wallet2::transfer_details& td) {
+                    return !td.m_spent && td.m_subaddr_index.major == major && td.m_subaddr_index.minor == entry.first;
+                }), entry.second.num_unspent_outputs);
+                total_balance += entry.second.balance;
+                total_unlocked_balance += entry.second.unlocked_balance;
+                blocks_to_unlock = std::max(blocks_to_unlock, entry.second.blocks_to_unlock);
+                time_to_unlock = std::max(time_to_unlock, entry.second.time_to_unlock);
+            }
+            std::vector<uint32_t> expected_indices;
+            for (const auto& entry: balances)
+                expected_indices.push_back(entry.first);
+            EXPECT_EQ(expected_indices, emitted_indices);
+        }
+        EXPECT_EQ(wallet.balance_all(strict), total_balance);
+        uint64_t expected_blocks = 0, expected_time = 0;
+        EXPECT_EQ(wallet.unlocked_balance_all(strict, &expected_blocks, &expected_time), total_unlocked_balance);
+        EXPECT_EQ(expected_blocks, blocks_to_unlock);
+        EXPECT_EQ(expected_time, time_to_unlock);
+    }
+}
+
+TEST(wallet_storage, store_to_file2file)
+{
+    const path source_wallet_file = unit_test::data_dir / "wallet_00fd416a";
+    const path interm_wallet_file = unit_test::data_dir / "wallet_00fd416a_copy_file2file";
+    const path target_wallet_file = unit_test::data_dir / "wallet_00fd416a_new_file2file";
+
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string() + ".keys"));
+
+    tools::copy_file(source_wallet_file.string(), interm_wallet_file.string());
+    tools::copy_file(source_wallet_file.string() + ".keys", interm_wallet_file.string() + ".keys");
+
+    ASSERT_TRUE(is_file_exist(interm_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(interm_wallet_file.string() + ".keys"));
+
+    if (is_file_exist(target_wallet_file.string()))
+        remove(target_wallet_file);
+    if (is_file_exist(target_wallet_file.string() + ".keys"))
+        remove(target_wallet_file.string() + ".keys");
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string()));
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    epee::wipeable_string password("beepbeep");
+
+    const auto files_are_expected = [&]()
+    {
+        EXPECT_FALSE(is_file_exist(interm_wallet_file.string()));
+        EXPECT_FALSE(is_file_exist(interm_wallet_file.string() + ".keys"));
+        EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+        EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+    };
+
+    {
+        tools::wallet2 w;
+        w.load(interm_wallet_file.string(), password);
+        const std::string primary_address = w.get_address_as_str();
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, primary_address);
+        w.store_to(target_wallet_file.string(), password);
+        files_are_expected();
+    }
+
+    files_are_expected();
+
+    {
+        tools::wallet2 w;
+        w.load(target_wallet_file.string(), password);
+        const std::string primary_address = w.get_address_as_str();
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, primary_address);
+        w.store_to("", "");
+        files_are_expected();
+    }
+
+    files_are_expected();
+}
+
+TEST(wallet_storage, store_to_mem2file)
+{
+    for (const auto nettype : {cryptonote::MAINNET, cryptonote::TESTNET, cryptonote::STAGENET})
+    {
+        SCOPED_TRACE(static_cast<int>(nettype));
+        const path target_wallet_file = unit_test::data_dir / ("wallet_mem2file_" + std::to_string(nettype));
+        const std::string address_file = target_wallet_file.string() + ".address.txt";
+        if (is_file_exist(address_file))
+            remove(address_file);
+
+        if (is_file_exist(target_wallet_file.string()))
+            remove(target_wallet_file);
+        if (is_file_exist(target_wallet_file.string() + ".keys"))
+            remove(target_wallet_file.string() + ".keys");
+        ASSERT_FALSE(is_file_exist(target_wallet_file.string()));
+        ASSERT_FALSE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+        epee::wipeable_string password("beepbeep2");
+
+        {
+            tools::wallet2 w(nettype);
+            w.generate("", password);
+            w.store_to(target_wallet_file.string(), password);
+
+            EXPECT_EQ(nettype != cryptonote::MAINNET, is_file_exist(address_file));
+            if (nettype != cryptonote::MAINNET)
+            {
+                std::string address;
+                ASSERT_TRUE(load_file_to_string(address_file, address));
+                EXPECT_EQ(w.get_address_as_str(), address);
+            }
+
+            EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+            EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+        }
+
+        EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+        EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+        {
+            tools::wallet2 w(nettype);
+            w.load(target_wallet_file.string(), password);
+
+            EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+            EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+        }
+
+        EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+        EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+    }
+}
+
+TEST(wallet_storage, export_key_images_uses_generated_key_image)
+{
+    const path wallet_file = unit_test::data_dir / "wallet_9svHk1";
+    epee::wipeable_string password("test");
+
+    tools::wallet2 w(cryptonote::TESTNET);
+    w.load(wallet_file.string(), password);
+    tools::wallet_keys_unlocker unlocker(w, &password);
+
+    const auto original = w.export_key_images(true);
+    ASSERT_EQ(0, original.first);
+    ASSERT_FALSE(original.second.empty());
+    const crypto::key_image expected_key_image = original.second.front().first;
+
+    wallet_accessor_test::forget_cached_key_image(w, 0);
+
+    const auto exported = w.export_key_images(false);
+    ASSERT_EQ(0, exported.first);
+    ASSERT_EQ(original.second.size(), exported.second.size());
+
+    const crypto::key_image &exported_key_image = exported.second.front().first;
+    EXPECT_TRUE(expected_key_image == exported_key_image);
+
+    const crypto::public_key pkey = wallet_accessor_test::get_public_key(w, 0);
+    std::vector<const crypto::public_key*> key_ptrs;
+    key_ptrs.push_back(&pkey);
+    EXPECT_TRUE(crypto::check_ring_signature((const crypto::hash&)exported_key_image,
+        exported_key_image, key_ptrs.data(), key_ptrs.size(), &exported.second.front().second));
+}
+
+TEST(wallet_storage, change_password_same_file)
+{
+    const path source_wallet_file = unit_test::data_dir / "wallet_00fd416a";
+    const path interm_wallet_file = unit_test::data_dir / "wallet_00fd416a_copy_change_password_same";
+
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string() + ".keys"));
+
+    tools::copy_file(source_wallet_file.string(), interm_wallet_file.string());
+    tools::copy_file(source_wallet_file.string() + ".keys", interm_wallet_file.string() + ".keys");
+
+    ASSERT_TRUE(is_file_exist(interm_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(interm_wallet_file.string() + ".keys"));
+
+    epee::wipeable_string old_password("beepbeep");
+    epee::wipeable_string new_password("meepmeep");
+
+    {
+        tools::wallet2 w;
+        w.load(interm_wallet_file.string(), old_password);
+        const std::string primary_address = w.get_address_as_str();
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, primary_address);
+        w.change_password(w.get_wallet_file(), old_password, new_password);
+    }
+
+    {
+        tools::wallet2 w;
+        w.load(interm_wallet_file.string(), new_password);
+        const std::string primary_address = w.get_address_as_str();
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, primary_address);
+    }
+
+    {
+        tools::wallet2 w;
+        EXPECT_THROW(w.load(interm_wallet_file.string(), old_password), tools::error::invalid_password);
+    }
+}
+
+TEST(wallet_storage, watch_only_wallet_with_distinct_password)
+{
+    const path source_wallet_file = unit_test::data_dir / "wallet_00fd416a";
+    const path wallet_file = unit_test::data_dir / "wallet_watch_only_distinct_password";
+    const std::string watch_only_file = wallet_file.string() + "-watchonly";
+    const epee::wipeable_string original_password("beepbeep");
+    const epee::wipeable_string watch_only_password("different password");
+    const epee::wipeable_string wrong_password("wrong password");
+    const std::string source_passphrase("source wallet passphrase");
+
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string() + ".keys"));
+    remove(wallet_file);
+    remove(wallet_file.string() + ".keys");
+    remove(watch_only_file);
+    remove(watch_only_file + ".keys");
+    tools::copy_file(source_wallet_file.string(), wallet_file.string());
+    tools::copy_file(source_wallet_file.string() + ".keys", wallet_file.string() + ".keys");
+
+    std::string new_keys_filename;
+    {
+        tools::wallet2 w;
+        w.load(wallet_file.string(), original_password);
+        ASSERT_EQ(tools::wallet2::AskPasswordToDecrypt, w.ask_password());
+        ASSERT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, w.get_address_as_str());
+        EXPECT_THROW(w.write_watch_only_wallet(wallet_file.string(), wrong_password, watch_only_password, new_keys_filename), tools::error::invalid_password);
+        EXPECT_FALSE(is_file_exist(watch_only_file + ".keys"));
+        {
+            tools::wallet_keys_unlocker unlocker(w, &original_password);
+            wallet_accessor_test::set_monero_c_passphrase(w, source_passphrase);
+        }
+        w.write_watch_only_wallet(wallet_file.string(), original_password, watch_only_password, new_keys_filename);
+        EXPECT_EQ(watch_only_file + ".keys", new_keys_filename);
+        EXPECT_TRUE(is_file_exist(new_keys_filename));
+        {
+            tools::wallet_keys_unlocker unlocker(w, &original_password);
+            const auto &passphrase = w.get_account().get_keys().m_monero_c_passphrase.buffer;
+            EXPECT_EQ(source_passphrase, std::string(passphrase.begin(), passphrase.end()));
+        }
+    }
+
+    {
+        tools::wallet2 w;
+        w.load(watch_only_file, watch_only_password);
+        EXPECT_TRUE(w.watch_only());
+        EXPECT_EQ(crypto::null_skey, w.get_account().get_keys().m_spend_secret_key);
+        EXPECT_TRUE(w.get_account().get_keys().m_monero_c_passphrase.buffer.empty());
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, w.get_address_as_str());
+    }
+    {
+        tools::wallet2 w;
+        EXPECT_ANY_THROW(w.load(watch_only_file, original_password));
+    }
+    {
+        tools::wallet2 w;
+        w.load(wallet_file.string(), original_password);
+        EXPECT_FALSE(w.watch_only());
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, w.get_address_as_str());
+    }
+
+    remove(watch_only_file + ".keys");
+    {
+        tools::wallet2 w;
+        w.load(wallet_file.string(), original_password);
+        w.write_watch_only_wallet(wallet_file.string(), original_password, new_keys_filename);
+    }
+    {
+        tools::wallet2 w;
+        w.load(watch_only_file, original_password);
+        EXPECT_TRUE(w.watch_only());
+        EXPECT_EQ(crypto::null_skey, w.get_account().get_keys().m_spend_secret_key);
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, w.get_address_as_str());
+    }
+    remove(watch_only_file + ".keys");
+    remove(wallet_file.string() + ".keys");
+    remove(wallet_file);
+}
+
+TEST(wallet_storage, watch_only_wallet_drops_custom_background_key)
+{
+    const path wallet_file = unit_test::data_dir / "wallet_watch_only_custom_background";
+    const std::string watch_only_file = wallet_file.string() + "-watchonly";
+    const epee::wipeable_string original_password("source password");
+    const epee::wipeable_string background_password("background password");
+    const epee::wipeable_string watch_only_password("watch-only password");
+    remove(watch_only_file + ".keys");
+
+    std::string new_keys_filename;
+    {
+        tools::wallet2 w;
+        w.generate("", original_password);
+        w.setup_background_sync(tools::wallet2::BackgroundSyncCustomPassword, original_password, background_password);
+        ASSERT_EQ(tools::wallet2::BackgroundSyncCustomPassword, w.background_sync_type());
+        ASSERT_TRUE(wallet_accessor_test::has_custom_background_key(w));
+        EXPECT_FALSE(wallet_accessor_test::watch_only_keys_contain_custom_background_key(w, original_password, watch_only_password));
+        w.write_watch_only_wallet(wallet_file.string(), original_password, watch_only_password, new_keys_filename);
+        EXPECT_EQ(watch_only_file + ".keys", new_keys_filename);
+        EXPECT_EQ(tools::wallet2::BackgroundSyncCustomPassword, w.background_sync_type());
+        EXPECT_TRUE(wallet_accessor_test::has_custom_background_key(w));
+    }
+    {
+        tools::wallet2 w;
+        w.load(watch_only_file, watch_only_password);
+        EXPECT_TRUE(w.watch_only());
+        EXPECT_EQ(tools::wallet2::BackgroundSyncOff, w.background_sync_type());
+        EXPECT_FALSE(wallet_accessor_test::has_custom_background_key(w));
+    }
+    remove(watch_only_file + ".keys");
+}
+
+TEST(wallet_storage, watch_only_rewrite_preserves_monero_c_passphrase)
+{
+    const path wallet_file = unit_test::data_dir / "wallet_watch_only_passphrase_rewrite";
+    const epee::wipeable_string password("wallet password");
+    const std::string passphrase("stored monero_c passphrase");
+    remove(wallet_file);
+    remove(wallet_file.string() + ".keys");
+
+    {
+        tools::wallet2 source;
+        source.generate("", password);
+        tools::wallet2 watch_only;
+        watch_only.generate(wallet_file.string(), password, source.get_address(),
+            source.get_account().get_keys().m_view_secret_key);
+        ASSERT_TRUE(watch_only.watch_only());
+        wallet_accessor_test::set_monero_c_passphrase(watch_only, passphrase);
+        watch_only.rewrite(wallet_file.string(), password);
+    }
+    {
+        tools::wallet2 watch_only;
+        watch_only.load(wallet_file.string(), password);
+        ASSERT_TRUE(watch_only.watch_only());
+        const auto &stored = watch_only.get_account().get_keys().m_monero_c_passphrase.buffer;
+        EXPECT_EQ(passphrase, std::string(stored.begin(), stored.end()));
+    }
+    remove(wallet_file.string() + ".keys");
+    remove(wallet_file);
+}
+
+TEST(wallet_storage, change_password_different_file)
+{
+    const path source_wallet_file = unit_test::data_dir / "wallet_00fd416a";
+    const path interm_wallet_file = unit_test::data_dir / "wallet_00fd416a_copy_change_password_diff";
+    const path target_wallet_file = unit_test::data_dir / "wallet_00fd416a_new_change_password_diff";
+
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(source_wallet_file.string() + ".keys"));
+
+    tools::copy_file(source_wallet_file.string(), interm_wallet_file.string());
+    tools::copy_file(source_wallet_file.string() + ".keys", interm_wallet_file.string() + ".keys");
+
+    ASSERT_TRUE(is_file_exist(interm_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(interm_wallet_file.string() + ".keys"));
+
+    if (is_file_exist(target_wallet_file.string()))
+        remove(target_wallet_file);
+    if (is_file_exist(target_wallet_file.string() + ".keys"))
+        remove(target_wallet_file.string() + ".keys");
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string()));
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    epee::wipeable_string old_password("beepbeep");
+    epee::wipeable_string new_password("meepmeep");
+
+    {
+        tools::wallet2 w;
+        w.load(interm_wallet_file.string(), old_password);
+        const std::string primary_address = w.get_address_as_str();
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, primary_address);
+        w.change_password(target_wallet_file.string(), old_password, new_password);
+    }
+
+    EXPECT_FALSE(is_file_exist(interm_wallet_file.string()));
+    EXPECT_FALSE(is_file_exist(interm_wallet_file.string() + ".keys"));
+    EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+    EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    {
+        tools::wallet2 w;
+        w.load(target_wallet_file.string(), new_password);
+        const std::string primary_address = w.get_address_as_str();
+        EXPECT_EQ(WALLET_00fd416a_PRIMARY_ADDRESS, primary_address);
+    }
+}
+
+TEST(wallet_storage, change_password_in_memory)
+{
+    const epee::wipeable_string password1("monero");
+    const epee::wipeable_string password2("means money");
+    const epee::wipeable_string password_wrong("is traceable");
+
+    tools::wallet2 w;
+    w.generate("", password1);
+    const std::string primary_address_1 = w.get_address_as_str();
+    w.change_password("", password1, password2);
+    const std::string primary_address_2 = w.get_address_as_str();
+    EXPECT_EQ(primary_address_1, primary_address_2);
+
+    EXPECT_THROW(w.change_password("", password_wrong, password1), tools::error::invalid_password);
+}
+
+TEST(wallet_storage, change_password_mem2file)
+{
+    const path target_wallet_file = unit_test::data_dir / "wallet_change_password_mem2file";
+
+    if (is_file_exist(target_wallet_file.string()))
+        remove(target_wallet_file);
+    if (is_file_exist(target_wallet_file.string() + ".keys"))
+        remove(target_wallet_file.string() + ".keys");
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string()));
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    const epee::wipeable_string password1("https://safecurves.cr.yp.to/rigid.html");
+    const epee::wipeable_string password2(
+        "https://csrc.nist.gov/csrc/media/projects/crypto-standards-development-process/documents/dualec_in_x982_and_sp800-90.pdf");
+    
+    std::string primary_address_1, primary_address_2;
+    {
+        tools::wallet2 w;
+        w.generate("", password1);
+        primary_address_1 = w.get_address_as_str();
+        w.change_password(target_wallet_file.string(), password1, password2);
+    }
+
+    EXPECT_TRUE(is_file_exist(target_wallet_file.string()));
+    EXPECT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    {
+        tools::wallet2 w;
+        w.load(target_wallet_file.string(), password2);
+        primary_address_2 = w.get_address_as_str();
+    }
+
+    EXPECT_EQ(primary_address_1, primary_address_2);
+}
+
+TEST(wallet_storage, gen_ascii_format)
+{
+    const path target_wallet_file = unit_test::data_dir / "wallet_gen_ascii_format";
+
+    if (is_file_exist(target_wallet_file.string()))
+        remove(target_wallet_file);
+    if (is_file_exist(target_wallet_file.string() + ".keys"))
+        remove(target_wallet_file.string() + ".keys");
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string()));
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    const epee::wipeable_string password("https://safecurves.cr.yp.to/rigid.html");
+    
+    std::string primary_address_1, primary_address_2;
+    {
+        tools::wallet2 w;
+        w.set_export_format(tools::wallet2::Ascii);
+        ASSERT_EQ(tools::wallet2::Ascii, w.export_format());
+        w.generate(target_wallet_file.string(), password);
+        primary_address_1 = w.get_address_as_str();
+    }
+
+    ASSERT_TRUE(is_file_exist(target_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    // Assert that we store keys in ascii format
+    {
+        std::string key_file_contents;
+        ASSERT_TRUE(epee::file_io_utils::load_file_to_string(target_wallet_file.string() + ".keys", key_file_contents));
+        EXPECT_NE(std::string::npos, key_file_contents.find(WALLET2_ASCII_OUTPUT_MAGIC));
+        for (const char c : key_file_contents)
+            ASSERT_TRUE(std::isprint(static_cast<unsigned char>(c)) || c == '\n' || c == '\r');
+    }
+
+    {
+        tools::wallet2 w;
+        w.set_export_format(tools::wallet2::Ascii);
+        ASSERT_EQ(tools::wallet2::Ascii, w.export_format());
+        w.load(target_wallet_file.string(), password);
+        primary_address_2 = w.get_address_as_str();
+    }
+
+    EXPECT_EQ(primary_address_1, primary_address_2);
+}
+
+TEST(wallet_storage, change_export_format)
+{
+    const path target_wallet_file = unit_test::data_dir / "wallet_change_export_format";
+
+    if (is_file_exist(target_wallet_file.string()))
+        remove(target_wallet_file);
+    if (is_file_exist(target_wallet_file.string() + ".keys"))
+        remove(target_wallet_file.string() + ".keys");
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string()));
+    ASSERT_FALSE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    const epee::wipeable_string password("https://safecurves.cr.yp.to/rigid.html");
+    
+    std::string primary_address_1, primary_address_2;
+    {
+        tools::wallet2 w;
+        ASSERT_EQ(tools::wallet2::Binary, w.export_format());
+        w.generate(target_wallet_file.string(), password);
+        primary_address_1 = w.get_address_as_str();
+        w.store();
+
+        // Assert that we initially store keys in binary format
+        {
+            std::string key_file_contents;
+            ASSERT_TRUE(w.unlock_keys_file());
+            ASSERT_FALSE(w.is_keys_file_locked());
+            const bool loaded = epee::file_io_utils::load_file_to_string(target_wallet_file.string() + ".keys", key_file_contents);
+            ASSERT_TRUE(w.lock_keys_file());
+            ASSERT_TRUE(w.is_keys_file_locked());
+            ASSERT_TRUE(loaded);
+            EXPECT_EQ(std::string::npos, key_file_contents.find(WALLET2_ASCII_OUTPUT_MAGIC));
+            bool only_printable = true;
+            for (const char c : key_file_contents)
+            {
+                if (!std::isprint(static_cast<unsigned char>(c)) && c != '\n' && c != '\r')
+                {
+                    only_printable = false;
+                    break;
+                }
+            }
+            EXPECT_FALSE(only_printable);
+        }
+
+        // switch formats and store
+        w.set_export_format(tools::wallet2::Ascii);
+        ASSERT_EQ(tools::wallet2::Ascii, w.export_format());
+        w.store_to("", password, /*force_rewrite_keys=*/ true);
+    }
+
+    ASSERT_TRUE(is_file_exist(target_wallet_file.string()));
+    ASSERT_TRUE(is_file_exist(target_wallet_file.string() + ".keys"));
+
+    // Assert that we store keys in ascii format
+    {
+        std::string key_file_contents;
+        ASSERT_TRUE(epee::file_io_utils::load_file_to_string(target_wallet_file.string() + ".keys", key_file_contents));
+        EXPECT_NE(std::string::npos, key_file_contents.find(WALLET2_ASCII_OUTPUT_MAGIC));
+        for (const char c : key_file_contents)
+            ASSERT_TRUE(std::isprint(static_cast<unsigned char>(c)) || c == '\n' || c == '\r');
+    }
+
+    {
+        tools::wallet2 w;
+        w.set_export_format(tools::wallet2::Ascii);
+        ASSERT_EQ(tools::wallet2::Ascii, w.export_format());
+        w.load(target_wallet_file.string(), password);
+        primary_address_2 = w.get_address_as_str();
+    }
+
+    EXPECT_EQ(primary_address_1, primary_address_2);
+}
+
+TEST(wallet_manual_encrypt, encrypt_with_wrong_password)
+{
+    const epee::wipeable_string password1("Beleza pura, malandro!");
+    const epee::wipeable_string password2("correct horse battery staple");
+    tools::wallet2 w;
+    w.generate("", password1);
+    ASSERT_TRUE(w.is_key_encryption_enabled());
+    EXPECT_THROW(w.encrypt_keys(password2), tools::error::invalid_password);
+}
+
+#define OLD_WALLET_KEYS_UNLOCKER 0
+#if OLD_WALLET_KEYS_UNLOCKER
+#define WALLET_KEYS_UNLOCKER_CTOR(wal, p_pwd) tools::wallet_keys_unlocker(wal, \
+    p_pwd ? tools::password_container(*static_cast<const epee::wipeable_string*>(p_pwd)) \
+    : boost::optional<tools::password_container>{})
+#else
+#define WALLET_KEYS_UNLOCKER_CTOR tools::wallet_keys_unlocker
+#endif
+
+static bool verify_wallet_privkeys(const tools::wallet2 &w)
+{
+    hw::device &hwdev = hw::get_device("default");
+    const cryptonote::account_keys &keys = w.get_account().get_keys();
+    return hwdev.verify_keys(keys.m_spend_secret_key, keys.m_account_address.m_spend_public_key)
+        && hwdev.verify_keys(keys.m_view_secret_key, keys.m_account_address.m_view_public_key);
+}
+
+TEST(wallet_keys_unlocker, is_key_encryption_enabled)
+{
+    const epee::wipeable_string password1("Beleza pura, malandro!");
+    const epee::wipeable_string password2("correct horse battery staple");
+    {
+        tools::wallet2 w;
+        w.generate("", password1);
+        ASSERT_TRUE(w.is_key_encryption_enabled());
+    }
+    {
+        tools::wallet2 w(cryptonote::MAINNET, /*kdf_rounds=*/1, /*unattended=*/true);
+        w.generate("", password1);
+        ASSERT_FALSE(w.is_key_encryption_enabled()); // because unattended
+    }
+    {
+        tools::wallet2 w_cold;
+        w_cold.generate("", password1);
+        ASSERT_TRUE(w_cold.is_key_encryption_enabled());
+        tools::wallet2 w_hot;
+        w_hot.generate("", password2,
+            w_cold.get_address(),
+            w_cold.get_account().get_keys().m_view_secret_key);
+        ASSERT_FALSE(w_hot.is_key_encryption_enabled()); // because watch only
+    }
+    {
+        const path bg_wallet_file = unit_test::data_dir / "is_key_encryption_enabled_bg1";
+        if (is_file_exist(bg_wallet_file.string()))
+            remove(bg_wallet_file);
+        if (is_file_exist(bg_wallet_file.string() + ".keys"))
+            remove(bg_wallet_file.string() + ".keys");
+
+        tools::wallet2 w;
+        w.generate(bg_wallet_file.string(), password1);
+        ASSERT_TRUE(w.is_key_encryption_enabled());
+        w.setup_background_sync(tools::wallet2::BackgroundSyncReusePassword, password1, boost::none);
+        ASSERT_FALSE(w.is_background_syncing());
+        w.start_background_sync();
+        ASSERT_TRUE(w.is_background_syncing());
+        ASSERT_FALSE(verify_wallet_privkeys(w));
+        ASSERT_FALSE(w.is_key_encryption_enabled()); // because background syncing
+    }
+    {
+        const path bg_wallet_file = unit_test::data_dir / "is_key_encryption_enabled_bg2";
+        if (is_file_exist(bg_wallet_file.string()))
+            remove(bg_wallet_file);
+        if (is_file_exist(bg_wallet_file.string() + ".keys"))
+            remove(bg_wallet_file.string() + ".keys");
+
+        tools::wallet2 w;
+        w.generate(bg_wallet_file.string(), password1);
+        ASSERT_TRUE(w.is_key_encryption_enabled());
+        w.setup_background_sync(tools::wallet2::BackgroundSyncCustomPassword, password1, password2);
+        ASSERT_FALSE(w.is_background_syncing());
+        w.start_background_sync();
+        ASSERT_TRUE(w.is_background_syncing());
+        ASSERT_FALSE(verify_wallet_privkeys(w));
+        ASSERT_FALSE(w.is_key_encryption_enabled()); // because background syncing
+    }
+}
+
+TEST(wallet_keys_unlocker, is_deterministic_with_encrypted_keys)
+{
+    const epee::wipeable_string password("correct horse battery staple");
+    const path wallet_file = unit_test::data_dir / "wallet_is_deterministic_encrypted_keys";
+
+    if (is_file_exist(wallet_file.string()))
+        remove(wallet_file);
+    if (is_file_exist(wallet_file.string() + ".keys"))
+        remove(wallet_file.string() + ".keys");
+
+    {
+        tools::wallet2 w;
+        w.generate(wallet_file.string(), password);
+        w.set_seed_language("English");
+        ASSERT_TRUE(w.is_key_encryption_enabled());
+        ASSERT_FALSE(verify_wallet_privkeys(w));
+        ASSERT_TRUE(w.is_deterministic());
+
+        epee::wipeable_string seed;
+        ASSERT_FALSE(w.get_seed(seed));
+
+        {
+            tools::wallet_keys_unlocker ul(w, &password);
+            ASSERT_TRUE(verify_wallet_privkeys(w));
+            ASSERT_TRUE(w.is_deterministic());
+            ASSERT_TRUE(w.get_seed(seed));
+            ASSERT_FALSE(seed.empty());
+        }
+
+        ASSERT_FALSE(verify_wallet_privkeys(w));
+        ASSERT_TRUE(w.is_deterministic());
+        epee::wipeable_string locked_seed;
+        ASSERT_FALSE(w.get_seed(locked_seed));
+    }
+
+    {
+        tools::wallet2 w;
+        w.load(wallet_file.string(), password);
+        ASSERT_TRUE(w.is_key_encryption_enabled());
+        ASSERT_FALSE(verify_wallet_privkeys(w));
+        ASSERT_TRUE(w.is_deterministic());
+    }
+
+    {
+        tools::wallet2 w;
+        w.generate("", password, crypto::secret_key(), false, true);
+        ASSERT_TRUE(w.is_key_encryption_enabled());
+        ASSERT_FALSE(verify_wallet_privkeys(w));
+        ASSERT_FALSE(w.is_deterministic());
+    }
+}
+
+TEST(wallet_keys_unlocker, deterministic_state_survives_hard_rescan)
+{
+    const epee::wipeable_string password("correct horse battery staple");
+    tools::wallet2 w;
+    w.generate("", password);
+    ASSERT_TRUE(w.is_deterministic());
+    w.rescan_blockchain(true, false);
+    ASSERT_TRUE(w.is_deterministic());
+
+    {
+        tools::wallet_keys_unlocker ul(w, &password);
+        ASSERT_TRUE(w.is_deterministic());
+        w.rescan_blockchain(true, false);
+        ASSERT_TRUE(w.is_deterministic());
+    }
+
+    ASSERT_TRUE(w.is_deterministic());
+}
+
+TEST(wallet_keys_unlocker, simple_nonce)
+{
+    // Test that encrypted keys are different each time, i.e. that a nonce may actually be used
+
+    const epee::wipeable_string password("1612");
+    tools::wallet2 w;
+    w.generate("", password);
+    ASSERT_TRUE(w.is_key_encryption_enabled());
+    ASSERT_FALSE(w.is_unattended());
+    ASSERT_FALSE(verify_wallet_privkeys(w));
+    std::unordered_set<crypto::secret_key> encrypted_spendkeys;
+    encrypted_spendkeys.insert(w.get_account().get_keys().m_spend_secret_key);
+
+    const int n_locks = 10;
+    for (int i = 0; i < n_locks; ++i)
+    {
+        {
+            tools::wallet_keys_unlocker ul(w, &password);
+        }
+        const crypto::secret_key enc_spendkey = w.get_account().get_keys().m_spend_secret_key;
+        ASSERT_FALSE(encrypted_spendkeys.count(enc_spendkey));
+        encrypted_spendkeys.insert(enc_spendkey);
+    }
+
+    ASSERT_EQ(n_locks + 1, encrypted_spendkeys.size());
+}
+
+TEST(wallet_keys_unlocker, mutiple_attended)
+{
+    // Test that multiple non-unattended wallets can be decrypted at the same time.
+
+    const epee::wipeable_string password1("https://www.justice.gov/archives/opa/pr/bitcoin-fog-operator-convicted-money-laundering-conspiracy");
+    const epee::wipeable_string password2("https://cointelegraph.com/news/bad-blockchain-forensics-convict-roman-sterlingov");
+
+    tools::wallet2 w1;
+    w1.generate("", password1);
+    ASSERT_TRUE(w1.is_key_encryption_enabled());
+    ASSERT_FALSE(w1.is_unattended());
+    ASSERT_FALSE(verify_wallet_privkeys(w1));
+    const crypto::secret_key w1_ks_encrypted = w1.get_account().get_keys().m_spend_secret_key;
+    const crypto::public_key w1_spend_pubkey = w1.get_account().get_keys().m_account_address.m_spend_public_key;
+
+    tools::wallet2 w2;
+    w2.generate("", password2);
+    ASSERT_TRUE(w2.is_key_encryption_enabled());
+    ASSERT_FALSE(w2.is_unattended());
+    ASSERT_FALSE(verify_wallet_privkeys(w2));
+    const crypto::secret_key w2_ks_encrypted = w2.get_account().get_keys().m_spend_secret_key;
+    const crypto::public_key w2_spend_pubkey = w2.get_account().get_keys().m_account_address.m_spend_public_key;
+
+    ASSERT_NE(w1_ks_encrypted, w2_ks_encrypted);
+    ASSERT_NE(w1_spend_pubkey, w2_spend_pubkey);
+
+    crypto::secret_key w1_ks_unencrypted;
+    crypto::secret_key w2_ks_unencrypted;
+    for (size_t i = 0; i < 2; ++i)
+    {
+        tools::wallet_keys_unlocker ul1 = WALLET_KEYS_UNLOCKER_CTOR(w1, &password1);
+        w1_ks_unencrypted = w1.get_account().get_keys().m_spend_secret_key;
+        ASSERT_NE(w1_ks_encrypted, w1_ks_unencrypted);
+        EXPECT_TRUE(verify_wallet_privkeys(w1));
+
+        tools::wallet_keys_unlocker ul2 = WALLET_KEYS_UNLOCKER_CTOR(w2, &password2);
+        w2_ks_unencrypted = w2.get_account().get_keys().m_spend_secret_key;
+        ASSERT_NE(w2_ks_encrypted, w2_ks_unencrypted);
+        EXPECT_TRUE(verify_wallet_privkeys(w2));
+    }
+
+    ASSERT_NE(w1_ks_unencrypted, w1.get_account().get_keys().m_spend_secret_key);
+    ASSERT_NE(w2_ks_unencrypted, w2.get_account().get_keys().m_spend_secret_key);
+}
+
+TEST(wallet_keys_unlocker, non_concentric_lifetime)
+{
+    // Test that wallet unlock-ers which aren't concentric still keep the wallet decrypted as
+    // long as one of them is alive.
+
+    const epee::wipeable_string password1("540fa389d7cf4476b061f6443215583d739b01b5d7d9b972a9c0600084bb3694");
+
+    tools::wallet2 w1;
+    w1.generate("", password1);
+    ASSERT_TRUE(w1.is_key_encryption_enabled());
+    ASSERT_FALSE(w1.is_unattended());
+    ASSERT_FALSE(verify_wallet_privkeys(w1));
+    const crypto::secret_key w1_ks_encrypted = w1.get_account().get_keys().m_spend_secret_key;
+
+    std::unique_ptr<tools::wallet_keys_unlocker> ul1(new WALLET_KEYS_UNLOCKER_CTOR(w1, &password1));
+    const crypto::secret_key w1_ks_unencrypted_1 = w1.get_account().get_keys().m_spend_secret_key;
+    ASSERT_NE(w1_ks_encrypted, w1_ks_unencrypted_1);
+    ASSERT_TRUE(verify_wallet_privkeys(w1));
+
+    std::unique_ptr<tools::wallet_keys_unlocker> ul2(new WALLET_KEYS_UNLOCKER_CTOR(w1, &password1));
+    const crypto::secret_key w1_ks_unencrypted_2 = w1.get_account().get_keys().m_spend_secret_key;
+    ASSERT_EQ(w1_ks_unencrypted_1, w1_ks_unencrypted_2);
+
+    ul1.reset(); // call ul1 destructor before ul2 destructor
+
+    const crypto::secret_key w1_ks_unencrypted_3 = w1.get_account().get_keys().m_spend_secret_key;
+    ASSERT_EQ(w1_ks_unencrypted_1, w1_ks_unencrypted_3);
+
+    ul2.reset(); // call ul2 destructor
+
+    ASSERT_NE(w1_ks_unencrypted_1, w1.get_account().get_keys().m_spend_secret_key);
+    ASSERT_NE(w1_ks_encrypted, w1.get_account().get_keys().m_spend_secret_key); // should use a unique nonce
+
+    // test that wallets were re-encrypted correctly & recoverable after non-concentric dtors
+    ASSERT_FALSE(verify_wallet_privkeys(w1));
+    tools::wallet_keys_unlocker ul3(w1, &password1);
+    ASSERT_TRUE(verify_wallet_privkeys(w1));
+}
+
+TEST(wallet_keys_unlocker, first_not_locked)
+{
+    // Test that if the first unlock-er is disabled, then subsequent unlock-ers decrypt successfully
+
+    const epee::wipeable_string password1("Ashigaru");
+
+    tools::wallet2 w1;
+    w1.generate("", password1);
+    ASSERT_TRUE(w1.is_key_encryption_enabled());
+    ASSERT_FALSE(w1.is_unattended());
+    ASSERT_FALSE(verify_wallet_privkeys(w1));
+    const crypto::secret_key w1_ks_encrypted = w1.get_account().get_keys().m_spend_secret_key;
+
+    {
+        tools::wallet_keys_unlocker ul1 = WALLET_KEYS_UNLOCKER_CTOR(w1, nullptr);
+        const crypto::secret_key w1_ks_encrypted_2 = w1.get_account().get_keys().m_spend_secret_key;
+        ASSERT_EQ(w1_ks_encrypted_2, w1_ks_encrypted); // is disabled ?
+
+        tools::wallet_keys_unlocker ul2 = WALLET_KEYS_UNLOCKER_CTOR(w1, &password1);
+        const crypto::secret_key w1_ks_unencrypted = w1.get_account().get_keys().m_spend_secret_key;
+        ASSERT_NE(w1_ks_encrypted_2, w1_ks_unencrypted);
+        ASSERT_TRUE(verify_wallet_privkeys(w1));
+    }
+}
+
+TEST(wallet_keys_unlocker, construction_failure_rolls_back_lock_count)
+{
+    const epee::wipeable_string password("correct horse battery staple");
+    const epee::wipeable_string wrong_password("correct horse battery stable");
+
+    tools::wallet2 w;
+    w.generate("", password);
+    ASSERT_TRUE(w.is_key_encryption_enabled());
+    ASSERT_FALSE(w.is_unattended());
+    ASSERT_FALSE(verify_wallet_privkeys(w));
+
+    ASSERT_ANY_THROW({
+        tools::wallet_keys_unlocker ul(w, &wrong_password);
+    });
+    ASSERT_FALSE(verify_wallet_privkeys(w));
+
+    {
+        tools::wallet_keys_unlocker ul(w, &password);
+        ASSERT_TRUE(verify_wallet_privkeys(w));
+    }
+    ASSERT_FALSE(verify_wallet_privkeys(w));
+}

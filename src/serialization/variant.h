@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -38,14 +38,13 @@
 
 #include <boost/variant/variant.hpp>
 #include <boost/variant/apply_visitor.hpp>
-#include <boost/variant/static_visitor.hpp>
-#include <boost/mpl/empty.hpp>
-#include <boost/mpl/if.hpp>
-#include <boost/mpl/front.hpp>
-#include <boost/mpl/pop_front.hpp>
+#include <boost/mpl/vector.hpp>
+
+#include <variant>
+
 #include "serialization.h"
 
-/*! \struct variant_serialization_triats
+/*! \struct variant_serialization_traits
  * 
  * \brief used internally to contain a variant's traits/possible types
  *
@@ -72,9 +71,9 @@ struct variant_reader
   {
     if(variant_serialization_traits<Archive, current_type>::get_tag() == t) {
       current_type x;
-      if(!::do_serialize(ar, x))
+      if(!do_serialize(ar, x))
       {
-        ar.stream().setstate(std::ios::failbit);
+        ar.set_fail();
         return false;
       }
       v = x;
@@ -95,63 +94,94 @@ struct variant_reader<Archive, Variant, TBegin, TBegin>
 
   static inline bool read(Archive &ar, Variant &v, variant_tag_type t)
   {
-    ar.stream().setstate(std::ios::failbit);
+    ar.set_fail();
     return false;
   }
 };
 
-
-template <template <bool> class Archive, BOOST_VARIANT_ENUM_PARAMS(typename T)>
-struct serializer<Archive<false>, boost::variant<BOOST_VARIANT_ENUM_PARAMS(T)>>
+namespace detail
 {
-  typedef boost::variant<BOOST_VARIANT_ENUM_PARAMS(T)> variant_type;
-  typedef typename Archive<false>::variant_tag_type variant_tag_type;
-  typedef typename variant_type::types types;
+template <typename T>
+struct is_variant_serializable: std::false_type {};
 
-  static bool serialize(Archive<false> &ar, variant_type &v) {
-    variant_tag_type t;
+template <typename... T>
+struct is_variant_serializable<boost::variant<T...>>: std::true_type {};
+
+template <typename... T>
+struct is_variant_serializable<std::variant<T...>>: std::true_type {};
+
+template <typename T>
+struct get_variant_types {};
+
+template <typename... T>
+struct get_variant_types<boost::variant<T...>>
+{ using types = typename boost::variant<T...>::types; };
+
+template <typename... T>
+struct get_variant_types<std::variant<T...>>
+{ using types = boost::mpl::vector<T...>; };
+
+} //namespace detail
+
+template <
+  template <bool> class Archive,
+  typename Variant,
+  typename = std::enable_if_t<detail::is_variant_serializable<Variant>::value>
+  >
+static bool do_serialize(Archive<false> &ar, Variant &v) {
+    using types = typename detail::get_variant_types<Variant>::types;
+    typename Archive<false>::variant_tag_type t;
     ar.begin_variant();
     ar.read_variant_tag(t);
-    if(!variant_reader<Archive<false>, variant_type,
+    if(!variant_reader<Archive<false>, Variant,
        typename boost::mpl::begin<types>::type,
        typename boost::mpl::end<types>::type>::read(ar, v, t))
     {
-      ar.stream().setstate(std::ios::failbit);
+      ar.set_fail();
       return false;
     }
     ar.end_variant();
     return true;
-  }
-};
+}
 
-template <template <bool> class Archive, BOOST_VARIANT_ENUM_PARAMS(typename T)>
-struct serializer<Archive<true>, boost::variant<BOOST_VARIANT_ENUM_PARAMS(T)>>
+template <template <bool> class Archive>
+struct variant_write_visitor
 {
-  typedef boost::variant<BOOST_VARIANT_ENUM_PARAMS(T)> variant_type;
-  //typedef typename Archive<true>::variant_tag_type variant_tag_type;
-
-  struct visitor : public boost::static_visitor<bool>
-  {
     Archive<true> &ar;
 
-    visitor(Archive<true> &a) : ar(a) { }
+    variant_write_visitor(Archive<true> &a) : ar(a) { }
 
     template <class T>
     bool operator ()(T &rv) const
     {
       ar.begin_variant();
       ar.write_variant_tag(variant_serialization_traits<Archive<true>, T>::get_tag());
-      if(!::do_serialize(ar, rv))
+      if(!do_serialize(ar, rv))
       {
-        ar.stream().setstate(std::ios::failbit);
+        ar.set_fail();
         return false;
       }
       ar.end_variant();
       return true;
     }
-  };
-
-  static bool serialize(Archive<true> &ar, variant_type &v) {
-    return boost::apply_visitor(visitor(ar), v);
-  }
 };
+
+template <
+  template <bool> class Archive,
+  typename... T,
+  typename = std::enable_if_t<detail::is_variant_serializable<boost::variant<T...>>::value>
+  >
+static bool do_serialize(Archive<true> &ar, boost::variant<T...> &v)
+{
+  return boost::apply_visitor(variant_write_visitor<Archive>(ar), v);
+}
+
+template <
+  template <bool> class Archive,
+  typename... T,
+  typename = std::enable_if_t<detail::is_variant_serializable<std::variant<T...>>::value>
+  >
+static bool do_serialize(Archive<true> &ar, std::variant<T...> &v)
+{
+  return std::visit(variant_write_visitor<Archive>(ar), v);
+}

@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -41,10 +41,9 @@ target_link_libraries(net_load_tests_clt
     cryptonote_core
     epee
     ${GTEST_LIBRARIES}
-    ${Boost_CHRONO_LIBRARY}
     ${Boost_DATE_TIME_LIBRARY}
     ${Boost_SYSTEM_LIBRARY}
-    ${Boost_THREAD_LIBARRY}
+    ${Boost_THREAD_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES})
 
@@ -63,7 +62,6 @@ target_link_libraries(net_load_tests_srv
     cryptonote_core
     epee
     ${GTEST_LIBRARIES}
-    ${Boost_CHRONO_LIBRARY}
     ${Boost_DATE_TIME_LIBRARY}
     ${Boost_SYSTEM_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -72,8 +70,7 @@ target_link_libraries(net_load_tests_srv
 set_property(TARGET net_load_tests_clt net_load_tests_srv
   PROPERTY
     FOLDER "tests")
-if(NOT MSVC)
-  set_property(TARGET net_load_tests_clt net_load_tests_srv APPEND_STRING
-    PROPERTY
-      COMPILE_FLAGS " -Wno-undef -Wno-sign-compare")
-endif()
+
+set_property(TARGET net_load_tests_clt net_load_tests_srv APPEND_STRING
+  PROPERTY
+    COMPILE_FLAGS " -Wno-undef -Wno-sign-compare")

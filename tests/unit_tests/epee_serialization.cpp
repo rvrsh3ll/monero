@@ -1,4 +1,5 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2020-2024, The Monero Project
+
 //
 // All rights reserved.
 //
@@ -28,8 +29,12 @@
 
 #include <cstdint>
 #include <gtest/gtest.h>
+#include <vector>
 
+#include "serialization/keyvalue_serialization.h"
+#include "storages/parserse_base_utils.h"
 #include "storages/portable_storage.h"
+#include "storages/portable_storage_template_helper.h"
 #include "span.h"
 
 TEST(epee_binary, two_keys)
@@ -52,4 +57,279 @@ TEST(epee_binary, duplicate_key)
 
   epee::serialization::portable_storage storage{};
   EXPECT_FALSE(storage.load_from_binary(data));
+}
+
+namespace
+{
+struct ObjOfObjs
+{
+  std::vector<ObjOfObjs> x;
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE(x)
+  END_KV_SERIALIZE_MAP()
+};
+
+struct ObjOfInts
+{
+  std::list<int> x;
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE(x)
+  END_KV_SERIALIZE_MAP()
+};
+
+template<typename t_param>
+struct ParentObjWithOptChild
+{
+  t_param     params;
+
+  ParentObjWithOptChild(): params{} {}
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE(params)
+  END_KV_SERIALIZE_MAP()
+};
+
+struct ObjWithOptChild
+{
+  bool test_value;
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE_OPT(test_value, true);
+  END_KV_SERIALIZE_MAP()
+};
+
+struct ObjWithBool
+{
+  bool b;
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE(b)
+  END_KV_SERIALIZE_MAP()
+};
+
+struct ObjWithString
+{
+  std::string s;
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE(s)
+  END_KV_SERIALIZE_MAP()
+};
+}
+
+TEST(epee_json, keyword_values)
+{
+  // true/false/null parse as keyword values
+  ObjWithBool o{};
+
+  o.b = false;
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o, std::string("{\"b\": true}")));
+  EXPECT_TRUE(o.b);
+
+  o.b = true;
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o, std::string("{\"b\": false}")));
+  EXPECT_FALSE(o.b);
+
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o, std::string("{\"b\": null}")));
+
+  // A value beginning with a non-ASCII byte (most significant bit == 1) is not
+  // a keyword and must be rejected.
+  EXPECT_FALSE(epee::serialization::load_t_from_json(o, std::string("{\"b\": \xc3\x28}")));
+}
+
+TEST(epee_json, accepts_empty_document)
+{
+  // a GET without a body; the RPC routes relied on this before #11367
+  epee::serialization::portable_storage storage;
+  EXPECT_TRUE(storage.load_from_json(""));
+  EXPECT_TRUE(storage.load_from_json(" \t\r\n"));
+  EXPECT_FALSE(storage.load_from_json(" x"));
+}
+
+TEST(epee_json, rejects_incomplete_and_trailing_documents)
+{
+  epee::serialization::portable_storage storage;
+
+  EXPECT_FALSE(storage.load_from_json("{"));
+  EXPECT_FALSE(storage.load_from_json("{\"x\": 1 "));
+  EXPECT_FALSE(storage.load_from_json("{\"x\": 1,"));
+  EXPECT_FALSE(storage.load_from_json("{}garbage"));
+  EXPECT_FALSE(storage.load_from_json("{}{}"));
+  EXPECT_TRUE(storage.load_from_json("{} \t\r\n"));
+}
+
+TEST(epee_json, escape_control_characters)
+{
+  using epee::misc_utils::parse::transform_to_escape_sequence;
+
+  // control characters must be escaped (RFC 8259): the short escapes are used
+  // where JSON defines them and \u00xx otherwise. \v is not a valid JSON escape.
+  EXPECT_EQ(transform_to_escape_sequence(std::string("\x01")), "\\u0001");
+  EXPECT_EQ(transform_to_escape_sequence(std::string("\x07")), "\\u0007");
+  EXPECT_EQ(transform_to_escape_sequence(std::string("\x0b")), "\\u000b");
+  EXPECT_EQ(transform_to_escape_sequence(std::string("\x1f")), "\\u001f");
+  EXPECT_EQ(transform_to_escape_sequence(std::string("a\x00" "b", 3)), "a\\u0000b");
+
+  // short escapes and printable text are unchanged
+  EXPECT_EQ(transform_to_escape_sequence(std::string("a\tb\n\r\f\b")), "a\\tb\\n\\r\\f\\b");
+  EXPECT_EQ(transform_to_escape_sequence(std::string("plain text")), "plain text");
+
+  // control characters round trip through the json serialiser and parser, and
+  // never appear verbatim in the serialised output
+  ObjWithString o{};
+  o.s = std::string("x\x01\x0b" "y", 4);
+  std::string j;
+  EXPECT_TRUE(epee::serialization::store_t_to_json(o, j));
+  EXPECT_EQ(j.find('\x01'), std::string::npos);
+  EXPECT_EQ(j.find('\x0b'), std::string::npos);
+
+  ObjWithString o2{};
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o2, j));
+  EXPECT_EQ(o2.s, o.s);
+}
+
+TEST(epee_binary, serialize_deserialize)
+{
+  ParentObjWithOptChild<ObjWithOptChild> o;
+  std::string o_json;
+  o.params.test_value = true;
+
+  EXPECT_TRUE(epee::serialization::store_t_to_json(o, o_json));
+  EXPECT_TRUE(o.params.test_value);
+
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o, o_json));
+  EXPECT_TRUE(o.params.test_value);
+
+  ParentObjWithOptChild<ObjWithOptChild> o2;
+  std::string o2_json;
+  o.params.test_value = false;
+
+  EXPECT_TRUE(epee::serialization::store_t_to_json(o2, o2_json));
+  EXPECT_FALSE(o2.params.test_value);
+
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o2, o2_json));
+  EXPECT_FALSE(o2.params.test_value);
+
+  // compiler sets default value of test_value to false
+  ParentObjWithOptChild<ObjWithOptChild> o3;
+  std::string o3_json;
+
+  EXPECT_TRUE(epee::serialization::store_t_to_json(o3, o3_json));
+  EXPECT_FALSE(o3.params.test_value);
+
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o3, o3_json));
+  EXPECT_FALSE(o3.params.test_value);
+
+  // test optional field default initialization.
+  ParentObjWithOptChild<ObjWithOptChild> o4;
+  std::string o4_json = "{\"params\": {}}";
+
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o4, o4_json));
+  EXPECT_TRUE(o4.params.test_value);
+}
+
+TEST(epee_binary, any_empty_seq)
+{
+  // Test that any c++ sequence type (std::vector, std::list, etc) can deserialize without error
+  // from an *empty* epee binary array of any type. This property is useful for other projects who
+  // maintain code which serializes epee binary but don't know the type of arrays until runtime.
+  // Without any elements to actually serialize, they don't know what type code to use for arrays
+  // and should be able to choose a default typecode.
+
+  static constexpr const std::uint8_t data_empty_bool[] = {
+    0x01, 0x11, 0x01, 0x1, 0x01, 0x01, 0x02, 0x1, 0x1, 0x04, 0x01, 'x', 0x8B /*array of bools*/, 0x00 /*length 0*/
+  };
+
+  static constexpr const std::uint8_t data_empty_double[] = {
+    0x01, 0x11, 0x01, 0x1, 0x01, 0x01, 0x02, 0x1, 0x1, 0x04, 0x01, 'x', 0x89 /*array of doubles*/, 0x00 /*length 0*/
+  };
+
+  static constexpr const std::uint8_t data_empty_string[] = {
+    0x01, 0x11, 0x01, 0x1, 0x01, 0x01, 0x02, 0x1, 0x1, 0x04, 0x01, 'x', 0x8A /*array of strings*/, 0x00 /*length 0*/
+  };
+
+  static constexpr const std::uint8_t data_empty_int64[] = {
+    0x01, 0x11, 0x01, 0x1, 0x01, 0x01, 0x02, 0x1, 0x1, 0x04, 0x01, 'x', 0x81 /*array of int64s*/, 0x00 /*length 0*/
+  };
+
+  static constexpr const std::uint8_t data_empty_object[] = {
+    0x01, 0x11, 0x01, 0x1, 0x01, 0x01, 0x02, 0x1, 0x1, 0x04, 0x01, 'x', 0x8C /*array of objects*/, 0x00 /*length 0*/
+  };
+
+  ObjOfObjs o;
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(o, epee::span<const std::uint8_t>(data_empty_bool)));
+  EXPECT_EQ(0, o.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(o, epee::span<const std::uint8_t>(data_empty_double)));
+  EXPECT_EQ(0, o.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(o, epee::span<const std::uint8_t>(data_empty_string)));
+  EXPECT_EQ(0, o.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(o, epee::span<const std::uint8_t>(data_empty_int64)));
+  EXPECT_EQ(0, o.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(o, epee::span<const std::uint8_t>(data_empty_object)));
+  EXPECT_EQ(0, o.x.size());
+
+  ObjOfInts i;
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(i, epee::span<const std::uint8_t>(data_empty_bool)));
+  EXPECT_EQ(0, i.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(i, epee::span<const std::uint8_t>(data_empty_double)));
+  EXPECT_EQ(0, i.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(i, epee::span<const std::uint8_t>(data_empty_string)));
+  EXPECT_EQ(0, i.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(i, epee::span<const std::uint8_t>(data_empty_int64)));
+  EXPECT_EQ(0, i.x.size());
+
+  EXPECT_TRUE(epee::serialization::load_t_from_binary(i, epee::span<const std::uint8_t>(data_empty_object)));
+  EXPECT_EQ(0, i.x.size());
+}
+
+namespace
+{
+struct ObjOfString
+{
+  std::string x;
+
+  BEGIN_KV_SERIALIZE_MAP()
+    KV_SERIALIZE(x)
+  END_KV_SERIALIZE_MAP()
+};
+}
+
+TEST(epee_json, unicode_escape_surrogate_pair)
+{
+  // 😀 is the UTF-16 surrogate pair for U+1F600, which must decode to
+  // the 4-byte UTF-8 sequence F0 9F 98 80 (not two 3-byte encoded surrogates).
+  ObjOfString o{};
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o, "{\"x\":\"\\uD83D\\uDE00\"}"));
+  EXPECT_EQ(std::string("\xF0\x9F\x98\x80"), o.x);
+
+  // Highest valid code point U+10FFFF.
+  ObjOfString o2{};
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o2, "{\"x\":\"\\uDBFF\\uDFFF\"}"));
+  EXPECT_EQ(std::string("\xF4\x8F\xBF\xBF"), o2.x);
+
+  // A basic multilingual plane escape is unaffected.
+  ObjOfString o3{};
+  EXPECT_TRUE(epee::serialization::load_t_from_json(o3, "{\"x\":\"\\u20AC\"}"));
+  EXPECT_EQ(std::string("\xE2\x82\xAC"), o3.x);
+}
+
+TEST(epee_json, unicode_escape_bad_surrogate)
+{
+  // A lone high surrogate, a lone low surrogate, and a high surrogate not
+  // followed by a low surrogate are all invalid and must fail to parse.
+  ObjOfString o{};
+  EXPECT_FALSE(epee::serialization::load_t_from_json(o, "{\"x\":\"\\uD83D\"}"));
+  EXPECT_FALSE(epee::serialization::load_t_from_json(o, "{\"x\":\"\\uDE00\"}"));
+  EXPECT_FALSE(epee::serialization::load_t_from_json(o, "{\"x\":\"\\uD83D\\u0041\"}"));
 }

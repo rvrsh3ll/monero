@@ -1,6 +1,6 @@
 // Word list created by Monero contributor sammy007
 // 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -51,7 +51,7 @@ namespace Language
   class Russian: public Base
   {
   public:
-    Russian(): Base("русский язык", "Russian", {}, 4)
+    Russian(): Base("Русский", "Russian", {}, 4)
     {
       static constexpr const char * const words[NWORDS] =
       {

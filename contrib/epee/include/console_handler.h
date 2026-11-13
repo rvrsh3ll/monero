@@ -109,20 +109,21 @@ namespace epee
 
     void stop()
     {
-      if (m_run)
+      // Both the console and the signal thread may call this.
+      if (m_run.exchange(false))
       {
-        m_run.store(false, std::memory_order_relaxed);
-
 #if defined(WIN32)
         ::CloseHandle(::GetStdHandle(STD_INPUT_HANDLE));
 #endif
 
         m_request_cv.notify_one();
         m_reader_thread.join();
-#ifdef HAVE_READLINE
-        m_readline_buffer.stop();
-#endif
       }
+#ifdef HAVE_READLINE
+      // Not inside the check above, as a suspended prompt can restart
+      // readline after the first stop.
+      m_readline_buffer.close();
+#endif
     }
 
     void cancel()
@@ -196,7 +197,7 @@ namespace epee
         if (m_read_status == state_cancelled)
           return false;
 
-        int retval = ::WaitForSingleObject(::GetStdHandle(STD_INPUT_HANDLE), 100);
+        DWORD retval = ::WaitForSingleObject(::GetStdHandle(STD_INPUT_HANDLE), 100);
         switch (retval)
         {
           case WAIT_FAILED:
@@ -312,6 +313,11 @@ eof:
     {
     }
 
+    void set_log_command_arguments(bool log_command_arguments)
+    {
+      m_log_command_arguments = log_command_arguments;
+    }
+
     template<class t_server, class chain_handler>
     bool run(t_server* psrv, chain_handler ch_handler, std::function<std::string(void)> prompt, const std::string& usage = "")
     {
@@ -342,11 +348,9 @@ eof:
       if (!prompt.empty())
       {
 #ifdef HAVE_READLINE
-        std::string color_prompt = "\001\033[1;33m\002" + prompt;
         if (' ' != prompt.back())
-          color_prompt += " ";
-        color_prompt += "\001\033[0m\002";
-        m_stdin_reader.get_readline_buffer().set_prompt(color_prompt);
+          prompt += " ";
+        m_stdin_reader.get_readline_buffer().set_prompt(prompt);
 #else
         epee::set_console_color(epee::console_color_yellow, true);
         std::cout << prompt;
@@ -399,12 +403,12 @@ eof:
 
           string_tools::trim(command);
 
-          LOG_PRINT_L2("Read command: " << command);
+          LOG_PRINT_L2("Read command: " << (m_log_command_arguments ? command : command.substr(0, command.find_first_of(" \t\r\n"))));
           if(cmd_handler(command))
           {
             continue;
           }
-          else if(0 == command.compare("exit") || 0 == command.compare("q"))
+          else if(0 == command.compare("exit") || 0 == command.compare("quit") || 0 == command.compare("q"))
           {
             continue_handle = false;
           }
@@ -431,6 +435,7 @@ eof:
     async_stdin_reader m_stdin_reader;
     std::atomic<bool> m_running = {true};
     std::atomic<bool> m_cancel = {false};
+    bool m_log_command_arguments = true;
     std::function<std::string(void)> m_prompt;
   };
 
@@ -655,6 +660,11 @@ eof:
     void stop_handling()
     {
       m_console_handler.stop();
+    }
+
+    void set_log_command_arguments(bool log_command_arguments)
+    {
+      m_console_handler.set_log_command_arguments(log_command_arguments);
     }
 
     bool run_handling(std::function<std::string(void)> prompt, const std::string& usage_string, std::function<void(void)> exit_handler = NULL)

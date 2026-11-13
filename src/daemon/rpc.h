@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -31,6 +31,9 @@
 #pragma once
 
 #include "rpc/core_rpc_server.h"
+#include "daemon/command_line_args.h"
+#include "cryptonote_protocol/cryptonote_protocol_handler.h"
+#include "p2p.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "daemon"
@@ -56,13 +59,13 @@ public:
     , const bool restricted
     , const std::string & port
     , const std::string & description
-    , bool allow_rpc_payment
+    , const bool disable_login
     )
     : m_server{core.get(), p2p.get()}, m_description{description}
   {
     MGINFO("Initializing " << m_description << " RPC server...");
 
-    if (!m_server.init(vm, restricted, port, allow_rpc_payment))
+    if (!m_server.init(vm, restricted, port, command_line::get_arg(vm, daemon_args::arg_proxy), disable_login))
     {
       throw std::runtime_error("Failed to initialize " + m_description + " RPC server.");
     }

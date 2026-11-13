@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -28,6 +28,7 @@
 
 #include <boost/algorithm/string.hpp>
 #include "misc_log_ex.h"
+#include "string_tools.h"
 #include "util.h"
 #include "dns_utils.h"
 #include "updates.h"
@@ -50,7 +51,7 @@ namespace tools
         "updates.moneropulse.net",
         "updates.moneropulse.fr",
         "updates.moneropulse.de",
-        "updates.moneropulse.no",
+        "updates.moneropulse.co",
         "updates.moneropulse.ch",
         "updates.moneropulse.se"
     };
@@ -71,15 +72,13 @@ namespace tools
       if (software != fields[0] || buildtag != fields[1])
         continue;
 
-      bool alnum = true;
-      for (auto c: fields[3])
-        if (!isalnum(c))
-          alnum = false;
-      if (fields[3].size() != 64 && !alnum)
+      crypto::hash parsed_hash;
+      if (!epee::string_tools::hex_to_pod(fields[3], parsed_hash))
       {
         MWARNING("Invalid hash: " << fields[3]);
         continue;
       }
+      fields[3] = epee::string_tools::pod_to_hex(parsed_hash);
 
       // use highest version
       if (found)

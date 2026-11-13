@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020, The Monero Project
+// Copyright (c) 2019-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -134,7 +134,7 @@ namespace zmq
         {
             /* ZMQ documentation states that message parts are atomic - either
                all are received or none are. Looking through ZMQ code and
-               Github discussions indicates that after part 1 is returned,
+               GitHub discussions indicates that after part 1 is returned,
                `EAGAIN` cannot be returned to meet these guarantees. Unit tests
                verify (for the `inproc://` case) that this is the behavior. 
                Therefore, read errors after the first part are treated as a
@@ -144,15 +144,26 @@ namespace zmq
                 static constexpr const int max_out = std::numeric_limits<int>::max();
                 const std::string::size_type initial = payload.size();
                 message part{};
+                bool too_large = false;
                 for (;;)
                 {
                     int last = 0;
                     if ((last = zmq_msg_recv(part.handle(), socket, flags)) < 0)
                         return last;
 
-                    payload.append(part.data(), part.size());
+                    if (!too_large)
+                        too_large =
+                            max_message_size < payload.size() ||
+                            max_message_size - payload.size() < part.size();
+                    if (!too_large)
+                        payload.append(part.data(), part.size());
                     if (!zmq_msg_more(part.handle()))
                         break;
+                }
+                if (too_large)
+                {
+                    errno = EMSGSIZE;
+                    return -1;
                 }
                 const std::string::size_type added = payload.size() - initial;
                 return unsigned(max_out) < added ? max_out : int(added);

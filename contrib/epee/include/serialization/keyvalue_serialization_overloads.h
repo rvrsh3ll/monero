@@ -26,10 +26,13 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <set>
 #include <list>
 #include <vector>
 #include <deque>
+#include <type_traits>
 #include <boost/mpl/vector.hpp>
 #include <boost/mpl/contains_fwd.hpp>
 
@@ -81,24 +84,6 @@ namespace epee
       return obj._load(stg, hchild_section);
     }
     //-------------------------------------------------------------------------------------------------------------------
-    template<class serializible_type, class t_storage>
-    static bool serialize_t_obj(enableable<serializible_type>& obj, t_storage& stg, typename t_storage::hsection hparent_section, const char* pname)
-    {
-      if(!obj.enabled)
-        return true;
-      return serialize_t_obj(obj.v, stg, hparent_section, pname);
-    }
-    //-------------------------------------------------------------------------------------------------------------------
-    template<class serializible_type, class t_storage>
-    static bool unserialize_t_obj(enableable<serializible_type>& obj, t_storage& stg, typename t_storage::hsection hparent_section, const char* pname)
-    {
-      obj.enabled = false;
-      typename t_storage::hsection	hchild_section = stg.open_section(pname, hparent_section, false);
-      if(!hchild_section) return false;
-      obj.enabled = true;
-      return obj.v._load(stg, hchild_section);
-    }
-    //-------------------------------------------------------------------------------------------------------------------
     template<class stl_container, class t_storage>
     static bool serialize_stl_container_t_val  (const stl_container& container, t_storage& stg, typename t_storage::hsection hparent_section, const char* pname)
     {
@@ -119,7 +104,7 @@ namespace epee
     static bool unserialize_stl_container_t_val(stl_container& container, t_storage& stg, typename t_storage::hsection hparent_section, const char* pname)
     {
       container.clear();
-      typename stl_container::value_type exchange_val;
+      typename stl_container::value_type exchange_val{};
       typename t_storage::harray hval_array = stg.get_first_value(pname, exchange_val, hparent_section);
       if(!hval_array) return false;
       container.insert(container.end(), std::move(exchange_val));
@@ -130,14 +115,17 @@ namespace epee
     template<class stl_container, class t_storage>
     static bool serialize_stl_container_pod_val_as_blob(const stl_container& container, t_storage& stg, typename t_storage::hsection hparent_section, const char* pname)
     {
+      static_assert(std::is_trivially_copyable_v<typename stl_container::value_type>,
+        "serialize_stl_container_pod_val_as_blob requires trivially copyable value_type");
+
       if(!container.size()) return true;
       std::string mb;
       mb.resize(sizeof(typename stl_container::value_type)*container.size());
-      typename stl_container::value_type* p_elem = (typename stl_container::value_type*)mb.data();
+      char *p_elem = mb.data();
       BOOST_FOREACH(const typename stl_container::value_type& v, container)
       {
-        *p_elem = v;
-        p_elem++;
+        memcpy(p_elem, std::addressof(v), sizeof(typename stl_container::value_type));
+        p_elem += sizeof(typename stl_container::value_type);
       }
       return stg.set_value(pname, std::move(mb), hparent_section);
     }
@@ -145,20 +133,28 @@ namespace epee
     template<class stl_container, class t_storage>
     static bool unserialize_stl_container_pod_val_as_blob(stl_container& container, t_storage& stg, typename t_storage::hsection hparent_section, const char* pname)
     {
+      static_assert(std::is_trivially_copyable_v<typename stl_container::value_type>,
+        "unserialize_stl_container_pod_val_as_blob requires trivially copyable value_type");
+
       container.clear();
       std::string buff;
       bool res = stg.get_value(pname, buff, hparent_section);
       if(res)
       {
         size_t loaded_size = buff.size();
-        typename stl_container::value_type* pelem =  (typename stl_container::value_type*)buff.data();
+        char *pelem = buff.data();
         CHECK_AND_ASSERT_MES(!(loaded_size%sizeof(typename stl_container::value_type)), 
           false, 
           "size in blob " << loaded_size << " not have not zero modulo for sizeof(value_type) = " << sizeof(typename stl_container::value_type) << ", type " << typeid(typename stl_container::value_type).name());
         size_t count = (loaded_size/sizeof(typename stl_container::value_type));
         hint_resize(container, count);
         for(size_t i = 0; i < count; i++)
-          container.insert(container.end(), *(pelem++));
+        {
+          typename stl_container::value_type v;
+          memcpy(std::addressof(v), pelem, sizeof(v));
+          container.insert(container.end(), v);
+          pelem += sizeof(v);
+        }
       }
       return res;
     }

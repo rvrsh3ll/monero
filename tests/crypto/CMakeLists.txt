@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -28,7 +28,6 @@
 
 set(crypto_sources
   crypto-ops-data.c
-  crypto-ops.c
   crypto.cpp
   hash.c
   main.cpp

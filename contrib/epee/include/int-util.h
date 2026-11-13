@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -34,10 +34,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
-#ifndef _MSC_VER
 #include <sys/param.h>
-#endif
 
 #if defined(__ANDROID__)
 #include <byteswap.h>
@@ -47,20 +44,6 @@
 #include <endian.h>
 #endif
 
-#if defined(_MSC_VER)
-#include <stdlib.h>
-
-static inline uint32_t rol32(uint32_t x, int r) {
-  static_assert(sizeof(uint32_t) == sizeof(unsigned int), "this code assumes 32-bit integers");
-  return _rotl(x, r);
-}
-
-static inline uint64_t rol64(uint64_t x, int r) {
-  return _rotl64(x, r);
-}
-
-#else
-
 static inline uint32_t rol32(uint32_t x, int r) {
   return (x << (r & 31)) | (x >> (-r & 31));
 }
@@ -68,8 +51,6 @@ static inline uint32_t rol32(uint32_t x, int r) {
 static inline uint64_t rol64(uint64_t x, int r) {
   return (x << (r & 63)) | (x >> (-r & 63));
 }
-
-#endif
 
 static inline uint64_t hi_dword(uint64_t val) {
   return val >> 32;
@@ -250,16 +231,22 @@ static inline void memcpy_swap32(void *dst, const void *src, size_t n) {
 }
 static inline void memcpy_swap64(void *dst, const void *src, size_t n) {
   size_t i;
+  if ((((uintptr_t) dst | (uintptr_t) src) & (sizeof(uint64_t) - 1)) == 0) {
+    for (i = 0; i < n; i++) {
+      ((uint64_t *) dst)[i] = swap64(((const uint64_t *) src)[i]);
+    }
+    return;
+  }
+
+  uint8_t *dst_bytes = (uint8_t *) dst;
+  const uint8_t *src_bytes = (const uint8_t *) src;
   for (i = 0; i < n; i++) {
-    ((uint64_t *) dst)[i] = swap64(((const uint64_t *) src)[i]);
+    uint64_t value;
+    memcpy(&value, src_bytes + i * sizeof(value), sizeof(value));
+    value = swap64(value);
+    memcpy(dst_bytes + i * sizeof(value), &value, sizeof(value));
   }
 }
-
-#ifdef _MSC_VER
-# define LITTLE_ENDIAN	1234
-# define BIG_ENDIAN	4321
-# define BYTE_ORDER	LITTLE_ENDIAN
-#endif
 
 #if !defined(BYTE_ORDER) || !defined(LITTLE_ENDIAN) || !defined(BIG_ENDIAN)
 static_assert(false, "BYTE_ORDER is undefined. Perhaps, GNU extensions are not enabled");

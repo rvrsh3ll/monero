@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -34,7 +34,6 @@
 #include <algorithm>
 #include <functional>
 #include <boost/endian/conversion.hpp>
-#include <boost/asio/io_service.hpp>
 #include <boost/asio/ip/udp.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/format.hpp>
@@ -42,6 +41,12 @@
 #include "common/apply_permutation.h"
 #include "transport.hpp"
 #include "messages/messages-common.pb.h"
+
+// https://github.com/Tencent/rapidjson/issues/1448
+#ifdef _WIN32
+#undef GetObject
+#endif
+#include <rapidjson/document.h>
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "device.trezor.transport"
@@ -154,10 +159,16 @@ namespace trezor{
   // Helpers
   //
 
+#define PROTO_MAGIC_SIZE 3
 #define PROTO_HEADER_SIZE 6
+#define PROTO_MAX_MESSAGE_SIZE (16 * 1024 * 1024) // Trezor protocol-v1 MESSAGE_MAX_LENGTH
 
   static size_t message_size(const google::protobuf::Message &req){
-    return static_cast<size_t>(req.ByteSize());
+#if GOOGLE_PROTOBUF_VERSION < 3006001
+    return size_t(req.ByteSize());
+#else
+    return req.ByteSizeLong();
+#endif
   }
 
   static size_t serialize_message_buffer_size(size_t msg_size) {
@@ -189,7 +200,7 @@ namespace trezor{
     }
 
     serialize_message_header(buff, msg_wire_num, msg_size);
-    if (!req.SerializeToArray(buff + 6, msg_size)){
+    if (!req.SerializeToArray(buff + PROTO_HEADER_SIZE, msg_size)){
       throw exc::EncodingException("Message serialization error");
     }
   }
@@ -248,16 +259,19 @@ namespace trezor{
       throw exc::CommunicationException("Read chunk has invalid size");
     }
 
-    if (memcmp(chunk_buff_raw, "?##", 3) != 0){
+    if (memcmp(chunk_buff_raw, "?##", PROTO_MAGIC_SIZE) != 0){
       throw exc::CommunicationException("Malformed chunk");
     }
 
     uint16_t tag;
     uint32_t len;
-    nread -= 3 + 6;
-    deserialize_message_header(chunk_buff_raw + 3, tag, len);
+    nread -= PROTO_MAGIC_SIZE + PROTO_HEADER_SIZE;
+    deserialize_message_header(chunk_buff_raw + PROTO_MAGIC_SIZE, tag, len);
+    if (len > PROTO_MAX_MESSAGE_SIZE){
+      throw exc::CommunicationException("Message too large");
+    }
 
-    epee::wipeable_string data_acc(chunk_buff_raw + 3 + 6, nread);
+    epee::wipeable_string data_acc(chunk_buff_raw + PROTO_MAGIC_SIZE + PROTO_HEADER_SIZE, nread);
     data_acc.reserve(len);
 
     while(nread < len){
@@ -405,7 +419,7 @@ namespace trezor{
     }
 
     if (!m_device_path){
-      throw exc::CommunicationException("Coud not open, empty device path");
+      throw exc::CommunicationException("Could not open, empty device path");
     }
 
     std::string uri = "/acquire/" + m_device_path.get() + "/null";
@@ -471,14 +485,14 @@ namespace trezor{
     }
 
     boost::optional<epee::wipeable_string> bin_data = m_response->parse_hexstr();
-    if (!bin_data){
+    if (!bin_data || bin_data->size() < PROTO_HEADER_SIZE){
       throw exc::CommunicationException("Response is not well hexcoded");
     }
 
     uint16_t msg_tag;
     uint32_t msg_len;
     deserialize_message_header(bin_data->data(), msg_tag, msg_len);
-    if (bin_data->size() != msg_len + 6){
+    if (bin_data->size() - PROTO_HEADER_SIZE != msg_len){
       throw exc::CommunicationException("Response is not well hexcoded");
     }
 
@@ -487,7 +501,7 @@ namespace trezor{
     }
 
     std::shared_ptr<google::protobuf::Message> msg_wrap(MessageMapper::get_message(msg_tag));
-    if (!msg_wrap->ParseFromArray(bin_data->data() + 6, msg_len)){
+    if (!msg_wrap->ParseFromArray(bin_data->data() + PROTO_HEADER_SIZE, msg_len)){
       throw exc::EncodingException("Response is not well hexcoded");
     }
     msg = msg_wrap;
@@ -567,14 +581,19 @@ namespace trezor{
     return ping_int();
   }
 
-  bool UdpTransport::ping_int(boost::posix_time::time_duration timeout){
+  bool UdpTransport::ping_int(boost::asio::steady_timer::duration timeout){
     require_socket();
     try {
       std::string req = "PINGPING";
       char res[8];
 
-      m_socket->send_to(boost::asio::buffer(req.c_str(), req.size()), m_endpoint);
-      receive(res, 8, nullptr, false, timeout);
+      const auto written = m_socket->send_to(boost::asio::buffer(req.c_str(), req.size()), m_endpoint);
+      if (written != req.size())
+        return false;
+      memset(res, 0, sizeof(res));
+      const auto received = receive(res, 8, nullptr, false, timeout);
+      if (received != 8)
+        return false;
 
       return memcmp(res, "PONGPONG", 8) == 0;
 
@@ -605,13 +624,12 @@ namespace trezor{
     }
 
     udp::resolver resolver(m_io_service);
-    udp::resolver::query query(udp::v4(), m_device_host, std::to_string(m_device_port));
-    m_endpoint = *resolver.resolve(query);
+    m_endpoint = *resolver.resolve(udp::v4(), m_device_host, std::to_string(m_device_port)).begin();
 
     m_socket.reset(new udp::socket(m_io_service));
     m_socket->open(udp::v4());
 
-    m_deadline.expires_at(boost::posix_time::pos_infin);
+    m_deadline.expires_after(boost::asio::steady_timer::duration::max());
     check_deadline();
 
     m_proto->session_begin(*this);
@@ -693,14 +711,14 @@ namespace trezor{
     return static_cast<size_t>(len);
   }
 
-  ssize_t UdpTransport::receive(void * buff, size_t size, boost::system::error_code * error_code, bool no_throw, boost::posix_time::time_duration timeout){
+  ssize_t UdpTransport::receive(void * buff, size_t size, boost::system::error_code * error_code, bool no_throw, const boost::asio::steady_timer::duration timeout){
     boost::system::error_code ec;
     boost::asio::mutable_buffer buffer = boost::asio::buffer(buff, size);
 
     require_socket();
 
     // Set a deadline for the asynchronous operation.
-    m_deadline.expires_from_now(timeout);
+    m_deadline.expires_after(timeout);
 
     // Set up the variables that receive the result of the asynchronous
     // operation. The error code is set to would_block to signal that the
@@ -758,7 +776,7 @@ namespace trezor{
     // Check whether the deadline has passed. We compare the deadline against
     // the current time since a new asynchronous operation may have moved the
     // deadline before this actor had a chance to run.
-    if (m_deadline.expires_at() <= boost::asio::deadline_timer::traits_type::now())
+    if (m_deadline.expiry() <= boost::asio::steady_timer::clock_type::now())
     {
       // The deadline has passed. The outstanding asynchronous operation needs
       // to be cancelled so that the blocked receive() function will return.
@@ -770,7 +788,7 @@ namespace trezor{
 
       // There is no longer an active deadline. The expiry is set to positive
       // infinity so that the actor takes no action until a new deadline is set.
-      m_deadline.expires_at(boost::posix_time::pos_infin);
+      m_deadline.expires_after(boost::asio::steady_timer::duration::max());
     }
 
     // Put the actor back to sleep.
@@ -1118,7 +1136,12 @@ namespace trezor{
 
     int transferred = 0;
     int r = libusb_interrupt_transfer(m_usb_device_handle, endpoint, (unsigned char*)buff, (int)size, &transferred, 0);
-    CHECK_AND_ASSERT_THROW_MES(r == 0, "Unable to transfer, r: " << r);
+    if (r != 0){
+      if (r == LIBUSB_ERROR_NO_DEVICE){
+        throw exc::NotConnectedException("Trezor was disconnected");
+      }
+      throw exc::CommunicationException(std::string("Unable to write to Trezor: ") + libusb_error_name(r));
+    }
     if (transferred != (int)size){
       throw exc::CommunicationException("Could not transfer chunk");
     }
@@ -1131,7 +1154,12 @@ namespace trezor{
 
     int transferred = 0;
     int r = libusb_interrupt_transfer(m_usb_device_handle, endpoint, (unsigned char*)buff, (int)size, &transferred, 0);
-    CHECK_AND_ASSERT_THROW_MES(r == 0, "Unable to transfer, r: " << r);
+    if (r != 0){
+      if (r == LIBUSB_ERROR_NO_DEVICE){
+        throw exc::NotConnectedException("Trezor was disconnected");
+      }
+      throw exc::CommunicationException(std::string("Unable to read from Trezor: ") + libusb_error_name(r));
+    }
     if (transferred != (int)size){
       throw exc::CommunicationException("Could not read the chunk");
     }

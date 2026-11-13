@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -76,7 +76,7 @@
                                 multiple of size / 8)
 
     ptr_cast(x,size)            casts a pointer to a pointer to a 
-                                varaiable of length 'size' bits
+                                variable of length 'size' bits
 */
 
 #define ui_type(size)               uint##size##_t

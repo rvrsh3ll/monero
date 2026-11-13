@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -34,23 +34,27 @@ set(unit_tests_sources
   blockchain_db.cpp
   block_queue.cpp
   block_reward.cpp
-  bootstrap_node_selector.cpp
   bulletproofs.cpp
+  bulletproofs_plus.cpp
   canonical_amounts.cpp
   chacha.cpp
   checkpoints.cpp
   command_line.cpp
   crypto.cpp
+  cryptonote_format_utils.cpp
+  curve_trees.cpp
   decompose_amount_into_digits.cpp
   device.cpp
   difficulty.cpp
   dns_resolver.cpp
+  download.cpp
   epee_boosted_tcp_server.cpp
   epee_levin_protocol_handler_async.cpp
+  epee_http_server.cpp
   epee_serialization.cpp
   epee_utils.cpp
   expect.cpp
-  fee.cpp
+  fcmp_pp.cpp
   json_serialization.cpp
   get_xtype_from_string.cpp
   hashchain.cpp
@@ -76,6 +80,7 @@ set(unit_tests_sources
   pruning.cpp
   random.cpp
   rolling_median.cpp
+  scaling_2021.cpp
   serialization.cpp
   sha256.cpp
   slow_memmem.cpp
@@ -85,19 +90,26 @@ set(unit_tests_sources
   test_protocol_pack.cpp
   threadpool.cpp
   tx_proof.cpp
+  tx_verification_utils.cpp
   hardfork.cpp
   unbound.cpp
   uri.cpp
+  util.cpp
   varint.cpp
+  verRctNonSemanticsSimple.cpp
   ringct.cpp
   output_selection.cpp
   vercmp.cpp
   ringdb.cpp
+  wallet_pool.cpp
+  wallet_storage.cpp
   wipeable_string.cpp
   is_hdd.cpp
   aligned.cpp
   rpc_version_str.cpp
-  zmq_rpc.cpp)
+  x25519.cpp
+  zmq_rpc.cpp
+  i2p_sam.cpp)
 
 set(unit_tests_headers
   unit_tests_utils.h)
@@ -113,33 +125,32 @@ target_link_libraries(unit_tests
     daemon_messages
     daemon_rpc_server
     blockchain_db
+    fcmp_pp
     lmdb_lib
     rpc
     net
     serialization
     wallet
     p2p
+    tests_common
     version
     ${Boost_CHRONO_LIBRARY}
     ${Boost_THREAD_LIBRARY}
     ${GTEST_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES}
-    ${ZMQ_LIB})
+    PkgConfig::libzmq)
+if (EPEE_READLINE)
+  target_link_libraries(unit_tests PRIVATE epee_readline)
+endif()
 set_property(TARGET unit_tests
   PROPERTY
     FOLDER "tests")
 
-if (NOT MSVC)
-  set_property(TARGET unit_tests
-    APPEND_STRING
-    PROPERTY
-      COMPILE_FLAGS " -Wno-undef -Wno-sign-compare")
-endif ()
-
-SET_PROPERTY(SOURCE main.cpp PROPERTY COMPILE_FLAGS -DDEFAULT_DATA_DIR="\\"${CMAKE_SOURCE_DIR}/tests/data\\"")
-
-SET_PROPERTY(SOURCE memwipe.cpp PROPERTY COMPILE_FLAGS -Ofast)
+set_property(TARGET unit_tests
+  APPEND_STRING
+  PROPERTY
+    COMPILE_FLAGS " -Wno-undef -Wno-sign-compare")
 
 add_test(
   NAME    unit_tests

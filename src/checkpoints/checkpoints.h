@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -128,6 +128,14 @@ namespace cryptonote
      * @return the height of the highest checkpoint
      */
     uint64_t get_max_height() const;
+
+    /**
+     * @brief gets the highest checkpoint height less than the given block height
+     *
+     * @param block_height the reference block height
+     * @return the nearest checkpoint height below block_height, or 0 if none
+     */
+    uint64_t get_nearest_checkpoint_height(uint64_t block_height) const;
 
     /**
      * @brief gets the checkpoints container

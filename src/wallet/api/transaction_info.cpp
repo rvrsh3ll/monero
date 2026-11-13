@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
 //
@@ -149,6 +149,9 @@ uint64_t TransactionInfoImpl::unlockTime() const
     return m_unlock_time;
 }
 
-} // namespace
+bool TransactionInfoImpl::isDoubleSpendSeen() const
+{
+    return m_double_spend_seen;
+}
 
-namespace Bitmonero = Monero;
+} // namespace

@@ -8,7 +8,7 @@
 // ! (how ever if in some wonderful juristdictions that is not the case, then why not make another sub-class withat that members and licence it as epee part)
 // ! Working on above premise, IF this is valid in your juristdictions, then consider this code as released as:
 
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -36,7 +36,7 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-/* rfree: place for hanlers for the non-template base, can be used by connection<> template class in abstract_tcp_server2 file  */
+/* rfree: place for handlers for the non-template base, can be used by connection<> template class in abstract_tcp_server2 file  */
 
 #ifndef INCLUDED_p2p_connection_basic_hpp
 #define INCLUDED_p2p_connection_basic_hpp
@@ -46,7 +46,11 @@
 #include <atomic>
 #include <memory>
 
-#include <boost/asio.hpp>
+#include <boost/asio/ip/address.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/write.hpp>
 #include <boost/asio/ssl.hpp>
 
 #include "byte_slice.h"
@@ -96,37 +100,35 @@ class connection_basic_pimpl; // PIMPL for this class
 	  e_connection_type_P2P = 2  // to other p2p node (probably limited)
   };
   
-  std::string to_string(t_connection_type type);
 
-class connection_basic { // not-templated base class for rapid developmet of some code parts
+class connection_basic { // not-templated base class for rapid development of some code parts
 		// beware of removing const, net_utils::connection is sketchily doing a cast to prevent storing ptr twice
 		const std::shared_ptr<connection_basic_shared_state> m_state;
 	public:
 
 		std::unique_ptr< connection_basic_pimpl > mI; // my Implementation
 
-		// moved here from orginal connecton<> - common member variables that do not depend on template in connection<>
-    volatile uint32_t m_want_close_connection;
+		// moved here from original connection<> - common member variables that do not depend on template in connection<>
+    std::atomic<bool> m_want_close_connection;
     std::atomic<bool> m_was_shutdown;
     critical_section m_send_que_lock;
     std::deque<byte_slice> m_send_que;
     volatile bool m_is_multithreaded;
     /// Strand to ensure the connection's handlers are not called concurrently.
-    boost::asio::io_service::strand strand_;
+    boost::asio::io_context::strand strand_;
     /// Socket for the connection.
     boost::asio::ssl::stream<boost::asio::ip::tcp::socket> socket_;
     ssl_support_t m_ssl_support;
 
 	public:
 		// first counter is the ++/-- count of current sockets, the other socket_number is only-increasing ++ number generator
-		connection_basic(boost::asio::ip::tcp::socket&& socket, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support);
-		connection_basic(boost::asio::io_service &io_service, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support);
+		connection_basic(boost::asio::io_context &context, boost::asio::ip::tcp::socket&& sock, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support);
+		connection_basic(boost::asio::io_context &context, std::shared_ptr<connection_basic_shared_state> state, ssl_support_t ssl_support);
 
 		virtual ~connection_basic() noexcept(false);
 
                 //! \return `shared_state` object passed in construction (ptr never changes).
 		connection_basic_shared_state& get_state() noexcept { return *m_state; /* verified in constructor */ }
-		connection_basic(boost::asio::io_service& io_service, std::atomic<long> &ref_sock_count, std::atomic<long> &sock_number, ssl_support_t ssl);
 
 		boost::asio::ip::tcp::socket& socket() { return socket_.next_layer(); }
 		ssl_support_t get_ssl_support() const { return m_ssl_support; }
@@ -135,7 +137,7 @@ class connection_basic { // not-templated base class for rapid developmet of som
 		bool handshake(boost::asio::ssl::stream_base::handshake_type type, boost::asio::const_buffer buffer = {})
 		{
 			//m_state != nullptr verified in constructor
-			return m_state->ssl_options().handshake(socket_, type, buffer);
+			return m_state->ssl_options().handshake(strand_.context(), socket_, type, buffer);
 		}
 
 		template<typename MutableBufferSequence, typename ReadHandler>
@@ -166,8 +168,6 @@ class connection_basic { // not-templated base class for rapid developmet of som
 		}
 
 		// various handlers to be called from connection class:
-		void do_send_handler_write(const void * ptr , size_t cb);
-		void do_send_handler_write_from_queue(const boost::system::error_code& e, size_t cb , int q_len); // from handle_write, sending next part
 
 		void logger_handle_net_write(size_t size); // network data written
 		void logger_handle_net_read(size_t size); // network data read
@@ -184,8 +184,6 @@ class connection_basic { // not-templated base class for rapid developmet of som
 		static int get_tos_flag();
 
 		// handlers and sleep
-		void sleep_before_packet(size_t packet_size, int phase, int q_len); // execute a sleep ; phase is not really used now(?)
-		static void save_limit_to_file(int limit); ///< for dr-monero
 		static double get_sleep_time(size_t cb);
 };
 

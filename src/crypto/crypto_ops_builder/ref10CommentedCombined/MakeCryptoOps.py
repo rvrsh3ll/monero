@@ -1,4 +1,4 @@
-#assumes you have gnu sed, osx sed might need slight syntax changeo
+#assumes you have gnu sed, osx sed might need slight syntax changes
 #c.f. https://unix.stackexchange.com/questions/112023/how-can-i-replace-a-string-in-a-files
 
 #written by shen-noether monero research labs
@@ -15,7 +15,7 @@ print("maybe someone smart can replace the sed with perl..")
 a = ""
 
 license = textwrap.dedent("""\
-    // Copyright (c) 2014-2020, The Monero Project
+    // Copyright (c) 2014-2024, The Monero Project
     // 
     // All rights reserved.
     // 

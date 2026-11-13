@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020, The Monero Project
+// Copyright (c) 2017-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -35,16 +35,15 @@
 #include "device.hpp"
 #include "log.hpp"
 #include "device_io_hid.hpp"
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/recursive_mutex.hpp>
+#include <mutex>
 
 namespace hw {
 
     namespace ledger {
 
-    /* Minimal supported version */
+    /* Minimum supported version */
     #define MINIMAL_APP_VERSION_MAJOR    1
-    #define MINIMAL_APP_VERSION_MINOR    6
+    #define MINIMAL_APP_VERSION_MINOR    8
     #define MINIMAL_APP_VERSION_MICRO    0
 
     #define VERSION(M,m,u)       ((M)<<16|(m)<<8|(u))
@@ -87,9 +86,8 @@ namespace hw {
     #define SW_PROTOCOL_NOT_SUPPORTED               0x6e00
     #define SW_UNKNOWN                              0x6f00
 
-    namespace {
-        bool apdu_verbose =true;
-    }
+    // Origin: https://github.com/LedgerHQ/ledger-live/blob/68b9451b5456ae6cd452d00aa5007a875bdf4c6f/libs/ledgerjs/packages/errors/src/index.ts#L337
+    #define SW_LOCKED_DEVICE                        0x5515
 
     void set_apdu_verbose(bool verbose);
 
@@ -144,8 +142,8 @@ namespace hw {
     class device_ledger : public hw::device {
     private:
         // Locker for concurrent access
-        mutable boost::recursive_mutex   device_locker;
-        mutable boost::mutex   command_locker;
+        mutable std::recursive_mutex   device_locker;
+        mutable std::mutex   command_locker;
 
         //IO
         hw::io::device_io_hid hw_device;
@@ -165,9 +163,13 @@ namespace hw {
         void send_simple(unsigned char ins, unsigned char p1 = 0x00);
         void send_secret(const unsigned char sec[32], int &offset);
         void receive_secret(unsigned char sec[32], int &offset);
+        /**
+         * @brief Request user export view privkey if not requested before, then return whether it has been exported
+         *
+         * Thread-safe. Result in this->viewkey iff this->has_view_key. I/O is performed iff !this->requested_view_key
+         */
+        bool soft_request_view_key();
 
-        // hw running mode
-        device_mode mode;
         bool tx_in_progress;
 
         // map public destination key to ephemeral destination key
@@ -178,14 +180,12 @@ namespace hw {
         //hmac for some encrypted value
         HMACmap hmac_map;
 
-        // To speed up blockchain parsing the view key maybe handle here.
-        crypto::secret_key viewkey;
-        bool has_view_key;
-        
-        //extra debug
-        #ifdef DEBUG_HWDEVICE
+        // To speed up blockchain parsing the view key may be handled here.
+        crypto::secret_key viewkey = crypto::null_skey;
+        bool has_view_key = false;
+        bool requested_view_key = false;
+
         device *controle_device;
-        #endif
 
     public:
         device_ledger();
@@ -227,6 +227,7 @@ namespace hw {
         /* ======================================================================= */
         bool  get_public_address(cryptonote::account_public_address &pubkey) override;
         bool  get_secret_keys(crypto::secret_key &viewkey , crypto::secret_key &spendkey) override;
+        bool  get_cached_view_key(crypto::secret_key &viewkey_out) override;
         bool  generate_chacha_key(const cryptonote::account_keys &keys, crypto::chacha_key &key, uint64_t kdf_rounds) override;
         void  display_address(const cryptonote::subaddress_index& index, const boost::optional<crypto::hash8> &payment_id) override;
 
@@ -254,6 +255,7 @@ namespace hw {
         bool  derive_public_key(const crypto::key_derivation &derivation, const std::size_t output_index, const crypto::public_key &pub,  crypto::public_key &derived_pub) override;
         bool  secret_key_to_public_key(const crypto::secret_key &sec, crypto::public_key &pub) override;
         bool  generate_key_image(const crypto::public_key &pub, const crypto::secret_key &sec, crypto::key_image &image) override;
+        bool  derive_view_tag(const crypto::key_derivation &derivation, const size_t output_index, crypto::view_tag &view_tag) override;
 
         /* ======================================================================= */
         /*                               TRANSACTION                               */
@@ -278,7 +280,8 @@ namespace hw {
                                              const bool &need_additional_txkeys, const std::vector<crypto::secret_key> &additional_tx_keys,
                                              std::vector<crypto::public_key> &additional_tx_public_keys,
                                              std::vector<rct::key> &amount_keys, 
-                                             crypto::public_key &out_eph_public_key) override;
+                                             crypto::public_key &out_eph_public_key,
+                                             const bool use_view_tags, crypto::view_tag &view_tag) override;
 
         bool  mlsag_prehash(const std::string &blob, size_t inputs_size, size_t outputs_size, const rct::keyV &hashes, const rct::ctkeyV &outPk, rct::key &prehash) override;
         bool  mlsag_prepare(const rct::key &H, const rct::key &xx, rct::key &a, rct::key &aG, rct::key &aHP, rct::key &rvII) override;

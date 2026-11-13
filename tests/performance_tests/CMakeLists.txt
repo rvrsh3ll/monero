@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2020, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -36,6 +36,8 @@ set(performance_tests_headers
   construct_tx.h
   derive_public_key.h
   derive_secret_key.h
+  fcmp_pp.h
+  fe_batch_invert.h
   ge_frombytes_vartime.h
   generate_key_derivation.h
   generate_key_image.h
@@ -43,9 +45,11 @@ set(performance_tests_headers
   generate_keypair.h
   signature.h
   is_out_to_acc.h
+  out_can_be_to_acc.h
   subaddress_expand.h
   range_proof.h
   bulletproof.h
+  bulletproof_plus.h
   crypto_ops.h
   sc_reduce32.h
   sc_check.h
@@ -53,7 +57,8 @@ set(performance_tests_headers
   multi_tx_test_base.h
   performance_tests.h
   performance_utils.h
-  single_tx_test_base.h)
+  single_tx_test_base.h
+  zero_commit.h)
 
 monero_add_minimal_executable(performance_tests
   ${performance_tests_sources}
@@ -65,6 +70,7 @@ target_link_libraries(performance_tests
     common
     cncrypto
     epee
+    tests_common
     ${Boost_CHRONO_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES})

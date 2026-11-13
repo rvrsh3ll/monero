@@ -1,0 +1,79 @@
+// Copyright (c) 2024, The Monero Project
+// 
+// All rights reserved.
+// 
+// Redistribution and use in source and binary forms, with or without modification, are
+// permitted provided that the following conditions are met:
+// 
+// 1. Redistributions of source code must retain the above copyright notice, this list of
+//    conditions and the following disclaimer.
+// 
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list
+//    of conditions and the following disclaimer in the documentation and/or other
+//    materials provided with the distribution.
+// 
+// 3. Neither the name of the copyright holder nor the names of its contributors may be
+//    used to endorse or promote products derived from this software without specific
+//    prior written permission.
+// 
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+// THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+// THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#pragma once
+
+extern "C"
+{
+#include "crypto/crypto-ops.h"
+}
+#include "crypto/crypto.h"
+
+namespace fcmp_pp
+{
+//----------------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------------------------
+// Field elems needed to get wei x and y coords
+// Take note of the bounds, and make sure downstream field ops can take said bounds as input.
+struct EdDerivatives final
+{
+    fe one_plus_y;        // bounded by 1.1*2^26,1.1*2^25,1.1*2^26,1.1*2^25,etc.
+    fe one_minus_y;       // bounded by 1.1*2^26,1.1*2^25,1.1*2^26,1.1*2^25,etc.
+    fe one_minus_y_mul_x; // bounded by 1.01*2^25,1.01*2^24,1.01*2^25,1.01*2^24,etc.
+};
+//----------------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------------------------
+bool mul8_is_identity_vartime(const ge_p3 &point);
+
+/*
+point_to_ed_derivatives converts an Ed25519 point to Ed25519 derivatives used for converting to
+Weierstrass coords, as per https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2.
+
+We expect that a point passed in this function has been validated to be in the main subgroup with no torsion,
+and does not equal identity. The `torsion_free_point` param is expected to be the output of
+crypto::get_valid_torsion_cleared_point_vartime.
+*/
+bool point_to_ed_derivatives(const crypto::ec_point &torsion_free_point, EdDerivatives &ed_derivatives);
+
+/*
+ed_derivatives_to_wei_x_y expects as input the output from point_to_ed_derivatives. No point passed in to
+point_to_ed_derivatives can have torsion, otherwise this function has undefined behavior.
+*/
+bool ed_derivatives_to_wei_x_y(const EdDerivatives &ed_derivatives, crypto::ec_coord &wei_x, crypto::ec_coord &wei_y);
+
+/*
+point_to_wei_x_y takes a torsion free point as input, and converts to Weierstrass coordinates.
+
+We expect that a point passed in this function has been validated to be in the main subgroup with no torsion,
+and does not equal identity. The `torsion_free_point` param is expected to be the output of
+crypto::get_valid_torsion_cleared_point_vartime.
+*/
+bool point_to_wei_x_y(const crypto::ec_point &torsion_free_point, crypto::ec_coord &wei_x, crypto::ec_coord &wei_y);
+//----------------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------------------------
+}//namespace fcmp_pp

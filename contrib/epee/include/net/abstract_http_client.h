@@ -43,7 +43,7 @@ namespace net_utils
   inline const char* get_unsave_chars()
   {
     //static constexpr char unsave_chars[] = "\"<>%\\^[]`+$,@:;/!#?=&";
-    static constexpr const char unsave_chars[] = "\"<>%\\^[]`+$,@:;!#&";
+    static constexpr const char unsave_chars[] = "\"<>%\\^[]`+$,@:;!#&=";
     return unsave_chars;
   }
 
@@ -54,7 +54,6 @@ namespace net_utils
   std::string convert(char val);
   std::string conver_to_url_format(const std::string& uri);
   std::string convert_from_url_format(const std::string& uri);
-  std::string convert_to_url_format_force_all(const std::string& uri);
 
 namespace http
 {
@@ -69,10 +68,10 @@ namespace http
     virtual void set_auto_connect(bool auto_connect) = 0;
     virtual bool connect(std::chrono::milliseconds timeout) = 0;
     virtual bool disconnect() = 0;
+    virtual bool shutdown() { return disconnect(); } // tear down: the client need not be usable afterwards; overrides should interrupt blocked calls and be callable from another thread (the default plain disconnect() gives neither guarantee)
     virtual bool is_connected(bool *ssl = NULL) = 0;
     virtual bool invoke(const boost::string_ref uri, const boost::string_ref method, const boost::string_ref body, std::chrono::milliseconds timeout, const http_response_info** ppresponse_info = NULL, const fields_list& additional_params = fields_list()) = 0;
     virtual bool invoke_get(const boost::string_ref uri, std::chrono::milliseconds timeout, const std::string& body = std::string(), const http_response_info** ppresponse_info = NULL, const fields_list& additional_params = fields_list()) = 0;
-    virtual bool invoke_post(const boost::string_ref uri, const std::string& body, std::chrono::milliseconds timeout, const http_response_info** ppresponse_info = NULL, const fields_list& additional_params = fields_list()) = 0;
     virtual uint64_t get_bytes_sent() const = 0;
     virtual uint64_t get_bytes_received() const = 0;
   };

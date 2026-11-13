@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 //
 // All rights reserved.
 //
@@ -43,13 +43,6 @@
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "wallet.wallet2"
 
-// workaround for a suspected bug in pthread/kernel on MacOS X
-#ifdef __APPLE__
-#define DEFAULT_MAX_CONCURRENCY 1
-#else
-#define DEFAULT_MAX_CONCURRENCY 0
-#endif
-
 namespace
 {
   class Print
@@ -76,9 +69,9 @@ namespace wallet_args
   {
     return {"wallet-file", wallet_args::tr("Use wallet <arg>"), ""};
   }
-  command_line::arg_descriptor<std::string> arg_rpc_client_secret_key()
+  command_line::arg_descriptor<std::string> arg_password_file()
   {
-    return {"rpc-client-secret-key", wallet_args::tr("Set RPC client secret key for RPC payments"), ""};
+    return {"password-file", wallet_args::tr("Wallet password file"), ""};
   }
 
   const char* tr(const char* str)
@@ -87,7 +80,8 @@ namespace wallet_args
   }
 
   std::pair<boost::optional<boost::program_options::variables_map>, bool> main(
-    int argc, char** argv,
+    int argc,
+    const char* const argv[],
     const char* const usage,
     const char* const notice,
     boost::program_options::options_description desc_params,
@@ -106,12 +100,11 @@ namespace wallet_args
     const command_line::arg_descriptor<std::string> arg_log_level = {"log-level", "0-4 or categories", ""};
     const command_line::arg_descriptor<std::size_t> arg_max_log_file_size = {"max-log-file-size", "Specify maximum log file size [B]", MAX_LOG_FILE_SIZE};
     const command_line::arg_descriptor<std::size_t> arg_max_log_files = {"max-log-files", "Specify maximum number of rotated log files to be saved (no limit by setting to 0)", MAX_LOG_FILES};
-    const command_line::arg_descriptor<uint32_t> arg_max_concurrency = {"max-concurrency", wallet_args::tr("Max number of threads to use for a parallel job"), DEFAULT_MAX_CONCURRENCY};
+    const command_line::arg_descriptor<uint32_t> arg_max_concurrency = {"max-concurrency", wallet_args::tr("Max number of threads to use for a parallel job"), 0};
     const command_line::arg_descriptor<std::string> arg_log_file = {"log-file", wallet_args::tr("Specify log file"), ""};
     const command_line::arg_descriptor<std::string> arg_config_file = {"config-file", wallet_args::tr("Config file"), "", true};
 
 
-    std::string lang = i18n_get_language();
     tools::on_startup();
 #ifdef NDEBUG
     tools::disable_core_dumps();
@@ -130,8 +123,6 @@ namespace wallet_args
     command_line::add_arg(desc_params, arg_max_log_files);
     command_line::add_arg(desc_params, arg_max_concurrency);
     command_line::add_arg(desc_params, arg_config_file);
-
-    i18n_set_language("translations", "monero", lang);
 
     po::options_description desc_all;
     desc_all.add(desc_general).add(desc_params);

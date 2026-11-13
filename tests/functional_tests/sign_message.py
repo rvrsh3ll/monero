@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2019-2020 The Monero Project
+# Copyright (c) 2019-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -28,8 +28,6 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from __future__ import print_function
-
 """Test message signing/verification RPC calls
 
 Test the following RPCs:
@@ -47,6 +45,7 @@ class MessageSigningTest():
       self.check_signing(False, True)
       self.check_signing(True, False)
       self.check_signing(True, True)
+      self.check_view_only_signing()
 
     def create(self):
         print('Creating wallets')
@@ -69,7 +68,7 @@ class MessageSigningTest():
             assert res.seed == seeds[i]
 
     def check_signing(self, subaddress, spend_key):
-        print('Signing/verifing messages with ' + ('subaddress' if subaddress else 'standard address') + ' ' + ('spend key' if spend_key else 'view key'))
+        print('Signing/verifying messages with ' + ('subaddress' if subaddress else 'standard address') + ' ' + ('spend key' if spend_key else 'view key'))
         messages = ['foo', '']
         if subaddress:
             address = []
@@ -102,6 +101,25 @@ class MessageSigningTest():
                 assert not res.good
                 res = self.wallet[i].verify(message, address[0], signature.replace('SigV2','SigV1'))
                 assert not res.good
+
+    def check_view_only_signing(self):
+        view_only = Wallet(idx = 2)
+        try: view_only.close_wallet()
+        except: pass
+        view_key = self.wallet[0].query_key('view_key').key
+        view_only.generate_from_keys(address = self.address[0], viewkey = view_key)
+        subaddress_index = view_only.create_address().address_index
+
+        for mode, index in [('', 0), ('spend', 0), ('spend', subaddress_index), ('view', subaddress_index)]:
+            try:
+                view_only.sign('foo', address_index = index, signature_type = mode)
+            except AssertionError as error:
+                assert 'message signing key' in str(error)
+            else:
+                assert False, 'signing without the requested private key succeeded'
+
+        signature = view_only.sign('foo', signature_type = 'view').signature
+        assert self.wallet[0].verify('foo', self.address[0], signature).good
 
 if __name__ == '__main__':
     MessageSigningTest().run_test()

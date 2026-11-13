@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #encoding=utf-8
 
-# Copyright (c) 2019-2020 The Monero Project
+# Copyright (c) 2019-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -32,10 +32,8 @@
 """Test basic wallet functionality
 """
 
-from __future__ import print_function
 import sys
-import os
-import errno
+import util_resources
 
 from framework.wallet import Wallet
 from framework.daemon import Daemon
@@ -44,33 +42,55 @@ class WalletTest():
     def run_test(self):
       self.reset()
       self.create()
+      self.set_daemon_with_proxy()
       self.check_main_address()
       self.check_keys()
       self.create_subaddresses()
       self.tags()
+      self.update_lookahead()
       self.attributes()
       self.open_close()
+      self.wallet_exists()
       self.languages()
+      self.generate_from_keys()
+      self.generate_from_json()
       self.change_password()
       self.store()
 
-    def remove_file(self, name):
-        WALLET_DIRECTORY = os.environ['WALLET_DIRECTORY']
-        assert WALLET_DIRECTORY != ''
+    def set_daemon_with_proxy(self):
+        print('Testing daemon URLs with a proxy')
+        wallet = Wallet()
+        wallet.auto_refresh(False)
         try:
-            os.unlink(WALLET_DIRECTORY + '/' + name)
-        except OSError as e:
-            if e.errno != errno.ENOENT:
-                raise
+            wallet.set_daemon('https://example.onion', proxy = '127.0.0.1:9050')
+            wallet.set_daemon('http://example.i2p', proxy = '127.0.0.1:9050')
+            wallet.set_daemon('https://example.onion:443', proxy = '127.0.0.1:9050')
 
-    def remove_wallet_files(self, name):
-        for suffix in ['', '.keys']:
-            self.remove_file(name + suffix)
+            for address, proxy in (('https://example.org', '127.0.0.1:9050'),
+                                   ('https://example.org/foo.onion:443', '127.0.0.1:9050'),
+                                   ('http://[::1%1.onion]', 'socks5://127.0.0.1:9050'),
+                                   ('http://[::1%1.i2p]', 'socks5://127.0.0.1:9050')):
+                ok = False
+                try:
+                    wallet.set_daemon(address, proxy = proxy)
+                except AssertionError as e:
+                    assert 'no strong verification was configured' in str(e)
+                    ok = True
+                assert ok
 
-    def file_exists(self, name):
-        WALLET_DIRECTORY = os.environ['WALLET_DIRECTORY']
-        assert WALLET_DIRECTORY != ''
-        return os.path.isfile(WALLET_DIRECTORY + '/' + name)
+            for address in ('https://example.org\0.onion', 'https://example.org\0.onion:443',
+                            'http://1.2.3.4 x.onion', 'http://1.2.3.4 x.onion:18081',
+                            'http://1.2.3.4\tx.onion', 'http://1.2.3.4\x7fx.onion'):
+                ok = False
+                try:
+                    wallet.set_daemon(address, proxy = '127.0.0.1:9050')
+                except AssertionError as e:
+                    assert 'Failed to parse daemon address' in str(e)
+                    ok = True
+                assert ok
+        finally:
+            wallet.set_daemon('http://127.0.0.1:18180', trusted = True, ssl_support = 'disabled')
+            wallet.auto_refresh(True)
 
     def reset(self):
         print('Resetting blockchain')
@@ -80,9 +100,89 @@ class WalletTest():
         daemon.flush_txpool()
 
     def create(self):
-        print('Creating wallet')
+        print('Creating Polyseed wallet')
         wallet = Wallet()
         # close the wallet if any, will throw if none is loaded
+        try: wallet.close_wallet()
+        except: pass
+        seed = 'pulse tone truth head invite orphan sock wet crumble oven price corn pilot antenna luxury strategy'
+        res = wallet.restore_deterministic_wallet(seed = seed)
+        assert res.address == '455jFA8HBVzH6nMt2AnNXGR77VR3BypYJXYiYCRkHmTY6XtqebWpu9RhA8gv6q68fC9cuSg2NUX49Wtgtr9Az5ynGgogCzt'
+        # Don't check the returned legacy seed against the Polyseed, it's of course different
+        wallet.close_wallet()
+
+        print('Checking explicit language for an ambiguous legacy seed')
+        seed = ' '.join(['pluma'] * 25)
+        wallet.restore_deterministic_wallet(seed = seed)
+        assert wallet.query_key('spend_key').key == '3b040000' * 8
+        wallet.close_wallet()
+        wallet.restore_deterministic_wallet(seed = seed, language = 'Spanish')
+        assert wallet.query_key('spend_key').key == 'b4050000' * 8
+        wallet.close_wallet()
+        wallet.restore_deterministic_wallet(seed = seed, language = 'español')
+        assert wallet.query_key('spend_key').key == 'b4050000' * 8
+        wallet.setup_background_sync(background_sync_type = wallet.background_sync_options.reuse_password)
+        wallet.start_background_sync()
+        wallet.stop_background_sync(wallet_password = '', seed = seed.replace(' ', '  ', 1))
+        assert wallet.query_key('spend_key').key == 'b4050000' * 8
+        spanish_address = wallet.get_address().address
+        spanish_spend_key = wallet.query_key('spend_key').key
+        spanish_view_key = wallet.query_key('view_key').key
+        wallet.close_wallet()
+
+        wallet.generate_from_keys(address = spanish_address, spendkey = spanish_spend_key,
+            viewkey = spanish_view_key)
+        wallet.setup_background_sync(background_sync_type = wallet.background_sync_options.reuse_password)
+        wallet.start_background_sync()
+        wallet.stop_background_sync(wallet_password = '', seed = seed)
+        assert wallet.query_key('spend_key').key == spanish_spend_key
+        wallet.close_wallet()
+
+        wallet.generate_from_keys(address = spanish_address, spendkey = spanish_spend_key,
+            viewkey = spanish_view_key, language = 'English')
+        wallet.setup_background_sync(background_sync_type = wallet.background_sync_options.reuse_password)
+        wallet.start_background_sync()
+        wallet.stop_background_sync(wallet_password = '', seed = seed)
+        assert wallet.query_key('spend_key').key == spanish_spend_key
+        wallet.close_wallet()
+
+        seed_offset = 'background sync test'
+        wallet.restore_deterministic_wallet(seed = seed, seed_offset = seed_offset, language = 'Spanish')
+        offset_address = wallet.get_address().address
+        offset_spend_key = wallet.query_key('spend_key').key
+        offset_view_key = wallet.query_key('view_key').key
+        wallet.close_wallet()
+        wallet.generate_from_keys(address = offset_address, spendkey = offset_spend_key,
+            viewkey = offset_view_key)
+        wallet.setup_background_sync(background_sync_type = wallet.background_sync_options.reuse_password)
+        wallet.start_background_sync()
+        wallet.stop_background_sync(wallet_password = '', seed = seed, seed_offset = seed_offset)
+        assert wallet.query_key('spend_key').key == offset_spend_key
+        wallet.close_wallet()
+
+        wallet.restore_deterministic_wallet(seed = seed)
+        address = wallet.get_address().address
+        spend_key = wallet.query_key('spend_key').key
+        view_key = wallet.query_key('view_key').key
+        wallet.close_wallet()
+        wallet.generate_from_keys(address = address, spendkey = spend_key, viewkey = view_key, language = 'Spanish')
+        wallet.setup_background_sync(background_sync_type = wallet.background_sync_options.reuse_password)
+        wallet.start_background_sync()
+        wallet.stop_background_sync(wallet_password = '', seed = seed)
+        assert wallet.query_key('spend_key').key == spend_key
+        wallet.close_wallet()
+
+        french_seed = 'jungle rapport rang koala pire demain soupe queue sondage essai rustre palace truite ficher neveu vent sorte puma membre affirmer borner notice papier pincer ficher'
+        wallet.restore_deterministic_wallet(seed = french_seed, language = 'French')
+        french_spend_key = wallet.query_key('spend_key').key
+        wallet.setup_background_sync(background_sync_type = wallet.background_sync_options.reuse_password)
+        wallet.start_background_sync()
+        wallet.stop_background_sync(wallet_password = '', seed = french_seed)
+        assert wallet.query_key('spend_key').key == french_spend_key
+        wallet.close_wallet()
+
+        print('Creating legacy seed wallet')
+        wallet = Wallet()
         try: wallet.close_wallet()
         except: pass
         seed = 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
@@ -107,6 +207,10 @@ class WalletTest():
         assert res.key == '49774391fa5e8d249fc2c5b45dadef13534bf2483dede880dac88f061e809100'
         res = wallet.query_key('spend_key')
         assert res.key == '148d78d2aba7dbca5cd8f6abcfb0b3c009ffbdbea1ff373d50ed94d78286640e'
+        res = wallet.query_key('public_view_key')
+        assert res.key == '231c9bf8341c6a870d92e3fb98063a90a355fb8dbf74a8561b9d7f9273247e99'
+        res = wallet.query_key('public_spend_key')
+        assert res.key == '1b3bd040020d3712ab84992b773d0a965134eb2df0392fb84af95de8a17be2ab'
         res = wallet.query_key('mnemonic')
         assert res.key == 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
 
@@ -160,6 +264,14 @@ class WalletTest():
         assert res.addresses[2].address == '87KfgTZ8ER5D3Frefqnrqif11TjVsTPaTcp37kqqKMrdDRUhpJRczeR7KiBmSHF32UJLP3HHhKUDmEQyJrv2mV8yFDCq8eB'
         assert res.addresses[2].label == 'sub_1_2'
 
+        all_accounts = wallet.get_address(account_index = 99, subaddresses = [999], all_accounts = True)
+        assert all_accounts.address == wallet.get_address().address
+        assert len(all_accounts.addresses) == 6
+        assert [(a.account_index, a.address_index) for a in all_accounts.addresses] == [
+            (0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (2, 0)]
+        assert all(a.address == wallet.get_address(a.account_index, [a.address_index]).addresses[0].address for a in all_accounts.addresses)
+        assert all(not a.used for a in all_accounts.addresses)
+
         res = wallet.label_address((1, 2), "sub_1_2_new")
         res = wallet.get_address(1, [2])
         assert len(res.addresses) == 1
@@ -182,6 +294,20 @@ class WalletTest():
         assert res.index == {'major': 1, 'minor': 0}
 
         res = wallet.label_account(0, "main")
+
+    def update_lookahead(self):
+        print('Updating subaddress lookahead')
+        wallet = Wallet()
+        address_0_999 = '8BQKgTSSqJjP14AKnZUBwnXWj46MuNmLvHfPTpmry52DbfNjjHVvHUk4mczU8nj8yZ57zBhksTJ8kM5xKeJXw55kCMVqyG7' # this is the address for address 999 of the main account in the test wallet
+        try:  # assert address_1_999 is not in the current pubkey table
+            wallet.get_address_index(address_0_999)
+        except Exception as e:
+            assert str(e) ==  "{'error': {'code': -2, 'message': \"Address doesn't belong to the wallet\"}, 'id': '0', 'jsonrpc': '2.0'}"
+        # update the lookahead and assert the high index address is now in the table
+        wallet.set_subaddress_lookahead(50, 1000)
+        r = wallet.get_address_index(address_0_999)
+        assert r['index']['major'] == 0
+        assert r['index']['minor'] == 999
 
     def tags(self):
         print('Testing tags')
@@ -240,6 +366,26 @@ class WalletTest():
         assert len(res.account_tags) == 1
         assert res.account_tags[0].tag == 'tagB'
         assert res.account_tags[0].label == ''
+        assert res.account_tags[0].accounts == [0, 1]
+        ok = False
+        try: wallet.tag_accounts('tagC', [0, 3])
+        except Exception as e:
+            assert 'Account index out of bound' in str(e)
+            ok = True
+        assert ok
+        res = wallet.get_account_tags()
+        assert len(res.account_tags) == 1
+        assert res.account_tags[0].tag == 'tagB'
+        assert res.account_tags[0].accounts == [0, 1]
+        ok = False
+        try: wallet.untag_accounts([0, 3])
+        except Exception as e:
+            assert 'Account index out of bound' in str(e)
+            ok = True
+        assert ok
+        res = wallet.get_account_tags()
+        assert len(res.account_tags) == 1
+        assert res.account_tags[0].tag == 'tagB'
         assert res.account_tags[0].accounts == [0, 1]
         wallet.set_account_tag_description('tagB', 'tag B')
         res = wallet.get_account_tags()
@@ -305,16 +451,59 @@ class WalletTest():
         res = wallet.get_address()
         assert res.address == '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
 
+    def wallet_exists(self):
+        print('Testing wallet_exists')
+        wallet = Wallet()
+
+        try: wallet.close_wallet()
+        except: pass
+
+        util_resources.remove_wallet_files('test1')
+
+        res = wallet.wallet_exists('test1')
+        assert not res.keys_file_exists
+        assert not res.wallet_file_exists
+
+        seed = 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
+        res = wallet.restore_deterministic_wallet(seed = seed, filename = 'test1')
+        assert res.address == '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
+        assert res.seed == seed
+
+        util_resources.remove_file('test1')
+        res = wallet.wallet_exists('test1')
+        assert res.keys_file_exists
+        assert not res.wallet_file_exists
+
+        wallet.store()
+        res = wallet.wallet_exists('test1')
+        assert res.keys_file_exists
+        assert res.wallet_file_exists
+
+        wallet.close_wallet()
+        util_resources.remove_wallet_files('test1')
+
     def languages(self):
         print('Testing languages')
         wallet = Wallet()
-        res = wallet.get_languages()
+
+        # Legacy languages
+        res = wallet.get_languages(polyseed = False)
         assert 'English' in res.languages
         assert 'English' in res.languages_local
         assert 'Dutch' in res.languages
         assert 'Nederlands' in res.languages_local
         assert 'Japanese' in res.languages
         assert u'日本語' in res.languages_local
+
+        # Polyseed languages
+        res = wallet.get_languages()
+        assert 'English' in res.languages
+        assert 'English' in res.languages_local
+        assert 'Spanish' in res.languages
+        assert 'español' in res.languages_local
+        assert 'Japanese' in res.languages
+        assert u'日本語' in res.languages_local
+
         try: wallet.close_wallet()
         except: pass
         languages = res.languages
@@ -325,6 +514,58 @@ class WalletTest():
             res = wallet.query_key('mnemonic')
             wallet.close_wallet()
 
+    def generate_from_keys(self):
+        print('Generating wallet from keys')
+        wallet = Wallet()
+        filename = 'generate-from-keys'
+        address = '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
+        spend_key = '148d78d2aba7dbca5cd8f6abcfb0b3c009ffbdbea1ff373d50ed94d78286640e'
+        view_key = '49774391fa5e8d249fc2c5b45dadef13534bf2483dede880dac88f061e809100'
+        seed = 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
+
+        try: wallet.close_wallet()
+        except: pass
+        util_resources.remove_wallet_files(filename)
+
+        ok = False
+        try:
+            wallet.generate_from_keys(filename = filename, address = address,
+                spendkey = spend_key, viewkey = view_key, language = 'invalid')
+        except Exception as e:
+            assert 'The specified seed language is invalid.' in str(e)
+            ok = True
+        assert ok
+        assert not util_resources.file_exists(filename)
+        assert not util_resources.file_exists(filename + '.keys')
+
+        res = wallet.generate_from_keys(filename = filename, address = address,
+            spendkey = spend_key, viewkey = view_key, language = 'English')
+        assert res.address == address
+        assert wallet.query_key('mnemonic').key == seed
+
+        attribute = 'wallet-rpc.autosave-test'
+        wallet.auto_refresh(False)
+        wallet.set_attribute(attribute, 'stored')
+        wallet.generate_from_keys(address = address, spendkey = spend_key,
+            viewkey = view_key)
+        wallet.open_wallet(filename, autosave_current = False)
+        assert wallet.get_attribute(attribute).value == 'stored'
+        wallet.auto_refresh(True)
+
+        wallet.close_wallet()
+        util_resources.remove_wallet_files(filename)
+
+    def generate_from_json(self):
+        print('Testing wallet generated from JSON with a Polyseed and a seed passphrase')
+        wallet = Wallet(idx = 7)
+        res = wallet.get_address()
+        # 455jFA8H... without the passphrase, see create()
+        assert res.address == '49PemLZHxP1hCUsbcRZVrAJWBjn7dYi9UQGEqTVAo3hWY1a8PD14Mdcf2fNC5QN3iM6XahTc9qdMi2W3i75C2KU5B7ZDiqn'
+        res = wallet.query_key('mnemonic')
+        assert res.key == 'pulse tone truth head invite orphan sock wet crumble oven price corn pilot antenna luxury strategy'
+        assert res.polyseed_birthday == 1783033776
+        assert not res.polyseed_is_encrypted
+
     def change_password(self):
         print('Testing password change')
         wallet = Wallet()
@@ -333,7 +574,7 @@ class WalletTest():
         try: wallet.close_wallet()
         except: pass
 
-        self.remove_wallet_files('test1')
+        util_resources.remove_wallet_files('test1')
 
         seed = 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
         res = wallet.restore_deterministic_wallet(seed = seed, filename = 'test1')
@@ -359,7 +600,7 @@ class WalletTest():
 
         wallet.close_wallet()
 
-        self.remove_wallet_files('test1')
+        util_resources.remove_wallet_files('test1')
 
     def store(self):
         print('Testing store')
@@ -369,22 +610,26 @@ class WalletTest():
         try: wallet.close_wallet()
         except: pass
 
-        self.remove_wallet_files('test1')
+        util_resources.remove_wallet_files('test1')
 
         seed = 'velvet lymph giddy number token physics poetry unquoted nibs useful sabotage limits benches lifestyle eden nitrogen anvil fewest avoid batch vials washing fences goat unquoted'
         res = wallet.restore_deterministic_wallet(seed = seed, filename = 'test1')
         assert res.address == '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
         assert res.seed == seed
 
-        self.remove_file('test1')
-        assert self.file_exists('test1.keys')
-        assert not self.file_exists('test1')
+        util_resources.remove_file('test1')
+        assert util_resources.file_exists('test1.keys')
+        assert not util_resources.file_exists('test1')
         wallet.store()
-        assert self.file_exists('test1.keys')
-        assert self.file_exists('test1')
+        assert util_resources.file_exists('test1.keys')
+        assert util_resources.file_exists('test1')
 
         wallet.close_wallet()
-        self.remove_wallet_files('test1')
+
+        wallet.open_wallet(filename = 'test1', password = '')
+        wallet.close_wallet()
+
+        util_resources.remove_wallet_files('test1')
 
 
 if __name__ == '__main__':

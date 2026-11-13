@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2026, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -29,10 +29,10 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #pragma once
+
 #include "cryptonote_basic/cryptonote_format_utils.h"
-#include <boost/serialization/vector.hpp>
-#include <boost/serialization/utility.hpp>
 #include "ringct/rctOps.h"
+#include "serialization/wire/fwd.h"
 
 namespace cryptonote
 {
@@ -53,7 +53,7 @@ namespace cryptonote
     rct::key mask;                      //ringct amount mask
     rct::multisig_kLRki multisig_kLRki; //multisig info
 
-    void push_output(uint64_t idx, const crypto::public_key &k, uint64_t amount) { outputs.push_back(std::make_pair(idx, rct::ctkey({rct::pk2rct(k), rct::zeroCommit(amount)}))); }
+    void push_output(uint64_t idx, const crypto::public_key &k, uint64_t amount) { outputs.push_back(std::make_pair(idx, rct::ctkey({rct::pk2rct(k), rct::zeroCommitVartime(amount)}))); }
 
     BEGIN_SERIALIZE_OBJECT()
       FIELD(outputs)
@@ -79,7 +79,7 @@ namespace cryptonote
     bool is_subaddress;
     bool is_integrated;
 
-    tx_destination_entry() : amount(0), addr(AUTO_VAL_INIT(addr)), is_subaddress(false), is_integrated(false) { }
+    tx_destination_entry() : amount(0), addr(), is_subaddress(false), is_integrated(false) { }
     tx_destination_entry(uint64_t a, const account_public_address &ad, bool is_subaddress) : amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false) { }
     tx_destination_entry(const std::string &o, uint64_t a, const account_public_address &ad, bool is_subaddress) : original(o), amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false) { }
 
@@ -107,24 +107,50 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
-  //---------------------------------------------------------------
-  crypto::public_key get_destination_view_key_pub(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::account_public_address>& change_addr);
-  bool construct_tx(const account_keys& sender_account_keys, std::vector<tx_source_entry> &sources, const std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time);
-  bool construct_tx_with_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, const crypto::secret_key &tx_key, const std::vector<crypto::secret_key> &additional_tx_keys, bool rct = false, const rct::RCTConfig &rct_config = { rct::RangeProofBorromean, 0 }, rct::multisig_out *msout = NULL, bool shuffle_outs = true);
-  bool construct_tx_and_get_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, crypto::secret_key &tx_key, std::vector<crypto::secret_key> &additional_tx_keys, bool rct = false, const rct::RCTConfig &rct_config = { rct::RangeProofBorromean, 0 }, rct::multisig_out *msout = NULL);
-  bool generate_output_ephemeral_keys(const size_t tx_version, const cryptonote::account_keys &sender_account_keys, const crypto::public_key &txkey_pub,  const crypto::secret_key &tx_key,
-                                      const cryptonote::tx_destination_entry &dst_entr, const boost::optional<cryptonote::account_public_address> &change_addr, const size_t output_index,
-                                      const bool &need_additional_txkeys, const std::vector<crypto::secret_key> &additional_tx_keys,
-                                      std::vector<crypto::public_key> &additional_tx_public_keys,
-                                      std::vector<rct::key> &amount_keys,
-                                      crypto::public_key &out_eph_public_key) ;
+  inline bool operator==(const tx_destination_entry &a, const tx_destination_entry &b)
+  {
+    return a.original == b.original
+      && a.amount == b.amount
+      && a.addr == b.addr
+      && a.is_subaddress == b.is_subaddress
+      && a.is_integrated == b.is_integrated;
+  }
 
+  //---------------------------------------------------------------
+
+  struct tx_block_template_backlog_entry
+  {
+    crypto::hash id;
+    uint64_t weight;
+    uint64_t fee;
+  };
+  WIRE_DECLARE_OBJECT(tx_block_template_backlog_entry);
+
+  //---------------------------------------------------------------
+  /**
+   * @brief check if can re-derive change address from device / keys
+   * @param change_addr address to attempt to re-derive
+   * @param subaddresses subaddress map
+   * @param keys account keys of sender
+   * @return subaddress index of `change_addr` if in the subaddress map and re-derives from device, otherwise nullopt
+   */
+  std::optional<cryptonote::subaddress_index> sanity_check_change_address(
+    const cryptonote::account_public_address& change_addr,
+    const std::unordered_map<crypto::public_key, cryptonote::subaddress_index>& subaddresses,
+    const cryptonote::account_keys &keys
+  );
+  void classify_addresses(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::account_public_address>& change_addr, size_t &num_stdaddresses, size_t &num_subaddresses, account_public_address &single_dest_subaddress);
+  crypto::public_key get_destination_view_key_pub(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::account_public_address>& change_addr);
+  bool construct_tx(const account_keys& sender_account_keys, std::vector<tx_source_entry> &sources, const std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx);
+  bool construct_tx_with_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, const crypto::secret_key &tx_key, const std::vector<crypto::secret_key> &additional_tx_keys, bool rct = false, const rct::RCTConfig &rct_config = { rct::RangeProofBorromean, 0 }, bool shuffle_outs = true, bool use_view_tags = false);
+  bool construct_tx_and_get_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, crypto::secret_key &tx_key, std::vector<crypto::secret_key> &additional_tx_keys, bool rct = false, const rct::RCTConfig &rct_config = { rct::RangeProofBorromean, 0 }, bool use_view_tags = false);
   bool generate_output_ephemeral_keys(const size_t tx_version, const cryptonote::account_keys &sender_account_keys, const crypto::public_key &txkey_pub,  const crypto::secret_key &tx_key,
                                       const cryptonote::tx_destination_entry &dst_entr, const boost::optional<cryptonote::account_public_address> &change_addr, const size_t output_index,
                                       const bool &need_additional_txkeys, const std::vector<crypto::secret_key> &additional_tx_keys,
                                       std::vector<crypto::public_key> &additional_tx_public_keys,
                                       std::vector<rct::key> &amount_keys,
-                                      crypto::public_key &out_eph_public_key) ;
+                                      crypto::public_key &out_eph_public_key,
+                                      const bool use_view_tags, crypto::view_tag &view_tag) ;
 
   bool generate_genesis_block(
       block& bl
@@ -133,38 +159,19 @@ namespace cryptonote
     );
 
   class Blockchain;
-  bool get_block_longhash(const Blockchain *pb, const block& b, crypto::hash& res, const uint64_t height, const int miners);
-  bool get_block_longhash(const Blockchain *pb, const block& b, crypto::hash& res, const uint64_t height, const crypto::hash *seed_hash, const int miners);
-  void get_altblock_longhash(const block& b, crypto::hash& res, const uint64_t main_height, const uint64_t height,
-    const uint64_t seed_height, const crypto::hash& seed_hash);
-  crypto::hash get_block_longhash(const Blockchain *pb, const block& b, const uint64_t height, const int miners);
-  void get_block_longhash_reorg(const uint64_t split_height);
+  bool get_block_longhash(const Blockchain *pb, const blobdata& bd, crypto::hash& res, const uint64_t height, const int major_version, const crypto::hash *seed_hash, const int miners = 0);
+  bool get_block_longhash(const Blockchain *pb, const block& b, crypto::hash& res, const uint64_t height, const crypto::hash *seed_hash = nullptr, const int miners = 0);
+  crypto::hash get_block_longhash(const Blockchain *pb, const block& b, const uint64_t height, const crypto::hash *seed_hash = nullptr, const int miners = 0);
+  void get_altblock_longhash(const block& b, crypto::hash& res, const crypto::hash& seed_hash);
 
 }
 
-BOOST_CLASS_VERSION(cryptonote::tx_source_entry, 1)
 BOOST_CLASS_VERSION(cryptonote::tx_destination_entry, 2)
 
 namespace boost
 {
   namespace serialization
   {
-    template <class Archive>
-    inline void serialize(Archive &a, cryptonote::tx_source_entry &x, const boost::serialization::version_type ver)
-    {
-      a & x.outputs;
-      a & x.real_output;
-      a & x.real_out_tx_key;
-      a & x.real_output_in_tx_index;
-      a & x.amount;
-      a & x.rct;
-      a & x.mask;
-      if (ver < 1)
-        return;
-      a & x.multisig_kLRki;
-      a & x.real_out_additional_tx_keys;
-    }
-
     template <class Archive>
     inline void serialize(Archive& a, cryptonote::tx_destination_entry& x, const boost::serialization::version_type ver)
     {

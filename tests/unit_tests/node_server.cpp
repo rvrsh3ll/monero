@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -35,10 +35,31 @@
 #include "cryptonote_core/i_core_events.h"
 #include "cryptonote_protocol/cryptonote_protocol_handler.h"
 #include "cryptonote_protocol/cryptonote_protocol_handler.inl"
+#include "net/i2p_address.h"
+#include "net/tor_address.h"
+#include "unit_tests_utils.h"
+#include <algorithm>
+#include <condition_variable>
+#include <thread>
 
 #define MAKE_IPV4_ADDRESS(a,b,c,d) epee::net_utils::ipv4_network_address{MAKE_IP(a,b,c,d),0}
 #define MAKE_IPV4_ADDRESS_PORT(a,b,c,d,e) epee::net_utils::ipv4_network_address{MAKE_IP(a,b,c,d),e}
 #define MAKE_IPV4_SUBNET(a,b,c,d,e) epee::net_utils::ipv4_network_subnet{MAKE_IP(a,b,c,d),e}
+
+namespace
+{
+  boost::filesystem::path create_temp_dir()
+  {
+    boost::system::error_code ec;
+    auto path = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("daemon-%%%%%%%%%%%%%%%%", ec);
+    if (ec)
+      return boost::filesystem::path{};
+    auto success = boost::filesystem::create_directory(path, ec);
+    if (!ec && success)
+      return path;
+    return boost::filesystem::path{};
+  }
+}
 
 namespace cryptonote {
   class blockchain_storage;
@@ -54,30 +75,33 @@ public:
   void set_target_blockchain_height(uint64_t) {}
   bool init(const boost::program_options::variables_map& vm) {return true ;}
   bool deinit(){return true;}
-  bool get_short_chain_history(std::list<crypto::hash>& ids) const { return true; }
+  bool get_short_chain_history(std::list<crypto::hash>& ids, uint64_t& current_height) const { return true; }
   bool have_block(const crypto::hash& id, int *where = NULL) const {return false;}
   bool have_block_unlocked(const crypto::hash& id, int *where = NULL) const {return false;}
   void get_blockchain_top(uint64_t& height, crypto::hash& top_id)const{height=0;top_id=crypto::null_hash;}
-  bool handle_incoming_tx(const cryptonote::tx_blob_entry& tx_blob, cryptonote::tx_verification_context& tvc, cryptonote::relay_method tx_relay, bool relayed) { return true; }
-  bool handle_incoming_txs(const std::vector<cryptonote::tx_blob_entry>& tx_blob, std::vector<cryptonote::tx_verification_context>& tvc, cryptonote::relay_method tx_relay, bool relayed) { return true; }
+  bool handle_incoming_tx(const cryptonote::blobdata& tx_blob, cryptonote::tx_verification_context& tvc, cryptonote::relay_method tx_relay, bool relayed) { return true; }
+  bool handle_single_incoming_block(const cryptonote::blobdata& block_blob, const cryptonote::block *b, cryptonote::block_verification_context& bvc, cryptonote::pool_supplement& extra_block_txs, bool update_miner_blocktemplate = true) { return true; }
   bool handle_incoming_block(const cryptonote::blobdata& block_blob, const cryptonote::block *block, cryptonote::block_verification_context& bvc, bool update_miner_blocktemplate = true) { return true; }
+  bool handle_incoming_block(const cryptonote::blobdata& block_blob, const cryptonote::block *block, cryptonote::block_verification_context& bvc, cryptonote::pool_supplement& extra_block_txs, bool update_miner_blocktemplate = true) { return true; }
   void pause_mine(){}
   void resume_mine(){}
   bool on_idle(){return true;}
   bool find_blockchain_supplement(const std::list<crypto::hash>& qblock_ids, bool clip_pruned, cryptonote::NOTIFY_RESPONSE_CHAIN_ENTRY::request& resp){return true;}
   bool handle_get_objects(cryptonote::NOTIFY_REQUEST_GET_OBJECTS::request& arg, cryptonote::NOTIFY_RESPONSE_GET_OBJECTS::request& rsp, cryptonote::cryptonote_connection_context& context){return true;}
   cryptonote::blockchain_storage &get_blockchain_storage() { throw std::runtime_error("Called invalid member function: please never call get_blockchain_storage on the TESTING class test_core."); }
-  bool get_test_drop_download() const {return true;}
-  bool get_test_drop_download_height() const {return true;}
   bool prepare_handle_incoming_blocks(const std::vector<cryptonote::block_complete_entry>  &blocks_entry, std::vector<cryptonote::block> &blocks) { return true; }
   bool cleanup_handle_incoming_blocks(bool force_sync = false) { return true; }
+  bool check_incoming_block_size(const cryptonote::blobdata& block_blob) const { return true; }
+  bool update_checkpoints(const bool skip_dns = false) { return true; }
   uint64_t get_target_blockchain_height() const { return 1; }
-  size_t get_block_sync_size(uint64_t height) const { return BLOCKS_SYNCHRONIZING_DEFAULT_COUNT; }
+  size_t get_block_sync_size(uint64_t height, const uint64_t max_average_of_blocksize_in_queue = 0) const { return BLOCKS_SYNCHRONIZING_DEFAULT_COUNT; }
+  bool is_block_sync_size_adaptive() const { return false; }
   virtual void on_transactions_relayed(epee::span<const cryptonote::blobdata> tx_blobs, cryptonote::relay_method tx_relay) {}
   cryptonote::network_type get_nettype() const { return cryptonote::MAINNET; }
   bool get_pool_transaction(const crypto::hash& id, cryptonote::blobdata& tx_blob, cryptonote::relay_category tx_category) const { return false; }
   bool pool_has_tx(const crypto::hash &txid) const { return false; }
   bool get_blocks(uint64_t start_offset, size_t count, std::vector<std::pair<cryptonote::blobdata, cryptonote::block>>& blocks, std::vector<cryptonote::blobdata>& txs) const { return false; }
+  bool get_transactions(const std::vector<crypto::hash>& txs_ids, std::vector<cryptonote::blobdata>& txs, std::vector<crypto::hash>& missed_txs, bool pruned = false) const { return false; }
   bool get_transactions(const std::vector<crypto::hash>& txs_ids, std::vector<cryptonote::transaction>& txs, std::vector<crypto::hash>& missed_txs) const { return false; }
   bool get_block_by_hash(const crypto::hash &h, cryptonote::block &blk, bool *orphan = NULL) const { return false; }
   uint8_t get_ideal_hard_fork_version() const { return 0; }
@@ -85,13 +109,13 @@ public:
   uint8_t get_hard_fork_version(uint64_t height) const { return 0; }
   uint64_t get_earliest_ideal_height_for_version(uint8_t version) const { return 0; }
   cryptonote::difficulty_type get_block_cumulative_difficulty(uint64_t height) const { return 0; }
-  bool fluffy_blocks_enabled() const { return false; }
   uint64_t prevalidate_block_hashes(uint64_t height, const std::vector<crypto::hash> &hashes, const std::vector<uint64_t> &weights) { return 0; }
   bool pad_transactions() { return false; }
   uint32_t get_blockchain_pruning_seed() const { return 0; }
   bool prune_blockchain(uint32_t pruning_seed = 0) { return true; }
   bool is_within_compiled_block_hash_area(uint64_t height) const { return false; }
   bool has_block_weights(uint64_t height, uint64_t nblocks) const { return false; }
+  bool check_block_weights(uint64_t height, const std::vector<cryptonote::block_complete_entry> &blocks) const { return false; }
   bool get_txpool_complement(const std::vector<crypto::hash> &hashes, std::vector<cryptonote::blobdata> &txes) { return false; }
   bool get_pool_transaction_hashes(std::vector<crypto::hash>& txs, bool include_unrelayed_txes = true) const { return false; }
   crypto::hash get_block_id_by_height(uint64_t height) const { return crypto::null_hash; }
@@ -99,6 +123,229 @@ public:
 };
 
 typedef nodetool::node_server<cryptonote::t_cryptonote_protocol_handler<test_core>> Server;
+
+namespace
+{
+  class known_top_test_core : public test_core
+  {
+  public:
+    crypto::hash main_top{};
+    crypto::hash alt_top{};
+    crypto::hash invalid_top{};
+    bool alt_disappears = false;
+    uint64_t target_height = 0;
+    mutable unsigned int block_lookups = 0;
+    mutable unsigned int hash_lookups = 0;
+
+    known_top_test_core()
+    {
+      main_top.data[0] = 1;
+      alt_top.data[0] = 2;
+      invalid_top.data[0] = 3;
+    }
+
+    bool have_block(const crypto::hash& id, int *where = NULL) const
+    {
+      if (id == main_top || id == alt_top || id == invalid_top)
+      {
+        if (where)
+          *where = id == main_top ? HAVE_BLOCK_MAIN_CHAIN : id == alt_top ? HAVE_BLOCK_ALT_CHAIN : HAVE_BLOCK_INVALID;
+        return true;
+      }
+      return false;
+    }
+
+    bool get_block_by_hash(const crypto::hash& id, cryptonote::block& block, bool *orphan = NULL) const
+    {
+      ++block_lookups;
+      if (id != main_top && (id != alt_top || alt_disappears))
+        return false;
+      block.miner_tx.vin.push_back(cryptonote::txin_gen{id == main_top ? 0u : 8u});
+      if (orphan)
+        *orphan = id == alt_top;
+      return true;
+    }
+
+    uint64_t get_target_blockchain_height() const { return target_height; }
+    void set_target_blockchain_height(uint64_t height) { target_height = height; }
+    void get_blockchain_top(uint64_t& height, crypto::hash& top_id) const { height = 0; top_id = main_top; }
+    crypto::hash get_block_id_by_height(uint64_t height) const
+    {
+      ++hash_lookups;
+      return height == 0 ? main_top : crypto::null_hash;
+    }
+  };
+
+  struct known_top_test_p2p : nodetool::p2p_endpoint_stub<cryptonote::cryptonote_connection_context>
+  {
+    unsigned fail_score = 0;
+
+    bool add_host_fail(const epee::net_utils::network_address&, unsigned score) override
+    {
+      fail_score += score;
+      return true;
+    }
+  };
+
+  struct known_top_result
+  {
+    bool accepted;
+    cryptonote::cryptonote_connection_context::state state;
+    unsigned fail_score;
+  };
+
+  known_top_result process_known_top(known_top_test_core& core, const crypto::hash& top, uint64_t height, bool initial, bool hidden = false)
+  {
+    known_top_test_p2p p2p;
+    cryptonote::t_cryptonote_protocol_handler<known_top_test_core> handler{core, &p2p};
+    cryptonote::cryptonote_connection_context context;
+    const epee::net_utils::network_address address = hidden
+      ? epee::net_utils::network_address{net::tor_address::unknown()}
+      : epee::net_utils::network_address{MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 1, 18080)};
+    static_cast<epee::net_utils::connection_context_base&>(context) =
+      epee::net_utils::connection_context_base{boost::uuids::uuid{}, address, false, false};
+    if (!initial)
+      context.set_state_normal();
+    cryptonote::CORE_SYNC_DATA data{};
+    data.top_id = top;
+    data.current_height = height;
+    const bool accepted = handler.process_payload_sync_data(data, context, initial);
+    return {accepted, context.m_state, p2p.fail_score};
+  }
+}
+
+TEST(cryptonote_protocol_handler, known_top_height_matches_main_chain)
+{
+  known_top_test_core core;
+  const auto result = process_known_top(core, core.main_top, 1, true);
+  EXPECT_TRUE(result.accepted);
+  EXPECT_EQ(result.state, cryptonote::cryptonote_connection_context::state_normal);
+  EXPECT_EQ(result.fail_score, 0u);
+  EXPECT_EQ(core.block_lookups, 0u);
+  EXPECT_EQ(core.hash_lookups, 1u);
+}
+
+TEST(cryptonote_protocol_handler, known_top_height_matches_alt_chain)
+{
+  known_top_test_core core;
+  const auto result = process_known_top(core, core.alt_top, 9, true);
+  EXPECT_TRUE(result.accepted);
+  EXPECT_EQ(result.state, cryptonote::cryptonote_connection_context::state_normal);
+  EXPECT_EQ(result.fail_score, 0u);
+  EXPECT_EQ(core.block_lookups, 1u);
+}
+
+TEST(cryptonote_protocol_handler, known_top_height_mismatch_is_rejected)
+{
+  known_top_test_core core;
+  const auto main = process_known_top(core, core.main_top, 1000, true);
+  EXPECT_FALSE(main.accepted);
+  EXPECT_EQ(main.fail_score, 5u);
+  EXPECT_EQ(core.hash_lookups, 0u);
+  const auto alt_high = process_known_top(core, core.alt_top, 1000, false);
+  EXPECT_FALSE(alt_high.accepted);
+  EXPECT_EQ(alt_high.fail_score, 5u);
+  const auto alt_low = process_known_top(core, core.alt_top, 1, false);
+  EXPECT_FALSE(alt_low.accepted);
+  EXPECT_EQ(alt_low.fail_score, 5u);
+}
+
+TEST(cryptonote_protocol_handler, hidden_peer_known_top_is_not_rejected)
+{
+  known_top_test_core core;
+  const auto invalid = process_known_top(core, core.invalid_top, 1000, true, true);
+  EXPECT_TRUE(invalid.accepted);
+  EXPECT_EQ(invalid.state, cryptonote::cryptonote_connection_context::state_normal);
+  EXPECT_EQ(invalid.fail_score, 0u);
+
+  const auto alt = process_known_top(core, core.alt_top, 1000, true, true);
+  EXPECT_TRUE(alt.accepted);
+  EXPECT_EQ(alt.state, cryptonote::cryptonote_connection_context::state_normal);
+  EXPECT_EQ(alt.fail_score, 0u);
+  EXPECT_EQ(core.block_lookups, 0u);
+}
+
+TEST(cryptonote_protocol_handler, invalid_known_top_is_rejected)
+{
+  known_top_test_core core;
+  const auto high = process_known_top(core, core.invalid_top, 1000, true);
+  EXPECT_FALSE(high.accepted);
+  EXPECT_EQ(high.fail_score, 1u);
+  const auto low = process_known_top(core, core.invalid_top, 1, true);
+  EXPECT_FALSE(low.accepted);
+  EXPECT_EQ(low.fail_score, 1u);
+}
+
+TEST(cryptonote_protocol_handler, disappeared_alt_top_is_not_rejected)
+{
+  known_top_test_core core;
+  core.alt_disappears = true;
+  const auto result = process_known_top(core, core.alt_top, 9, false);
+  EXPECT_TRUE(result.accepted);
+  EXPECT_EQ(result.state, cryptonote::cryptonote_connection_context::state_synchronizing);
+  EXPECT_EQ(result.fail_score, 0u);
+  EXPECT_EQ(core.target_height, 9u);
+}
+
+TEST(cryptonote_protocol_handler, unknown_top_starts_synchronizing)
+{
+  known_top_test_core core;
+  const auto result = process_known_top(core, crypto::null_hash, 9, true);
+  EXPECT_TRUE(result.accepted);
+  EXPECT_EQ(result.state, cryptonote::cryptonote_connection_context::state_synchronizing);
+  EXPECT_EQ(result.fail_score, 0u);
+}
+
+TEST(node_server, anonymous_inbound_bind_port)
+{
+  const auto parse = [](const char* bind) {
+    boost::program_options::options_description options("Command line options");
+    Server::init_options(options);
+
+    const std::string inbound = std::string{"vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:18083,"} + bind;
+    const char* argv[] = {"unit_tests", "--anonymous-inbound", inbound.c_str()};
+    boost::program_options::variables_map vm;
+    boost::program_options::store(boost::program_options::parse_command_line(3, argv, options), vm);
+    boost::program_options::notify(vm);
+    return nodetool::get_anonymous_inbounds(vm);
+  };
+
+  const auto port_only = parse("18083");
+  ASSERT_TRUE(port_only);
+  ASSERT_EQ(1, port_only->size());
+  EXPECT_EQ("127.0.0.1", port_only->front().local_ip);
+  EXPECT_EQ("18083", port_only->front().local_port);
+
+  const auto explicit_address = parse("127.0.0.2:18084");
+  ASSERT_TRUE(explicit_address);
+  ASSERT_EQ(1, explicit_address->size());
+  EXPECT_EQ("127.0.0.2", explicit_address->front().local_ip);
+  EXPECT_EQ("18084", explicit_address->front().local_port);
+
+  EXPECT_FALSE(parse("invalid"));
+  EXPECT_FALSE(parse("65536"));
+}
+
+TEST(node_server, ipv6_peer_group)
+{
+  const auto make_ipv6 = [](const char* ip) {
+    return epee::net_utils::network_address{
+      epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6(ip), 18080}
+    };
+  };
+
+  const boost::optional<nodetool::ipv6_peer_group> first = nodetool::get_ipv6_peer_group(make_ipv6("2001:db8:1::1"));
+  const boost::optional<nodetool::ipv6_peer_group> same = nodetool::get_ipv6_peer_group(make_ipv6("2001:db8:ffff::1"));
+  const boost::optional<nodetool::ipv6_peer_group> different = nodetool::get_ipv6_peer_group(make_ipv6("2001:db9::1"));
+
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(same);
+  ASSERT_TRUE(different);
+  EXPECT_EQ(*first, *same);
+  EXPECT_NE(*first, *different);
+  EXPECT_FALSE(nodetool::get_ipv6_peer_group(make_ipv6("::ffff:192.0.2.1")));
+  EXPECT_FALSE(nodetool::get_ipv6_peer_group(MAKE_IPV4_ADDRESS(192, 0, 2, 1)));
+}
 
 static bool is_blocked(Server &server, const epee::net_utils::network_address &address, time_t *t = NULL)
 {
@@ -112,7 +359,269 @@ static bool is_blocked(Server &server, const epee::net_utils::network_address &a
       return true;
     }
   }
+
+  if (address.get_type_id() != epee::net_utils::address_type::ipv4)
+    return false;
+  
+  const epee::net_utils::ipv4_network_address ipv4_address = address.as<epee::net_utils::ipv4_network_address>();
+
+  // check if in a blocked ipv4 subnet
+  const std::map<epee::net_utils::ipv4_network_subnet, time_t> subnets = server.get_blocked_subnets();
+  for (const auto &subnet : subnets)
+    if (subnet.first.matches(ipv4_address))
+      return true;
+
   return false;
+}
+
+TEST(node_server, ipv4_mapped_ipv6_address)
+{
+  boost::asio::ip::address_v6::bytes_type bytes = {};
+  bytes[10] = 0xff;
+  bytes[11] = 0xff;
+  bytes[12] = 45;
+  bytes[13] = 155;
+  bytes[14] = 69;
+  bytes[15] = 10;
+
+  const epee::net_utils::network_address mapped{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6{bytes}, 18080}
+  };
+  const boost::optional<epee::net_utils::ipv4_network_address> ipv4 = epee::net_utils::get_ipv4_mapped_address(mapped);
+  ASSERT_TRUE(bool(ipv4));
+  EXPECT_EQ("45.155.69.10", ipv4->host_str());
+  EXPECT_EQ(18080, ipv4->port());
+
+  const epee::net_utils::network_address ipv6{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6::loopback(), 18080}
+  };
+  EXPECT_FALSE(epee::net_utils::get_ipv4_mapped_address(ipv6));
+
+  EXPECT_TRUE(nodetool::is_forbidden_ipv6_address(mapped));
+  EXPECT_FALSE(nodetool::is_forbidden_ipv6_address(ipv6));
+  EXPECT_TRUE(nodetool::should_skip_connect_address(mapped, true));
+  EXPECT_TRUE(nodetool::should_skip_connect_address(ipv6, false));
+  EXPECT_FALSE(nodetool::should_skip_connect_address(ipv6, true));
+}
+
+TEST(node_server, unspecified_ipv6_address)
+{
+  const epee::net_utils::network_address unspecified{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6::any(), 18080}
+  };
+  EXPECT_TRUE(nodetool::is_forbidden_ipv6_address(unspecified));
+  EXPECT_TRUE(nodetool::should_skip_connect_address(unspecified, true));
+  EXPECT_TRUE(nodetool::should_skip_connect_address(unspecified, false));
+
+  const epee::net_utils::network_address ipv6{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("2001:db8::1"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_forbidden_ipv6_address(ipv6));
+  EXPECT_FALSE(nodetool::should_skip_connect_address(ipv6, true));
+  EXPECT_TRUE(nodetool::should_skip_connect_address(ipv6, false));
+}
+
+TEST(node_server, p2p_connection_limit_ipv6_by_64)
+{
+  const epee::net_utils::network_address ipv6_a{
+    epee::net_utils::ipv6_network_address{
+      boost::asio::ip::make_address_v6("2001:db8:abcd:1234:1111:2222:3333:4444"), 18080
+    }
+  };
+  const epee::net_utils::network_address ipv6_b{
+    epee::net_utils::ipv6_network_address{
+      boost::asio::ip::make_address_v6("2001:db8:abcd:1234:ffff:eeee:dddd:cccc"), 18080
+    }
+  };
+  const epee::net_utils::network_address ipv6_c{
+    epee::net_utils::ipv6_network_address{
+      boost::asio::ip::make_address_v6("2001:db8:abcd:1235::1"), 18080
+    }
+  };
+
+  EXPECT_TRUE(nodetool::is_same_p2p_connection_limit_host(ipv6_a, ipv6_b));
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(ipv6_a, ipv6_c));
+
+  const epee::net_utils::network_address loopback_a{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6::loopback(), 18080}
+  };
+  const epee::net_utils::network_address loopback_b{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("::2"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(loopback_a, loopback_b));
+
+  const epee::net_utils::network_address link_local_a{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fe80::1"), 18080}
+  };
+  const epee::net_utils::network_address link_local_b{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fe80::2"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(link_local_a, link_local_b));
+
+  const epee::net_utils::network_address unique_local_a{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fc00::1"), 18080}
+  };
+  const epee::net_utils::network_address unique_local_b{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fc00::2"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(unique_local_a, unique_local_b));
+
+  const epee::net_utils::network_address unique_local_c{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fd00::1"), 18080}
+  };
+  const epee::net_utils::network_address unique_local_d{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fd00::2"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(unique_local_c, unique_local_d));
+
+  const epee::net_utils::network_address multicast_a{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("ff00::1"), 18080}
+  };
+  const epee::net_utils::network_address multicast_b{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("ff00::2"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(multicast_a, multicast_b));
+
+  const epee::net_utils::network_address site_local_a{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fec0::1"), 18080}
+  };
+  const epee::net_utils::network_address site_local_b{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("fec0::2"), 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(site_local_a, site_local_b));
+
+  const epee::net_utils::network_address ipv4_a{MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 1, 18080)};
+  const epee::net_utils::network_address ipv4_b{MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 2, 18080)};
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(ipv4_a, ipv4_b));
+
+  boost::asio::ip::address_v6::bytes_type bytes_a = {};
+  bytes_a[10] = 0xff;
+  bytes_a[11] = 0xff;
+  bytes_a[12] = 203;
+  bytes_a[13] = 0;
+  bytes_a[14] = 113;
+  bytes_a[15] = 1;
+  const epee::net_utils::network_address mapped_a{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6{bytes_a}, 18080}
+  };
+
+  boost::asio::ip::address_v6::bytes_type bytes_b = bytes_a;
+  bytes_b[15] = 2;
+  const epee::net_utils::network_address mapped_b{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6{bytes_b}, 18080}
+  };
+  EXPECT_FALSE(nodetool::is_same_p2p_connection_limit_host(mapped_a, mapped_b));
+}
+
+namespace
+{
+  using path_t = boost::filesystem::path;
+  using ec_t = boost::system::error_code;
+
+  path_t create_temp_dir(const char* pattern)
+  {
+    ec_t ec;
+    path_t path = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path(pattern, ec);
+    if (ec)
+      return path_t{};
+
+    const bool success = boost::filesystem::create_directory(path, ec);
+    if (!ec && success)
+      return path;
+
+    return path_t{};
+  }
+
+  void remove_tree(const path_t& path)
+  {
+    ec_t ec;
+    boost::filesystem::remove_all(path, ec);
+  }
+
+  boost::program_options::variables_map make_regtest_options(const path_t& dir)
+  {
+    boost::program_options::options_description desc;
+    cryptonote::core::init_options(desc);
+    Server::init_options(desc);
+
+    std::vector<std::string> args{
+      "--regtest",
+      "--p2p-bind-ip=127.0.0.1",
+      "--out-peers=0",
+      "--in-peers=0",
+      "--data-dir",
+      dir.string(),
+      "--check-updates=disabled",
+      "--disable-dns-checkpoints",
+      "--offline",
+    };
+
+    boost::program_options::variables_map vm;
+    boost::program_options::store(
+      boost::program_options::command_line_parser(args).options(desc).run(),
+      vm
+    );
+    boost::program_options::notify(vm);
+    return vm;
+  }
+
+  nodetool::peerlist_entry make_peer(const epee::net_utils::network_address& address, const nodetool::peerid_type id, const int64_t last_seen)
+  {
+    nodetool::peerlist_entry peer = AUTO_VAL_INIT(peer);
+    peer.adr = address;
+    peer.id = id;
+    peer.last_seen = last_seen;
+    return peer;
+  }
+}
+
+TEST(node_server, peerlist_merge_rejects_forbidden_ipv6_addresses)
+{
+  boost::asio::ip::address_v6::bytes_type bytes = {};
+  bytes[10] = 0xff;
+  bytes[11] = 0xff;
+  bytes[12] = 45;
+  bytes[13] = 155;
+  bytes[14] = 69;
+  bytes[15] = 10;
+
+  const epee::net_utils::network_address mapped{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6{bytes}, 18080}
+  };
+  const epee::net_utils::network_address ipv4{MAKE_IPV4_ADDRESS_PORT(11, 22, 33, 44, 18080)};
+  const epee::net_utils::network_address unspecified{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::address_v6::any(), 18080}
+  };
+  const epee::net_utils::network_address ipv6{
+    epee::net_utils::ipv6_network_address{boost::asio::ip::make_address_v6("2001:db8::1"), 18080}
+  };
+
+  std::vector<nodetool::peerlist_entry> remote_peerlist;
+  remote_peerlist.push_back(make_peer(mapped, 1, 100));
+  remote_peerlist.push_back(make_peer(ipv4, 2, 200));
+  remote_peerlist.push_back(make_peer(unspecified, 3, 300));
+  remote_peerlist.push_back(make_peer(ipv6, 4, 400));
+
+  nodetool::peerlist_manager peerlist;
+  ASSERT_TRUE(peerlist.init(nodetool::peerlist_types{}, false));
+  ASSERT_TRUE(peerlist.merge_peerlist(remote_peerlist, [](const nodetool::peerlist_entry& pe) {
+    return !nodetool::is_forbidden_ipv6_address(pe.adr);
+  }));
+
+  std::vector<nodetool::peerlist_entry> gray;
+  std::vector<nodetool::peerlist_entry> white;
+  peerlist.get_peerlist(gray, white);
+  const auto contains_address = [](const std::vector<nodetool::peerlist_entry>& peers, const epee::net_utils::network_address& address) {
+    return std::any_of(peers.begin(), peers.end(), [&address](const nodetool::peerlist_entry& peer) {
+      return peer.adr == address;
+    });
+  };
+  EXPECT_TRUE(contains_address(gray, ipv4));
+  EXPECT_TRUE(contains_address(gray, ipv6));
+  EXPECT_FALSE(contains_address(gray, mapped));
+  EXPECT_FALSE(contains_address(white, mapped));
+  EXPECT_FALSE(contains_address(gray, unspecified));
+  EXPECT_FALSE(contains_address(white, unspecified));
 }
 
 TEST(ban, add)
@@ -216,12 +725,36 @@ TEST(ban, limit)
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
 }
 
+TEST(ban, clear)
+{
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  ASSERT_FALSE(server.clear_bans());
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(5,6,7,0,24)));
+  ASSERT_TRUE(server.clear_bans());
+  ASSERT_TRUE(server.get_blocked_hosts().empty());
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+  ASSERT_FALSE(server.clear_bans());
+}
+
 TEST(ban, subnet)
 {
   time_t seconds;
   test_core pr_core;
   cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
   Server server(cprotocol);
+  const auto node_dir = create_temp_dir("ban-subnet-%%%%%%%%%%%%%%%%");
+  ASSERT_TRUE(!node_dir.empty());
+  const epee::scope_guard auto_remove_node_dir([&node_dir](){
+      remove_tree(node_dir);
+    });
+
+  const auto vm = make_regtest_options(node_dir);
+  ASSERT_TRUE(server.init(vm));
   cprotocol.set_p2p_endpoint(&server);
 
   ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,24), 10));
@@ -240,12 +773,92 @@ TEST(ban, subnet)
   ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,255,3,255), &seconds));
   ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,0,3,255), &seconds));
-  ASSERT_FALSE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,2,3,8,24)));
-  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
-  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,8), 10));
-  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,2,3,8,24)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 16);
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,3,8), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,2,255), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,4,0), &seconds));
   ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,255,0,0,8)));
   ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+}
+
+TEST(ban, subnet_arithmetic)
+{
+  time_t seconds;
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  const auto node_dir = create_temp_dir("ban-subnet-arithmetic-%%%%%%%%%%%%%%%%");
+  ASSERT_TRUE(!node_dir.empty());
+  const epee::scope_guard auto_remove_node_dir([&node_dir](){
+      remove_tree(node_dir);
+    });
+
+  const auto vm = make_regtest_options(node_dir);
+  ASSERT_TRUE(server.init(vm));
+  cprotocol.set_p2p_endpoint(&server);
+
+  ASSERT_NO_THROW((void)(MAKE_IPV4_SUBNET(0,0,0,0,0)));
+  ASSERT_NO_THROW((void)(MAKE_IPV4_SUBNET(203,0,113,9,32)));
+  ASSERT_THROW((void)(MAKE_IPV4_SUBNET(203,0,113,9,33)), std::runtime_error);
+
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(172,16,0,0,16), 10));
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(172,16,1,0,24), 10));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(172,16,0,0,16)));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,1), &seconds));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(172,16,0,0,12), 10));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,1), &seconds));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(172,16,1,0,24)));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,1), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,255), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,0,255), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,2,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,31,255,255), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,15,255,255), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,32,0,0), &seconds));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 12);
+
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(172,16,2,42), 10));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(172,16,2,0,24)));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,2,42), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,2,255), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,3,0), &seconds));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 12);
+
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(172,16,3,7,32)));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,3,6), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,3,7), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,3,8), &seconds));
+
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(203,0,113,9,32), 10));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,9), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,8), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,10), &seconds));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(203,0,113,9,32)));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,9), &seconds));
+
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(10,1,2,3), 10));
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(192,0,2,0,24), 10));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(0,0,0,0,0)));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,1,2,3), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(192,0,2,100), &seconds));
+  ASSERT_TRUE(server.get_blocked_hosts().empty());
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(0,0,0,0,0), 10));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(0,0,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(255,255,255,255), &seconds));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(203,0,113,9,32)));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,8), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,9), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(203,0,113,10), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(0,0,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(255,255,255,255), &seconds));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 32);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(0,0,0,0,0)));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
 }
 
 TEST(ban, ignores_port)
@@ -262,6 +875,68 @@ TEST(ban, ignores_port)
   ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS_PORT(1,2,3,4,5)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS_PORT(1,2,3,4,5)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS_PORT(1,2,3,4,6)));
+}
+
+TEST(ban, file_banlist)
+{
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  const auto node_dir = create_temp_dir();
+  ASSERT_TRUE(!node_dir.empty());
+  const epee::scope_guard auto_remove_node_dir([&node_dir](){
+      boost::filesystem::remove_all(node_dir);
+    });
+
+  boost::program_options::variables_map vm;
+  boost::program_options::store(
+    boost::program_options::command_line_parser({
+      "--data-dir",
+      node_dir.string(),
+      "--ban-list",
+      (unit_test::data_dir / "node" / "banlist_1.txt").string()
+    }).options([]{
+      boost::program_options::options_description options_description{};
+      cryptonote::core::init_options(options_description);
+      Server::init_options(options_description);
+      return options_description;
+    }()).run(),
+    vm
+  );
+
+  ASSERT_TRUE(server.init(vm));
+
+  // Test cases (look in the banlist_1.txt file)
+
+  // magicfolk
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(255,255,255,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(128,128,128,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(150,75,0,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(99,98,0,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(99,98,0,255,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(99,98,1,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(99,98,1,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(99,98,255,255,9999)) );
+  EXPECT_FALSE( is_blocked(server, MAKE_IPV4_ADDRESS_PORT(99,99,0,0,9999)) );
+
+  // personal enemies
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(1,2,3,4,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(6,7,8,9,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(1,0,0,7,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(1,0,0,7,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(100,98,1,13,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(100,98,1,0,9999)) );
+  EXPECT_TRUE(  is_blocked(server, MAKE_IPV4_ADDRESS_PORT(100,98,1,255,9999)) );
+  EXPECT_FALSE( is_blocked(server, MAKE_IPV4_ADDRESS_PORT(100,98,2,0,9999)) );
+  EXPECT_FALSE( is_blocked(server, MAKE_IPV4_ADDRESS_PORT(100,98,0,255,9999)) );
+
+  // angel
+  EXPECT_FALSE( is_blocked(server, MAKE_IPV4_ADDRESS_PORT(007,007,007,007,9999)) );
+
+  // random IP
+  EXPECT_FALSE( is_blocked(server, MAKE_IPV4_ADDRESS_PORT(145,036,205,235,9999)) );
 }
 
 TEST(node_server, bind_same_p2p_port)
@@ -289,22 +964,10 @@ TEST(node_server, bind_same_p2p_port)
     cryptonote::core::init_options(desc_options);
     Server::init_options(desc_options);
 
-    const char *argv[2] = {nullptr, nullptr};
+    const char *argv[] = {"node_server_bind_same_p2p_port_test"};
     boost::program_options::variables_map vm;
     boost::program_options::store(boost::program_options::parse_command_line(1, argv, desc_options), vm);
 
-    /*
-    Reason for choosing '127.0.0.2' as the IP:
-
-    A TCP local socket address that has been bound is unavailable for some time after closing, unless the SO_REUSEADDR flag has been set.
-    That's why connections with automatically assigned source port 48080/58080 from previous test blocks the next to bind acceptor
-    so solution is to either set reuse_addr option for each socket in all tests
-    or use ip different from localhost for acceptors in order to not interfere with automatically assigned source endpoints
-
-    Relevant part about REUSEADDR from man:
-    https://www.man7.org/linux/man-pages/man7/ip.7.html
-    */
-    vm.find(nodetool::arg_p2p_bind_ip.name)->second   = boost::program_options::variable_value(std::string("127.0.0.2"), false);
     vm.find(nodetool::arg_p2p_bind_port.name)->second = boost::program_options::variable_value(std::string(port), false);
 
     boost::program_options::notify(vm);
@@ -312,14 +975,56 @@ TEST(node_server, bind_same_p2p_port)
     return server->server->init(vm);
   };
 
-  constexpr char port[] = "48080";
-  constexpr char port_another[] = "58080";
+  /*
+  Use fixed test ports outside common ephemeral ranges to avoid bind
+  failures from recently closed TCP connections that used the same local
+  source port.
+  */
+  constexpr char port[] = "19080";
+  constexpr char port_another[] = "19081";
 
   const auto node = new_node();
   EXPECT_TRUE(init(node, port));
 
   EXPECT_FALSE(init(new_node(), port));
   EXPECT_TRUE(init(new_node(), port_another));
+}
+
+TEST(node_server, bracketed_ipv6_bind_address)
+{
+  const path_t dir = create_temp_dir("ipv6-bind-%%%%%%%%%%%%%%%%");
+  ASSERT_FALSE(dir.empty());
+  const epee::scope_guard cleanup([&dir]{ remove_tree(dir); });
+
+  boost::asio::io_context io;
+  boost::asio::ip::tcp::acceptor reservation(io);
+  ec_t ec;
+  reservation.open(boost::asio::ip::tcp::v6(), ec);
+  if (ec)
+    GTEST_SKIP() << "IPv6 is unavailable: " << ec.message();
+  reservation.bind({boost::asio::ip::address_v6::loopback(), 0}, ec);
+  if (ec)
+    GTEST_SKIP() << "IPv6 loopback is unavailable: " << ec.message();
+  const auto port = reservation.local_endpoint().port();
+  reservation.close();
+
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  auto vm = make_regtest_options(dir);
+  vm.find(cryptonote::arg_offline.name)->second = boost::program_options::variable_value(false, false);
+  vm.find(nodetool::arg_p2p_bind_port.name)->second = boost::program_options::variable_value(std::string("0"), false);
+  vm.find(nodetool::arg_p2p_use_ipv6.name)->second = boost::program_options::variable_value(true, false);
+  vm.find(nodetool::arg_p2p_bind_ipv6_address.name)->second = boost::program_options::variable_value(std::string("[::1]"), false);
+  vm.find(nodetool::arg_p2p_bind_port_ipv6.name)->second = boost::program_options::variable_value(std::to_string(port), false);
+  ASSERT_TRUE(server.init(vm));
+
+  boost::asio::ip::tcp::socket peer(io);
+  peer.connect({boost::asio::ip::address_v6::loopback(), port}, ec);
+  EXPECT_FALSE(ec) << ec.message();
+  EXPECT_TRUE(server.deinit());
 }
 
 TEST(cryptonote_protocol_handler, race_condition)
@@ -332,18 +1037,18 @@ TEST(cryptonote_protocol_handler, race_condition)
   using context_t = contexts::p2p;
   using handler_t = epee::levin::async_protocol_handler<context_t>;
   using connection_t = epee::net_utils::connection<handler_t>;
-  using connection_ptr = boost::shared_ptr<connection_t>;
+  using connection_ptr = std::shared_ptr<connection_t>;
   using connections_t = std::vector<connection_ptr>;
   using shared_state_t = typename connection_t::shared_state;
   using shared_state_ptr = std::shared_ptr<shared_state_t>;
-  using io_context_t = boost::asio::io_service;
+  using io_context_t = boost::asio::io_context;
   using event_t = epee::simple_event;
   using ec_t = boost::system::error_code;
   auto create_conn_pair = [](connection_ptr in, connection_ptr out) {
     using endpoint_t = boost::asio::ip::tcp::endpoint;
     using acceptor_t = boost::asio::ip::tcp::acceptor;
     io_context_t io_context;
-    endpoint_t endpoint(boost::asio::ip::address::from_string("127.0.0.1"), 5262);
+    endpoint_t endpoint(boost::asio::ip::make_address("127.0.0.1"), 5262);
     acceptor_t acceptor(io_context);
     ec_t ec;
     acceptor.open(endpoint.protocol(), ec);
@@ -351,7 +1056,7 @@ TEST(cryptonote_protocol_handler, race_condition)
     acceptor.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
     acceptor.bind(endpoint, ec);
     EXPECT_EQ(ec.value(), 0);
-    acceptor.listen(boost::asio::socket_base::max_connections, ec);
+    acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
     EXPECT_EQ(ec.value(), 0);
     out->socket().open(endpoint.protocol(), ec);
     EXPECT_EQ(ec.value(), 0);
@@ -369,7 +1074,7 @@ TEST(cryptonote_protocol_handler, race_condition)
     conn.get_context(context);
     return context.m_connection_id;
   };
-  using work_t = boost::asio::io_service::work;
+  using work_t = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
   using work_ptr = std::shared_ptr<work_t>;
   using workers_t = std::vector<std::thread>;
   using commands_handler_t = epee::levin::levin_commands_handler<context_t>;
@@ -429,6 +1134,8 @@ TEST(cryptonote_protocol_handler, race_condition)
     const stat::chain &stat
   ){
     core.get_blockchain_storage().get_db().batch_start({}, {});
+    std::unordered_map<uint64_t, rct::key> transparent_amount_commitments;
+    cryptonote::collect_transparent_amount_commitments(block.miner_tx, {}, transparent_amount_commitments);
     core.get_blockchain_storage().get_db().add_block(
       {block, cryptonote::block_to_blob(block)},
       cryptonote::get_transaction_weight(block.miner_tx),
@@ -437,7 +1144,8 @@ TEST(cryptonote_protocol_handler, race_condition)
       ),
       stat.diff,
       stat.reward,
-      {}
+      {},
+      transparent_amount_commitments
     );
     core.get_blockchain_storage().get_db().batch_stop();
   };
@@ -511,7 +1219,7 @@ TEST(cryptonote_protocol_handler, race_condition)
     }
     virtual bool drop_connection(const contexts::basic& context) override {
       if (shared_state)
-        return shared_state->close(context.m_connection_id);
+        return shared_state->close(context.m_connection_id, true);
       else
         return {};
     }
@@ -585,7 +1293,7 @@ TEST(cryptonote_protocol_handler, race_condition)
             net_node.core_protocol->process_payload_sync_data(msg.payload_data, context, true);
             handshaked.raise();
           },
-          P2P_DEFAULT_HANDSHAKE_INVOKE_TIMEOUT
+          std::chrono::milliseconds{P2P_DEFAULT_HANDSHAKE_INVOKE_TIMEOUT}
         );
         return true;
       }
@@ -593,16 +1301,6 @@ TEST(cryptonote_protocol_handler, race_condition)
     handshaked.wait();
   };
   using path_t = boost::filesystem::path;
-  auto create_dir = []{
-    ec_t ec;
-    path_t path = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("daemon-%%%%%%%%%%%%%%%%", ec);
-    if (ec)
-      return path_t{};
-    auto success = boost::filesystem::create_directory(path, ec);
-    if (not ec && success)
-      return path;
-    return path_t{};
-  };
   auto remove_tree = [](const path_t &path){
     ec_t ec;
     boost::filesystem::remove_all(path, ec);
@@ -622,7 +1320,7 @@ TEST(cryptonote_protocol_handler, race_condition)
   };
   using options_description_t = boost::program_options::options_description;
 
-  const auto dir = create_dir();
+  const auto dir = create_temp_dir();
   ASSERT_TRUE(not dir.empty());
 
   daemons_t daemon{
@@ -683,7 +1381,7 @@ TEST(cryptonote_protocol_handler, race_condition)
   };
 
   io_context_t io_context;
-  work_ptr work = std::make_shared<work_t>(io_context);
+  work_ptr work = std::make_shared<work_t>(io_context.get_executor());
   workers_t workers;
   while (workers.size() < 4) {
     workers.emplace_back([&io_context]{
@@ -720,7 +1418,7 @@ TEST(cryptonote_protocol_handler, race_condition)
       auto conn = connections.first;
       auto shared_state = daemon.main.shared_state;
       const auto tag = get_conn_tag(*conn);
-      conn->strand_.post([tag, conn, shared_state, &events]{
+      boost::asio::post(conn->strand_, [tag, conn, shared_state, &events]{
         shared_state->for_connection(tag, [](context_t &context){
           context.m_expect_height = -1;
           context.m_expect_response = -1;
@@ -747,10 +1445,10 @@ TEST(cryptonote_protocol_handler, race_condition)
     events.check.raise();
     events.finish.wait();
 
-    connections.first->strand_.post([connections]{
+    boost::asio::post(connections.first->strand_, [connections]{
       connections.first->cancel();
     });
-    connections.second->strand_.post([connections]{
+    boost::asio::post(connections.second->strand_, [connections]{
       connections.second->cancel();
     });
     connections.first.reset();
@@ -794,10 +1492,12 @@ TEST(cryptonote_protocol_handler, race_condition)
       work_ptr work;
       workers_t workers;
     } check;
-    check.work = std::make_shared<work_t>(check.io_context);
-    check.workers.emplace_back([&check]{
-      check.io_context.run();
-    });
+    check.work = std::make_shared<work_t>(check.io_context.get_executor());
+    while (check.workers.size() < 2) {
+      check.workers.emplace_back([&check]{
+        check.io_context.run();
+      });
+    }
     while (daemon.main.conn.size() < 1) {
       daemon.main.conn.emplace_back(new connection_t(check.io_context, daemon.main.shared_state, {}, {}));
       daemon.alt.conn.emplace_back(new connection_t(io_context, daemon.alt.shared_state, {}, {}));
@@ -813,7 +1513,7 @@ TEST(cryptonote_protocol_handler, race_condition)
       auto conn = daemon.main.conn.back();
       auto shared_state = daemon.main.shared_state;
       const auto tag = get_conn_tag(*conn);
-      conn->strand_.post([tag, conn, shared_state, &events]{
+      boost::asio::post(conn->strand_, [tag, conn, shared_state, &events]{
         shared_state->for_connection(tag, [](context_t &context){
           EXPECT_TRUE(context.m_state == contexts::cryptonote::state_normal);
           return true;
@@ -856,7 +1556,7 @@ TEST(cryptonote_protocol_handler, race_condition)
       }
     }
     while (daemon.main.conn.size() < 2) {
-      daemon.main.conn.emplace_back(new connection_t(io_context, daemon.main.shared_state, {}, {}));
+      daemon.main.conn.emplace_back(new connection_t(check.io_context, daemon.main.shared_state, {}, {}));
       daemon.alt.conn.emplace_back(new connection_t(io_context, daemon.alt.shared_state, {}, {}));
       create_conn_pair(daemon.main.conn.back(), daemon.alt.conn.back());
       conduct_handshake(daemon.alt.net_node, daemon.alt.conn.back());
@@ -865,13 +1565,13 @@ TEST(cryptonote_protocol_handler, race_condition)
 
     for (;daemon.main.conn.size(); daemon.main.conn.pop_back()) {
       auto conn = daemon.main.conn.back();
-      conn->strand_.post([conn]{
+      boost::asio::post(conn->strand_, [conn]{
         conn->cancel();
       });
     }
     for (;daemon.alt.conn.size(); daemon.alt.conn.pop_back()) {
       auto conn = daemon.alt.conn.back();
-      conn->strand_.post([conn]{
+      boost::asio::post(conn->strand_, [conn]{
         conn->cancel();
       });
     }
@@ -902,6 +1602,495 @@ TEST(cryptonote_protocol_handler, race_condition)
     w.join();
   }
   remove_tree(dir);
+}
+
+TEST(node_server, race_condition)
+{
+  struct contexts {
+    using cryptonote = cryptonote::cryptonote_connection_context;
+    using p2p = nodetool::p2p_connection_context_t<cryptonote>;
+  };
+  using context_t = contexts::cryptonote;
+  using options_t = boost::program_options::variables_map;
+  using options_description_t = boost::program_options::options_description;
+  using worker_t = std::thread;
+  struct protocol_t {
+  private:
+    using p2p_endpoint_t = nodetool::i_p2p_endpoint<context_t>;
+    using lock_t = std::mutex;
+    using condition_t = std::condition_variable_any;
+    using unique_lock_t = std::unique_lock<lock_t>;
+    p2p_endpoint_t *p2p_endpoint;
+    lock_t lock;
+    condition_t condition;
+    bool started{};
+    size_t counter{};
+  public:
+    using payload_t = cryptonote::CORE_SYNC_DATA;
+    using blob_t = cryptonote::blobdata;
+    using connection_context = context_t;
+    using payload_type = payload_t;
+    using relay_t = cryptonote::relay_method;
+    using string_t = std::string;
+    using span_t = epee::span<const uint8_t>;
+    using blobs_t = epee::span<const cryptonote::blobdata>;
+    using connections_t = std::list<cryptonote::connection_info>;
+    using block_queue_t = cryptonote::block_queue;
+    using stripes_t = std::pair<uint32_t, uint32_t>;
+    using byte_stream_t = epee::byte_stream;
+    struct core_events_t: cryptonote::i_core_events {
+      uint64_t get_current_blockchain_height() const override { return {}; }
+      bool is_synchronized() const override { return {}; }
+      void on_transactions_relayed(blobs_t blobs, relay_t relay) override {}
+    };
+    int handle_invoke_map(bool is_notify, int command, const span_t in, byte_stream_t &out, context_t &context, bool &handled) {
+      return {};
+    }
+    bool on_idle() {
+      if (not p2p_endpoint)
+        return {};
+      {
+        unique_lock_t guard(lock);
+        if (not started)
+          started = true;
+        else
+          return {};
+      }
+      std::vector<blob_t> txs(128 / 64 * 1024 * 1024, blob_t(1, 'x'));
+      worker_t worker([this]{
+        p2p_endpoint->for_each_connection(
+          [this](context_t &, uint64_t, uint32_t){
+            {
+              unique_lock_t guard(lock);
+              ++counter;
+              condition.notify_all();
+              condition.wait(guard, [this]{ return counter >= 3; });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            return false;
+          }
+        );
+      });
+      {
+        unique_lock_t guard(lock);
+        ++counter;
+        condition.notify_all();
+        condition.wait(guard, [this]{ return counter >= 3; });
+        ++counter;
+        condition.notify_all();
+        condition.wait(guard, [this]{ return counter >= 5; });
+      }
+      p2p_endpoint->send_txs(
+        std::move(txs),
+        epee::net_utils::zone::public_,
+        {},
+        relay_t::fluff
+      );
+      worker.join();
+      return {};
+    }
+    bool init(const options_t &options) { return {}; }
+    bool deinit() { return {}; }
+    void set_p2p_endpoint(p2p_endpoint_t *p2p_endpoint) {
+      this->p2p_endpoint = p2p_endpoint;
+    }
+    bool process_payload_sync_data(const payload_t &payload, contexts::p2p &context, bool is_inital) {
+      context.m_state = context_t::state_normal;
+      context.m_needed_objects.resize(512 * 1024);
+      {
+        unique_lock_t guard(lock);
+        ++counter;
+        condition.notify_all();
+        condition.wait(guard, [this]{ return counter >= 3; });
+        ++counter;
+        condition.notify_all();
+        condition.wait(guard, [this]{ return counter >= 5; });
+      }
+      return true;
+    }
+    bool get_payload_sync_data(blob_t &blob) { return {}; }
+    bool get_payload_sync_data(payload_t &payload) { return {}; }
+    bool on_callback(context_t &context) { return {}; }
+    core_events_t &get_core(){ static core_events_t core_events; return core_events;}
+    void log_connections() {}
+    connections_t get_connections() { return {}; }
+    const block_queue_t &get_block_queue() const {
+      static block_queue_t block_queue;
+      return block_queue;
+    }
+    void stop() {}
+    void on_connection_close(context_t &context) {}
+    void set_max_out_peers(epee::net_utils::zone zone, unsigned int max) {}
+    bool no_sync() const { return {}; }
+    void set_no_sync(bool value) {}
+    string_t get_peers_overview() const { return {}; }
+    stripes_t get_next_needed_pruning_stripe() const { return {}; }
+    bool needs_new_sync_connections(epee::net_utils::zone zone) const { return {}; }
+    bool is_busy_syncing() { return {}; }
+  };
+  using node_server_t = nodetool::node_server<protocol_t>;
+  auto conduct_test = [](protocol_t &protocol){
+    struct messages {
+      struct core {
+        using sync = cryptonote::CORE_SYNC_DATA;
+      };
+      using handshake = nodetool::COMMAND_HANDSHAKE_T<core::sync>;
+    };
+    using handler_t = epee::levin::async_protocol_handler<context_t>;
+    using connection_t = epee::net_utils::connection<handler_t>;
+    using connection_ptr = std::shared_ptr<connection_t>;
+    using shared_state_t = typename connection_t::shared_state;
+    using shared_state_ptr = std::shared_ptr<shared_state_t>;
+    using io_context_t = boost::asio::io_context;
+    using work_t = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
+    using work_ptr = std::shared_ptr<work_t>;
+    using workers_t = std::vector<std::thread>;
+    using endpoint_t = boost::asio::ip::tcp::endpoint;
+    using ec_t = boost::system::error_code;
+    using event_t = epee::simple_event;
+    struct command_handler_t: epee::levin::levin_commands_handler<context_t> {
+      using span_t = epee::span<const uint8_t>;
+      using byte_stream_t = epee::byte_stream;
+      int invoke(int, const span_t, byte_stream_t &, context_t &) override { return {}; }
+      int notify(int, const span_t, context_t &) override { return {}; }
+      void callback(context_t &) override {}
+      void on_connection_new(context_t &) override {}
+      void on_connection_close(context_t &) override {}
+      ~command_handler_t() override {}
+      static void destroy(epee::levin::levin_commands_handler<context_t>* ptr) { delete ptr; }
+    };
+    io_context_t io_context;
+    work_ptr work = std::make_shared<work_t>(io_context.get_executor());
+    workers_t workers;
+    while (workers.size() < 4) {
+      workers.emplace_back([&io_context]{
+        io_context.run();
+      });
+    }
+    boost::asio::post(io_context, [&]{
+      protocol.on_idle();
+    });
+    boost::asio::post(io_context, [&]{
+      protocol.on_idle();
+    });
+    shared_state_ptr shared_state = std::make_shared<shared_state_t>();
+    shared_state->set_handler(new command_handler_t, &command_handler_t::destroy);
+    connection_ptr conn{new connection_t(io_context, shared_state, {}, {})};
+    endpoint_t endpoint(boost::asio::ip::make_address("127.0.0.1"), 19082);
+    ec_t ec;
+    conn->socket().connect(endpoint, ec);
+    ASSERT_EQ(ec.value(), 0) << "connect to 127.0.0.1:19082 failed: " << ec.message();
+    conn->start({}, {});
+    context_t context;
+    conn->get_context(context);
+    event_t handshaked;
+    typename messages::handshake::request_t msg{{
+      ::config::NETWORK_ID,
+      19083,
+    }};
+    epee::net_utils::async_invoke_remote_command2<typename messages::handshake::response>(
+      context,
+      messages::handshake::ID,
+      msg,
+      *shared_state,
+      [conn, &handshaked](int code, const typename messages::handshake::response &msg, context_t &context){
+        EXPECT_TRUE(code >= 0);
+        handshaked.raise();
+      },
+      std::chrono::milliseconds{P2P_DEFAULT_HANDSHAKE_INVOKE_TIMEOUT}
+    );
+    handshaked.wait();
+    boost::asio::post(conn->strand_, [conn]{
+      conn->cancel();
+    });
+    conn.reset();
+    work.reset();
+    for (auto& w: workers) {
+      w.join();
+    }
+  };
+  using path_t = boost::filesystem::path;
+  using ec_t = boost::system::error_code;
+  auto remove_tree = [](const path_t &path){
+    ec_t ec;
+    boost::filesystem::remove_all(path, ec);
+  };
+  const auto dir = create_temp_dir();
+  ASSERT_TRUE(not dir.empty());
+  protocol_t protocol{};
+  node_server_t node_server(protocol);
+  protocol.set_p2p_endpoint(&node_server);
+  ASSERT_TRUE(node_server.init(
+    [&dir]{
+      options_t options;
+      boost::program_options::store(
+        boost::program_options::command_line_parser({
+          "--p2p-bind-ip=127.0.0.1",
+          "--p2p-bind-port=19082",
+          "--out-peers=0",
+          "--data-dir",
+          dir.string(),
+          "--add-exclusive-node=127.0.0.1:19082",
+          "--check-updates=disabled",
+          "--disable-dns-checkpoints",
+        }).options([]{
+          options_description_t options_description{};
+          cryptonote::core::init_options(options_description);
+          node_server_t::init_options(options_description);
+          return options_description;
+        }()).run(),
+        options
+      );
+      return options;
+    }()
+  ));
+  worker_t worker([&]{
+    node_server.run();
+  });
+  conduct_test(protocol);
+  node_server.send_stop_signal();
+  worker.join();
+  node_server.deinit();
+  remove_tree(dir);
+}
+
+TEST(regtest, isolates_p2p_state_from_mainnet_data_dir)
+{
+  const path_t dir = create_temp_dir("regtest-%%%%%%%%%%%%%%%%");
+  ASSERT_TRUE(!dir.empty());
+  const epee::scope_guard cleanup([&dir]{
+    remove_tree(dir);
+  });
+
+  nodetool::peerlist_types peers{};
+  peers.white.push_back(make_peer(MAKE_IPV4_ADDRESS_PORT(11, 22, 33, 44, 18080), 1, 100));
+  peers.gray.push_back(make_peer(MAKE_IPV4_ADDRESS_PORT(55, 66, 77, 88, 18080), 2, 200));
+
+  const path_t mainnet_state = dir / P2P_NET_DATA_FILENAME;
+  ASSERT_TRUE(nodetool::peerlist_storage{}.store(mainnet_state.string(), peers));
+
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  const auto vm = make_regtest_options(dir);
+  ASSERT_TRUE(server.init(vm));
+  ASSERT_EQ(0u, server.get_public_white_peers_count());
+  ASSERT_EQ(0u, server.get_public_gray_peers_count());
+  ASSERT_TRUE(server.deinit());
+
+  const path_t regtest_state = dir / "fake" / P2P_NET_DATA_FILENAME;
+  ASSERT_TRUE(boost::filesystem::exists(regtest_state));
+
+  auto base_storage = nodetool::peerlist_storage::open(mainnet_state.string());
+  ASSERT_TRUE(bool(base_storage));
+  nodetool::peerlist_types base_public = base_storage->take_zone(epee::net_utils::zone::public_);
+  EXPECT_EQ(1u, base_public.white.size());
+  EXPECT_EQ(1u, base_public.gray.size());
+
+  auto regtest_storage = nodetool::peerlist_storage::open(regtest_state.string());
+  ASSERT_TRUE(bool(regtest_storage));
+  nodetool::peerlist_types regtest_public = regtest_storage->take_zone(epee::net_utils::zone::public_);
+  EXPECT_TRUE(regtest_public.white.empty());
+  EXPECT_TRUE(regtest_public.gray.empty());
+}
+
+namespace
+{
+  class target_test_core : public test_core
+  {
+  public:
+    uint64_t target_height = 0;
+    bool safe_sync = false;
+    bool known_block = false;
+    bool synchronized = false;
+
+    uint64_t get_target_blockchain_height() const { return target_height; }
+    void set_target_blockchain_height(uint64_t height) { target_height = height; }
+    void safesyncmode(bool safe) { safe_sync = safe; }
+    bool have_block(const crypto::hash&, int* where = nullptr) const
+    {
+      if (known_block && where)
+        *where = HAVE_BLOCK_MAIN_CHAIN;
+      return known_block;
+    }
+    void on_synchronized() { synchronized = true; }
+  };
+
+  struct target_test_p2p : nodetool::p2p_endpoint_stub<cryptonote::cryptonote_connection_context>
+  {
+    std::vector<cryptonote::cryptonote_connection_context*> connections;
+
+    void for_each_connection(std::function<bool(cryptonote::cryptonote_connection_context&, nodetool::peerid_type, uint32_t)> f) override
+    {
+      for (auto* connection : connections)
+        if (!f(*connection, 0, 0))
+          break;
+    }
+  };
+
+  void set_test_address(cryptonote::cryptonote_connection_context& context, boost::uuids::uuid id,
+    const epee::net_utils::network_address& address)
+  {
+    static_cast<epee::net_utils::connection_context_base&>(context) =
+      epee::net_utils::connection_context_base{id, address, false, false};
+  }
+}
+
+TEST(cryptonote_protocol_handler, hidden_peer_retains_target_but_restores_safe_sync)
+{
+  target_test_core core;
+  target_test_p2p p2p;
+  cryptonote::t_cryptonote_protocol_handler<target_test_core> handler{core, &p2p};
+  ASSERT_TRUE(handler.init(make_regtest_options(".")));
+  cryptonote::cryptonote_connection_context hidden, public_peer;
+  boost::uuids::uuid hidden_id{}, public_id{};
+  hidden_id.data[0] = 1;
+  public_id.data[0] = 2;
+  set_test_address(hidden, hidden_id, net::tor_address::unknown());
+  set_test_address(public_peer, public_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 1, 18080));
+  p2p.connections = {&hidden, &public_peer};
+
+  cryptonote::CORE_SYNC_DATA data{};
+  data.current_height = 8;
+  ASSERT_TRUE(handler.process_payload_sync_data(data, hidden, true));
+  ASSERT_EQ(hidden.m_state, cryptonote::cryptonote_connection_context::state_normal);
+  EXPECT_EQ(core.target_height, 0u);
+
+  data.current_height = 10;
+  ASSERT_TRUE(handler.process_payload_sync_data(data, public_peer, true));
+  ASSERT_EQ(public_peer.m_state, cryptonote::cryptonote_connection_context::state_synchronizing);
+  ASSERT_EQ(core.target_height, 10u);
+
+  handler.on_connection_close(public_peer);
+  EXPECT_EQ(core.target_height, 8u);
+  EXPECT_TRUE(core.safe_sync);
+  EXPECT_EQ(hidden.m_remote_blockchain_height, 8u);
+}
+
+TEST(cryptonote_protocol_handler, public_peer_retains_sync_target)
+{
+  for (const auto state : {cryptonote::cryptonote_connection_context::state_normal,
+                           cryptonote::cryptonote_connection_context::state_synchronizing})
+  {
+    SCOPED_TRACE(static_cast<int>(state));
+    target_test_core core;
+    target_test_p2p p2p;
+    cryptonote::t_cryptonote_protocol_handler<target_test_core> handler{core, &p2p};
+    ASSERT_TRUE(handler.init(make_regtest_options(".")));
+    cryptonote::cryptonote_connection_context tor, i2p, public_peer, closing;
+    boost::uuids::uuid tor_id{}, i2p_id{}, public_id{}, closing_id{};
+    tor_id.data[0] = 1;
+    i2p_id.data[0] = 2;
+    public_id.data[0] = 3;
+    closing_id.data[0] = 4;
+    set_test_address(tor, tor_id, MONERO_UNWRAP(net::tor_address::make("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion", 18080)));
+    set_test_address(i2p, i2p_id, MONERO_UNWRAP(net::i2p_address::make("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopn.b32.i2p")));
+    set_test_address(public_peer, public_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 1, 18080));
+    set_test_address(closing, closing_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 2, 18080));
+    tor.set_state_normal();
+    i2p.set_state_normal();
+    public_peer.m_state = state;
+    closing.m_state = cryptonote::cryptonote_connection_context::state_synchronizing;
+    tor.m_remote_blockchain_height = 12;
+    i2p.m_remote_blockchain_height = 13;
+    public_peer.m_remote_blockchain_height = 9;
+    closing.m_remote_blockchain_height = core.target_height = 14;
+    p2p.connections = {&tor, &i2p, &public_peer, &closing};
+
+    handler.on_connection_close(closing);
+    EXPECT_EQ(core.target_height, 13u);
+    EXPECT_FALSE(core.safe_sync);
+  }
+}
+
+TEST(cryptonote_protocol_handler, higher_hidden_peer_blocks_known_public_top)
+{
+  target_test_core core;
+  target_test_p2p p2p;
+  cryptonote::t_cryptonote_protocol_handler<target_test_core> handler{core, &p2p};
+  ASSERT_TRUE(handler.init(make_regtest_options(".")));
+  cryptonote::cryptonote_connection_context tor, i2p, public_peer, new_public_peer, closing;
+  boost::uuids::uuid tor_id{}, i2p_id{}, public_id{}, new_public_id{}, closing_id{};
+  tor_id.data[0] = 1;
+  i2p_id.data[0] = 2;
+  public_id.data[0] = 3;
+  closing_id.data[0] = 4;
+  new_public_id.data[0] = 5;
+  set_test_address(tor, tor_id, MONERO_UNWRAP(net::tor_address::make("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion", 18080)));
+  set_test_address(i2p, i2p_id, MONERO_UNWRAP(net::i2p_address::make("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopn.b32.i2p")));
+  set_test_address(public_peer, public_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 1, 18080));
+  set_test_address(new_public_peer, new_public_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 3, 18080));
+  set_test_address(closing, closing_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 2, 18080));
+  tor.set_state_normal();
+  i2p.set_state_normal();
+  closing.m_state = cryptonote::cryptonote_connection_context::state_synchronizing;
+  tor.m_remote_blockchain_height = 8;
+  i2p.m_remote_blockchain_height = 9;
+  closing.m_remote_blockchain_height = core.target_height = 10;
+  p2p.connections = {&tor, &i2p, &public_peer, &closing};
+
+  handler.on_connection_close(closing);
+  ASSERT_EQ(core.target_height, 9u);
+  EXPECT_TRUE(core.safe_sync);
+  p2p.connections = {&tor, &i2p, &public_peer};
+
+  core.known_block = true;
+  cryptonote::CORE_SYNC_DATA data{};
+  data.current_height = core.get_current_blockchain_height();
+  ASSERT_TRUE(handler.process_payload_sync_data(data, public_peer, true));
+  EXPECT_FALSE(core.synchronized);
+  EXPECT_FALSE(handler.is_synchronized());
+
+  p2p.connections = {&tor, &public_peer};
+  handler.on_connection_close(i2p);
+  EXPECT_EQ(core.target_height, 8u);
+  p2p.connections = {&public_peer};
+  handler.on_connection_close(tor);
+  ASSERT_EQ(core.target_height, 1u);
+  EXPECT_FALSE(handler.is_synchronized());
+  p2p.connections = {&public_peer, &new_public_peer};
+  ASSERT_TRUE(handler.process_payload_sync_data(data, new_public_peer, true));
+  EXPECT_TRUE(core.synchronized);
+  EXPECT_TRUE(handler.is_synchronized());
+}
+
+TEST(cryptonote_protocol_handler, public_sync_below_hidden_target_keeps_safe_mode)
+{
+  target_test_core core;
+  target_test_p2p p2p;
+  cryptonote::t_cryptonote_protocol_handler<target_test_core> handler{core, &p2p};
+  ASSERT_TRUE(handler.init(make_regtest_options(".")));
+  cryptonote::cryptonote_connection_context hidden, closing, public_peer;
+  boost::uuids::uuid hidden_id{}, closing_id{}, public_id{};
+  hidden_id.data[0] = 1;
+  closing_id.data[0] = 2;
+  public_id.data[0] = 3;
+  set_test_address(hidden, hidden_id, MONERO_UNWRAP(net::tor_address::make("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion", 18080)));
+  set_test_address(closing, closing_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 1, 18080));
+  set_test_address(public_peer, public_id, MAKE_IPV4_ADDRESS_PORT(203, 0, 113, 2, 18080));
+  hidden.set_state_normal();
+  hidden.m_remote_blockchain_height = 101;
+  p2p.connections = {&hidden, &closing};
+  core.safe_sync = true;
+
+  cryptonote::CORE_SYNC_DATA data{};
+  data.current_height = 101;
+  ASSERT_TRUE(handler.process_payload_sync_data(data, closing, true));
+  ASSERT_EQ(core.target_height, 101u);
+  ASSERT_FALSE(core.safe_sync);
+
+  handler.on_connection_close(closing);
+  ASSERT_EQ(core.target_height, 101u);
+  ASSERT_TRUE(core.safe_sync);
+
+  p2p.connections = {&hidden, &public_peer};
+  data.current_height = 81;
+  ASSERT_TRUE(handler.process_payload_sync_data(data, public_peer, true));
+  EXPECT_EQ(public_peer.m_state, cryptonote::cryptonote_connection_context::state_synchronizing);
+  EXPECT_EQ(core.target_height, 101u);
+  EXPECT_TRUE(core.safe_sync);
 }
 
 namespace nodetool { template class node_server<cryptonote::t_cryptonote_protocol_handler<test_core>>; }

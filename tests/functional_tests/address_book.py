@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #encoding=utf-8
 
-# Copyright (c) 2019-2020 The Monero Project
+# Copyright (c) 2019-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -32,7 +32,6 @@
 """Test wallet address book RPC
 """
 
-from __future__ import print_function
 from framework.wallet import Wallet
 
 class AddressBookTest():
@@ -98,15 +97,15 @@ class AddressBookTest():
 
         # request (partially) out of range
         ok = False
-        try: res = wallet.get_address_book[4, 2]
+        try: res = wallet.get_address_book([4, 2])
         except: ok = True
         assert ok
         ok = False
-        try: res = wallet.get_address_book[0, 2]
+        try: res = wallet.get_address_book([0, 2])
         except: ok = True
         assert ok
         ok = False
-        try: res = wallet.get_address_book[2, 0]
+        try: res = wallet.get_address_book([2, 0])
         except: ok = True
         assert ok
 
@@ -232,6 +231,18 @@ class AddressBookTest():
         res = wallet.get_address_book([1])
         assert len(res.entries) == 1
         assert e == res.entries[0]
+        # change integrated address to standard address
+        res = wallet.edit_address_book(2, address = '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm')
+        res = wallet.get_address_book([2])
+        e = res.entries[0]
+        assert e.address == '42ey1afDFnn4886T7196doS9GPMzexD9gXpsZJDwVjeRVdFCSoHnv7KPbBeGpzJBzHRCAs9UxqeoyFQMYbqSWYTfJJQAWDm'
+        # change integrated address to another integrated address
+        res = wallet.make_integrated_address()
+        integrated_address_2 = res.integrated_address
+        res = wallet.edit_address_book(2, address = integrated_address_2)
+        res = wallet.get_address_book([2])
+        e = res.entries[0]
+        assert e.address == integrated_address_2
 
         # empty
         wallet.delete_address_book(0)

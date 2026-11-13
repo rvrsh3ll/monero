@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2020, The Monero Project
+// Copyright (c) 2014-2024, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -53,31 +53,31 @@ private:
   epee::console_colors m_color;
   bool m_bright;
   el::Level m_log_level;
+  bool m_log_to_file;
 public:
   scoped_message_writer(
       epee::console_colors color = epee::console_color_default
     , bool bright = false
     , std::string&& prefix = std::string()
     , el::Level log_level = el::Level::Info
+    , bool log_to_file = true
     )
     : m_flush(true)
     , m_color(color)
     , m_bright(bright)
     , m_log_level(log_level)
+    , m_log_to_file(log_to_file)
   {
     m_oss << prefix;
   }
 
   scoped_message_writer(scoped_message_writer&& rhs)
     : m_flush(std::move(rhs.m_flush))
-#if defined(_MSC_VER)
-    , m_oss(std::move(rhs.m_oss))
-#else
       // GCC bug: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=54316
     , m_oss(rhs.m_oss.str(), std::ios_base::out | std::ios_base::ate)
-#endif
     , m_color(std::move(rhs.m_color))
     , m_log_level(std::move(rhs.m_log_level))
+    , m_log_to_file(rhs.m_log_to_file)
   {
     rhs.m_flush = false;
   }
@@ -99,17 +99,21 @@ public:
     {
       m_flush = false;
 
-      MCLOG_FILE(m_log_level, "msgwriter", m_oss.str());
+      std::string message = m_oss.str();
+      if (m_log_to_file)
+        MCLOG_FILE(m_log_level, "msgwriter", message);
+      try { el::base::sanitize(message); }
+      catch (const std::exception&) { message = "<Invalid UTF-8 in message>"; }
 
       PAUSE_READLINE();
       if (epee::console_color_default == m_color)
       {
-        std::cout << m_oss.str();
+        std::cout << message;
       }
       else
       {
         set_console_color(m_color, m_bright);
-        std::cout << m_oss.str();
+        std::cout << message;
         epee::reset_console_color();
       }
       std::cout << std::endl;
@@ -120,6 +124,11 @@ public:
 inline scoped_message_writer success_msg_writer(bool color = true)
 {
   return scoped_message_writer(color ? epee::console_color_green : epee::console_color_default, false, std::string(), el::Level::Info);
+}
+
+inline scoped_message_writer unlogged_success_msg_writer(bool color = true)
+{
+  return scoped_message_writer(color ? epee::console_color_green : epee::console_color_default, false, std::string(), el::Level::Info, false);
 }
 
 inline scoped_message_writer msg_writer(epee::console_colors color = epee::console_color_default)

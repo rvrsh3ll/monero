@@ -1,4 +1,4 @@
-# Copyright (c) 2014-2019, The Monero Project
+# Copyright (c) 2014-2024, The Monero Project
 # 
 # All rights reserved.
 # 
@@ -28,59 +28,21 @@
 # 
 # Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
-
-# This is broken up into two parts: first we check for miniupnp, compile it if we can't
-# find it, and thereafter we check for libunbound, and compile it if we can't find it.
-# We always compile if we are building statically to reduce static dependency issues...
-# ...except for FreeBSD, because FreeBSD is a special case that doesn't play well with
-# others.
-
-find_package(Miniupnpc REQUIRED)
-
-message(STATUS "Using in-tree miniupnpc")
-set(UPNPC_NO_INSTALL TRUE CACHE BOOL "Disable miniupnp installation" FORCE)
-add_subdirectory(miniupnp/miniupnpc)
-set_property(TARGET libminiupnpc-static PROPERTY FOLDER "external")
-set_property(TARGET libminiupnpc-static PROPERTY POSITION_INDEPENDENT_CODE ON)
-if(MSVC)
-  set_property(TARGET libminiupnpc-static APPEND_STRING PROPERTY COMPILE_FLAGS " -wd4244 -wd4267")
-elseif(NOT MSVC)
-  set_property(TARGET libminiupnpc-static APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-undef -Wno-unused-result -Wno-unused-value")
-endif()
-if(CMAKE_SYSTEM_NAME MATCHES "NetBSD")
-	set_property(TARGET libminiupnpc-static APPEND_STRING PROPERTY COMPILE_FLAGS " -D_NETBSD_SOURCE")
-endif()
-
-set(UPNP_LIBRARIES "libminiupnpc-static" PARENT_SCOPE)
-
-find_package(Unbound)
-
-if(NOT UNBOUND_INCLUDE_DIR OR STATIC)
-  # NOTE: If STATIC is true, CMAKE_FIND_LIBRARY_SUFFIXES has been reordered.
-  # unbound has config tests which used OpenSSL libraries, so -ldl may need to
-  # be set in this case.
-  # The unbound CMakeLists.txt can set it, since it's also needed for the
-  # static OpenSSL libraries set up there after with target_link_libraries.
-  add_subdirectory(unbound)
-
-  set(UNBOUND_STATIC true PARENT_SCOPE)
-  set(UNBOUND_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/unbound/libunbound" PARENT_SCOPE)
-  set(UNBOUND_LIBRARY "unbound" PARENT_SCOPE)
-  set(UNBOUND_LIBRARY_DIRS "${LIBEVENT2_LIBDIR}" PARENT_SCOPE)
-else()
-  message(STATUS "Found libunbound include (unbound.h) in ${UNBOUND_INCLUDE_DIR}")
-  if(UNBOUND_LIBRARIES)
-    message(STATUS "Found libunbound shared library")
-    set(UNBOUND_STATIC false PARENT_SCOPE)
-    set(UNBOUND_INCLUDE ${UNBOUND_INCLUDE_DIR} PARENT_SCOPE)
-    set(UNBOUND_LIBRARY ${UNBOUND_LIBRARIES} PARENT_SCOPE)
-    set(UNBOUND_LIBRARY_DIRS "" PARENT_SCOPE)
-  else()
-    die("Found libunbound includes, but could not find libunbound library. Please make sure you have installed libunbound or libunbound-dev or the equivalent")
-  endif()
-endif()
+# mx25519 contains copyleft code licensed under MPL-2.0. Monero licensing is generally
+# permissive, so we default to exclude copyleft code if this project is being used as
+# a dependency, to not accidentally cause honest non-FOSS dependents to infringe.
+# The fast mx25519 code can be enabled by setting the variable below.
+string(COMPARE EQUAL "${CMAKE_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}" MONERO_IS_TOP_LEVEL)
+option(MX25519_COPYLEFT "Include the MPL-2.0 licensed assembly backends (ARM64, AMD64, AMD64X)" ${MONERO_IS_TOP_LEVEL})
 
 add_subdirectory(db_drivers)
 add_subdirectory(easylogging++)
+if(NOT WIN32)
+  add_subdirectory(linenoise)
+endif()
+add_subdirectory(mx25519 EXCLUDE_FROM_ALL)
 add_subdirectory(qrcodegen)
 add_subdirectory(randomx EXCLUDE_FROM_ALL)
+add_subdirectory(polyseed EXCLUDE_FROM_ALL)
+target_compile_options(polyseed_static PRIVATE -fexceptions)
+add_subdirectory(utf8proc EXCLUDE_FROM_ALL)
